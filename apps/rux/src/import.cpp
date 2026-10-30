@@ -8,6 +8,7 @@
 #include "import/csv.hpp"
 #include "import/e57.hpp"
 #include "import/gsplat.hpp"
+#include "import/ifc.hpp"
 #include "import/materialepas.hpp"
 #include "import/mushroom.hpp"
 #include "import/panorama.hpp"
@@ -40,6 +41,7 @@ SUBCOMMANDS:
   360           Import 360 panoramic images
   photos        Import manual survey photos as material passports
   speckle       Import a Revit model from Speckle (read-only)
+  ifc           Import an IFC building model (storeys, walls, openings, spaces)
 
 EXAMPLES:
   rux import rtabmap scan.db           # Import RTABMap scan
@@ -52,6 +54,7 @@ EXAMPLES:
   rux import 360 /path/to/photos/     # Import 360 panoramic images
   rux import photos ./manual_photos/  # Import survey photos
   rux import speckle --project P --model M  # Revit model via Speckle
+  rux import ifc building.ifc          # IFC building model
 
 NOTES:
   - Use 'rux import <subcommand> --help' for detailed options
@@ -70,6 +73,7 @@ NOTES:
   setup_subcommand_import_panorama(*sub, global_opt);
   setup_subcommand_import_photos(*sub, global_opt);
   setup_subcommand_import_speckle(*sub, global_opt);
+  setup_subcommand_import_ifc(*sub, global_opt);
 
   sub->callback([]() {
     spdlog::trace("calling import subcommand");
