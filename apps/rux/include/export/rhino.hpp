@@ -8,6 +8,7 @@
 #include <CLI/CLI.hpp>
 #include <filesystem>
 #include <memory>
+#include <reusex/io/export_scene.hpp>
 
 namespace fs = std::filesystem;
 
@@ -15,6 +16,8 @@ struct SubcommandExportRhinoOptions {
   fs::path path_out = fs::current_path() / "export.3dm"; ///< Output .3dm file
   int rhino_version =
       0; ///< Target Rhino major version (6, 7, 8, ...); 0 = latest
+  /// Cloud reduction and typed elements; defaults are the library's.
+  reusex::io::ExportSceneOptions scene;
 };
 
 void setup_subcommand_export_rhino(CLI::App &parent,

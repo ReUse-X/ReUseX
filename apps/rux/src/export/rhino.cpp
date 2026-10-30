@@ -37,12 +37,22 @@ LAYER STRUCTURE:
   │   └── ...
   ├── mesh/          # All meshes as individual ON_Mesh objects
   ├── 360/           # Sphere per panoramic image with user strings
-  └── materials/     # TextDots per passport with user strings
+  ├── materials/     # TextDots per passport with user strings
+  ├── components/    # Building components by type
+  └── <storey>/      # Typed elements per storey (name, else "Storey k")
+      ├── Walls      # One mesh per element, named <name or type> (<guid>),
+      ├── Slabs      #   user text: guid, type, storey, storey_name and
+      ├── Roof       #   thickness / height / length / area / volume /
+      ├── Spaces     #   room_name / opening_kind / host_wall ...
+      ├── Doors
+      ├── Windows
+      └── Other openings
 
 EXAMPLES:
   rux export rhino -o output.3dm       # Export everything (latest version)
   rux export rhino -o output.3dm -r 6  # Save for Rhino 6
   rux -p project.rux export rhino      # Custom project path
+  rux export rhino --cloud-voxel 0.03  # Lighter cloud (export only)
 
 WORKFLOW:
   1. rux import rtabmap scan.db        # Import sensor data
@@ -51,6 +61,9 @@ WORKFLOW:
 
 NOTES:
   - Only layers with data are created (empty layers are omitted)
+  - Typed elements come from the solid_* meshes of `rux create solids`;
+    without them, solids are built from the storeys / walls / openings /
+    spaces tables for the export only
   - Use -r/--rhino-version to target an older Rhino (6, 7, 8, ...)
   - Output .3dm file compatible with Rhino 7+ and OpenNURBS readers by default
   - Point colors preserved from RGB channels
@@ -69,6 +82,22 @@ NOTES:
       ->default_val(opt->rhino_version)
       ->check(CLI::IsMember({0, 2, 3, 4, 5, 6, 7, 8}));
 
+  sub->add_option("--cloud-voxel", opt->scene.cloud_voxel_m,
+                  "Export the cloud with one point per voxel of this size "
+                  "[m] (0 = every point). The stored cloud is not changed.")
+      ->default_val(opt->scene.cloud_voxel_m)
+      ->check(CLI::NonNegativeNumber);
+
+  sub->add_option("--max-cloud-points", opt->scene.max_cloud_points,
+                  "Export at most this many cloud points, an even stride "
+                  "over the stored order, after --cloud-voxel (0 = no cap)")
+      ->default_val(opt->scene.max_cloud_points);
+
+  sub->add_flag("!--no-typed-elements", opt->scene.typed_elements,
+                "Leave out the typed elements (storeys, walls, slabs, "
+                "spaces, openings); the solid_* meshes are then exported as "
+                "plain meshes");
+
   sub->callback([opt, global_opt]() {
     spdlog::trace("calling export rhino subcommand");
     rux::finish(run_subcommand_export_rhino(*opt, *global_opt));
@@ -84,7 +113,7 @@ int run_subcommand_export_rhino(SubcommandExportRhinoOptions const &opt,
     ProjectDB db(project_path, true);
 
     spdlog::info("Gathering export data...");
-    auto scene = io::gather_export_scene(db);
+    auto scene = io::gather_export_scene(db, opt.scene);
 
     spdlog::info("Building Rhino model...");
     auto model = io::export_to_rhino(scene);
