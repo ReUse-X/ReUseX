@@ -69,6 +69,7 @@
   tokenizers-cpp,
   onnxruntime,
   exiv2,
+  web-ifc,
   openmvs,
   nanoflann,
   libjxl,
@@ -245,6 +246,9 @@ in
         yaml-cpp
         openssl
         exiv2
+        # web-ifc — native C++ IFC (STEP) parser + geometry engine, for
+        # `rux import ifc` (pkgs/web-ifc). MPL-2.0. Optional in CMake.
+        web-ifc
 
         # OpenMVS — library-linked Multi-View Stereo for `rux create dense`.
         # AGPL-3.0-or-later; combined work is therefore AGPL.

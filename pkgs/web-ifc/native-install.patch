@@ -1,0 +1,135 @@
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index 827dc9d..6048970 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -23,6 +23,8 @@ set_property(GLOBAL PROPERTY USE_FOLDERS ON)
+ 
+ option(WEB_IFC_WASM_NATIVE_EXCEPTIONS "Use native WebAssembly exception handling (requires a compatible runtime)" ON)
+ option(BUILD_SHARED_LIBS "Build web-ifc as a shared library instead of static" OFF)
++option(WEB_IFC_BUILD_TESTS "Build the native web-ifc test executables" ON)
++option(WEB_IFC_SYSTEM_SPDLOG "Use an installed spdlog (find_package) instead of fetching one" OFF)
+ set(WEB_IFC_WASM_EXCEPTION_FLAG "-fexceptions")
+ if(WEB_IFC_WASM_NATIVE_EXCEPTIONS)
+ 	set(WEB_IFC_WASM_EXCEPTION_FLAG "-fwasm-exceptions")
+@@ -43,9 +45,11 @@ Message("Downloading TinyNURBS")
+ FetchContent_Declare(tinynurbs GIT_REPOSITORY "https://github.com/QuimMoya/tinynurbs" GIT_TAG "47115cd9b6e922b27bbc4ab01fdeac2e9ea597a4" SOURCE_SUBDIR "../")
+ FetchContent_MakeAvailable(tinynurbs)
+ 
++if(WEB_IFC_BUILD_TESTS OR EMSCRIPTEN)
+ Message("Downloading TinyCPPTest")
+ FetchContent_Declare(tinycpptest GIT_REPOSITORY "https://github.com/kovacsv/TinyCppTest" GIT_TAG "12e42c8ac6e032ce450fb3f772ebdfd1ddc6008c" SOURCE_SUBDIR "../")
+ FetchContent_MakeAvailable(tinycpptest)
++endif()
+ 
+ Message("Downloading GLM")
+ FetchContent_Declare(glm GIT_REPOSITORY "https://github.com/g-truc/glm" GIT_TAG "8d1fd52e5ab5590e2c81768ace50c72bae28f2ed" SOURCE_SUBDIR "../")
+@@ -59,9 +63,13 @@ Message("Downloading CDT")
+ FetchContent_Declare(cdt GIT_REPOSITORY "https://github.com/artem-ogre/CDT" GIT_TAG "2068d015b9db3c92481e869b0c1f669b96a1d70a" SOURCE_SUBDIR "../")
+ FetchContent_MakeAvailable(cdt)
+ 
++if(WEB_IFC_SYSTEM_SPDLOG)
++find_package(spdlog CONFIG REQUIRED)
++else()
+ Message("Downloading spdlog")
+ FetchContent_Declare(spdlog GIT_REPOSITORY "https://github.com/gabime/spdlog" GIT_TAG "79524ddd08a4ec981b7fea76afd08ee05f83755d" SOURCE_SUBDIR "../")
+ FetchContent_MakeAvailable(spdlog)
++endif()
+ 
+ Message("Downloading StdUUID")
+ FetchContent_Declare(stduuid GIT_REPOSITORY "https://github.com/mariusbancila/stduuid" GIT_TAG "3afe7193facd5d674de709fccc44d5055e144d7a" SOURCE_SUBDIR "../")
+@@ -84,11 +92,17 @@ function(PARAM_SETTER THE_EXECUTABLE)
+ 		$<BUILD_INTERFACE:${fastfloat_SOURCE_DIR}/include>
+ 		$<BUILD_INTERFACE:${cdt_SOURCE_DIR}/CDT/include>
+ 		$<BUILD_INTERFACE:${earcut_SOURCE_DIR}/include>
+-		$<BUILD_INTERFACE:${spdlog_SOURCE_DIR}/include>
+ 		$<BUILD_INTERFACE:${stduuid_SOURCE_DIR}/include>
+ 		$<BUILD_INTERFACE:${unordered_dense_SOURCE_DIR}/include>
+ 	)
+ 
++	# spdlog types appear in ModelManager.h, so the dependency is PUBLIC.
++	if(WEB_IFC_SYSTEM_SPDLOG)
++		target_link_libraries(${THE_EXECUTABLE} PUBLIC spdlog::spdlog)
++	else()
++		target_include_directories(${THE_EXECUTABLE} PRIVATE $<BUILD_INTERFACE:${spdlog_SOURCE_DIR}/include>)
++	endif()
++
+ 	if(NOT MSVC)
+ 		target_compile_options(${THE_EXECUTABLE} PRIVATE -Wall -Wextra -Wpedantic)
+ 
+@@ -183,6 +197,8 @@ if(NOT EMSCRIPTEN)
+ 
+ 	# Export symbols on Windows (Needed for shared library)
+ 	set_target_properties(web-ifc-library PROPERTIES WINDOWS_EXPORT_ALL_SYMBOLS ON)
++	# Consumers link web-ifc::web-ifc.
++	set_target_properties(web-ifc-library PROPERTIES EXPORT_NAME web-ifc)
+ 
+ 	# Add generator expressions for install support
+ 	target_include_directories(web-ifc-library PUBLIC
+@@ -190,8 +206,10 @@ if(NOT EMSCRIPTEN)
+ 		$<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/web-ifc>
+ 		$<INSTALL_INTERFACE:${CMAKE_INSTALL_INCLUDEDIR}>
+ 		$<INSTALL_INTERFACE:${CMAKE_INSTALL_INCLUDEDIR}/web-ifc>
++		$<INSTALL_INTERFACE:${CMAKE_INSTALL_INCLUDEDIR}/web-ifc/third_party>
+ 	)
+ 
++	if(WEB_IFC_BUILD_TESTS)
+ 	# build parameters for web-ifc-test
+ 	add_executable(web-ifc-test ${web-ifc-source} "./test/encoding_test.cpp" "./test/main.cpp" "./test/io_helpers.cpp")
+ 	param_setter(web-ifc-test)
+@@ -209,6 +227,7 @@ if(NOT EMSCRIPTEN)
+ 	if(NOT RELEASE)
+ 		target_compile_options(web-ifc PRIVATE -DCSG_DEBUG_OUTPUT -DDEBUG_DUMP_SVG)
+ 	endif()
++	endif()
+ 
+ 	# Installation rules
+ 	# Install the static library
+@@ -223,15 +242,30 @@ if(NOT EMSCRIPTEN)
+ 	# boolean-utils/ is entirely internal (all headers only ever included from .cpp files)
+ 	# mesh_utils.h and geometryutils.h are implementation-only helpers
+ 	# bim-geometry/utils.h and representation/ are part of the transitive public API
++	# All headers: the public ones reach into boolean-utils/ (IfcGeometry.h)
++	# and operations/ transitively, so excluding them leaves the installed
++	# tree uncompilable.
+ 	install(DIRECTORY web-ifc/
+ 		DESTINATION ${CMAKE_INSTALL_INCLUDEDIR}/web-ifc
+ 		FILES_MATCHING
+ 		PATTERN "*.h"
+-		PATTERN "mesh_utils.h" EXCLUDE
+-		PATTERN "geometryutils.h" EXCLUDE
+-		REGEX "boolean-utils" EXCLUDE
+ 	)
+ 
++	# Header-only dependencies the installed headers include
++	# (<ankerl/unordered_dense.h>, <mapbox/earcut.hpp>, <tinynurbs/...>, ...).
++	install(DIRECTORY ${unordered_dense_SOURCE_DIR}/include/
++		DESTINATION ${CMAKE_INSTALL_INCLUDEDIR}/web-ifc/third_party)
++	install(DIRECTORY ${earcut_SOURCE_DIR}/include/
++		DESTINATION ${CMAKE_INSTALL_INCLUDEDIR}/web-ifc/third_party)
++	install(DIRECTORY ${tinynurbs_SOURCE_DIR}/include/
++		DESTINATION ${CMAKE_INSTALL_INCLUDEDIR}/web-ifc/third_party)
++	install(DIRECTORY ${fastfloat_SOURCE_DIR}/include/
++		DESTINATION ${CMAKE_INSTALL_INCLUDEDIR}/web-ifc/third_party)
++	install(DIRECTORY ${cdt_SOURCE_DIR}/CDT/include/
++		DESTINATION ${CMAKE_INSTALL_INCLUDEDIR}/web-ifc/third_party)
++	install(DIRECTORY ${stduuid_SOURCE_DIR}/include/
++		DESTINATION ${CMAKE_INSTALL_INCLUDEDIR}/web-ifc/third_party)
++
+ 	# Install version.h
+ 	install(FILES version.h
+ 		DESTINATION ${CMAKE_INSTALL_INCLUDEDIR}/web-ifc
+diff --git a/cmake/web-ifc-config.cmake.in b/cmake/web-ifc-config.cmake.in
+index 888b724..84a8bc5 100644
+--- a/cmake/web-ifc-config.cmake.in
++++ b/cmake/web-ifc-config.cmake.in
+@@ -1,5 +1,10 @@
+ @PACKAGE_INIT@
+ 
++include(CMakeFindDependencyMacro)
++if(@WEB_IFC_SYSTEM_SPDLOG@)
++  find_dependency(spdlog CONFIG)
++endif()
++
+ include("${CMAKE_CURRENT_LIST_DIR}/web-ifc-targets.cmake")
+ 
+ check_required_components(web-ifc)
