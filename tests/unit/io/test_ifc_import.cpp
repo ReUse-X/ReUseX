@@ -18,6 +18,7 @@
 
 #include <catch2/catch_approx.hpp>
 #include <catch2/catch_test_macros.hpp>
+#include <catch2/matchers/catch_matchers_string.hpp>
 
 #include <nlohmann/json.hpp>
 #include <pcl/PolygonMesh.h>
@@ -29,6 +30,8 @@
 #include <fstream>
 #include <iterator>
 #include <string>
+#include <utility>
+#include <vector>
 
 using Catch::Approx;
 using namespace reusex::io::ifc;
@@ -62,6 +65,34 @@ void save_dummy_mesh(reusex::ProjectDB &db, const std::string &name,
   mesh.polygons.push_back(f);
   db.save_mesh(name, mesh, stage, "{}");
 }
+
+std::string fixture_text() {
+  std::ifstream in(fixture());
+  return {std::istreambuf_iterator<char>(in), std::istreambuf_iterator<char>()};
+}
+
+/// The fixture with the lines starting `#<id>=` replaced by @p with ("" =
+/// removed); each edited line must exist.
+std::string
+variant(const std::vector<std::pair<std::string, std::string>> &edits) {
+  std::string text = fixture_text();
+  for (const auto &[id, with] : edits) {
+    const std::string key = "\n#" + id + "=";
+    const auto at = text.find(key);
+    REQUIRE(at != std::string::npos);
+    const auto end = text.find('\n', at + 1);
+    text.replace(at + 1, end - at - 1, with);
+  }
+  return text;
+}
+
+/// Write @p text to a fresh temp .ifc and import it.
+struct VariantFile {
+  reusex::test_support::TempPath tmp{"test_ifc_variant", ".ifc"};
+  explicit VariantFile(const std::string &text) {
+    std::ofstream(tmp.path) << text;
+  }
+};
 
 bool has_mesh(const reusex::ProjectDB &db, const std::string &name) {
   const auto names = db.list_meshes();
@@ -162,12 +193,12 @@ TEST_CASE("import_ifc maps a small IFC4 building", "[io][ifc]") {
 
   // Meshes per class, StandardCase folded; no space / opening mesh.
   REQUIRE(r.meshes.size() == 3);
-  const auto *walls = mesh_named(r, "imported/wall");
+  const auto *walls = mesh_named(r, "imported/ifc/wall");
   REQUIRE(walls != nullptr);
   CHECK(walls->category == "IfcWall");
   CHECK(walls->elements == 2);
-  REQUIRE(mesh_named(r, "imported/door") != nullptr);
-  const auto *slab = mesh_named(r, "imported/slab");
+  REQUIRE(mesh_named(r, "imported/ifc/door") != nullptr);
+  const auto *slab = mesh_named(r, "imported/ifc/slab");
   REQUIRE(slab != nullptr);
   double zmin = 1e9;
   for (const auto &v : slab->vertices)
@@ -227,6 +258,192 @@ TEST_CASE("import_ifc recentres a georeferenced model", "[io][ifc]") {
   CHECK(k.model.walls[0].x0 == Approx(600000.0));
 }
 
+TEST_CASE("import_ifc reads a space without a body from FootPrint and Box",
+          "[io][ifc]") {
+  const std::string footprint =
+      "#203=IFCPRODUCTDEFINITIONSHAPE($,$,(#230,#235));\n"
+      "#230=IFCSHAPEREPRESENTATION(#23,'FootPrint','GeometricCurveSet',"
+      "(#231));\n"
+      "#231=IFCGEOMETRICCURVESET((#232));\n"
+      "#232=IFCPOLYLINE((#240,#241,#242,#243,#240));\n"
+      "#240=IFCCARTESIANPOINT((500.,500.));\n"
+      "#241=IFCCARTESIANPOINT((4500.,500.));\n"
+      "#242=IFCCARTESIANPOINT((4500.,3500.));\n"
+      "#243=IFCCARTESIANPOINT((500.,3500.));";
+  const std::string box =
+      "\n#235=IFCSHAPEREPRESENTATION(#23,'Box','BoundingBox',(#236));\n"
+      "#236=IFCBOUNDINGBOX(#237,4000.,3000.,2500.);\n"
+      "#237=IFCCARTESIANPOINT((500.,500.,0.));";
+
+  SECTION("FootPrint + Box") {
+    const VariantFile f(variant({{"203", footprint + box}}));
+    const auto r = import_ifc(f.tmp.path);
+    REQUIRE(r.model.spaces.size() == 1);
+    const auto &s = r.model.spaces[0];
+    CHECK(s.area == Approx(12.0));
+    CHECK(s.polygon.outer.size() == 4);
+    CHECK(s.z_floor == Approx(0.0).margin(1e-9));
+    CHECK(s.z_ceiling == Approx(2.5));
+    CHECK(s.volume == Approx(30.0));
+    CHECK(s.storey == 0);
+    CHECK(nlohmann::json::parse(s.metadata)["geometry"] == "FootPrint+Box");
+    CHECK(r.stats.spaces_from_footprint == 1);
+  }
+  SECTION("FootPrint alone: the storey's floor to ceiling") {
+    const VariantFile f(
+        variant({{"203", "#203=IFCPRODUCTDEFINITIONSHAPE($,$,(#230));" +
+                             footprint.substr(footprint.find('\n'))}}));
+    const auto r = import_ifc(f.tmp.path);
+    REQUIRE(r.model.spaces.size() == 1);
+    const auto &s = r.model.spaces[0];
+    CHECK(s.area == Approx(12.0));
+    CHECK(s.z_floor == Approx(0.0).margin(1e-9));
+    CHECK(s.z_ceiling == Approx(3.0));
+    CHECK(nlohmann::json::parse(s.metadata)["geometry"] == "FootPrint");
+  }
+}
+
+TEST_CASE("import_ifc sizes an unrelated door from OverallWidth / Height",
+          "[io][ifc]") {
+  // No voids / fills: the door is hosted geometrically, and its body (a
+  // 1.1 m x 2.3 m lining) is wider and taller than its nominal size.
+  const VariantFile f(variant(
+      {{"110", ""},
+       {"130", ""},
+       {"125", "#125=IFCEXTRUDEDAREASOLID(#126,#21,#24,2300.);"},
+       {"126", "#126=IFCRECTANGLEPROFILEDEF(.AREA.,$,#127,1100.,50.);"}}));
+  const auto r = import_ifc(f.tmp.path);
+  REQUIRE(r.model.openings.size() == 1);
+  const auto &o = r.model.openings[0];
+  CHECK(o.wall == r.model.walls[0].guid);
+  CHECK(o.s_start == Approx(1.0));
+  CHECK(o.s_end == Approx(1.9));
+  CHECK(o.z_sill == Approx(0.0).margin(1e-6));
+  CHECK(o.z_head == Approx(2.1));
+  const auto md = nlohmann::json::parse(o.metadata);
+  CHECK(md["host"] == "geometry");
+  CHECK(md["extent_source"]["s"] == "OverallWidth");
+  CHECK(md["extent_source"]["z"] == "OverallHeight");
+  CHECK(r.stats.openings_by_geometry == 1);
+  CHECK(r.stats.openings_extent_params == 1);
+}
+
+TEST_CASE("import_ifc converts a conversion-based unit (feet)", "[io][ifc]") {
+  const VariantFile f(variant(
+      {{"11", "#11=IFCCONVERSIONBASEDUNIT(#12,.LENGTHUNIT.,'FOOT',#13);\n"
+              "#12=IFCDIMENSIONALEXPONENTS(1,0,0,0,0,0,0);\n"
+              "#13=IFCMEASUREWITHUNIT(IFCLENGTHMEASURE(0.3048),#14);\n"
+              "#14=IFCSIUNIT(*,.LENGTHUNIT.,$,.METRE.);"}}));
+  IfcImportOptions opt;
+  opt.recenter = false;
+  const auto r = import_ifc(f.tmp.path, opt);
+  constexpr double ft = 0.3048;
+  CHECK(r.stats.length_unit_m == Approx(ft));
+  REQUIRE(r.model.walls.size() == 2);
+  CHECK(r.model.walls[0].x1 == Approx(6000.0 * ft));
+  CHECK(r.model.walls[0].thickness == Approx(200.0 * ft));
+  CHECK(r.model.storeys[1].z_floor == Approx(3000.0 * ft));
+  REQUIRE(r.model.openings.size() == 1);
+  CHECK(r.model.openings[0].z_head == Approx(2100.0 * ft));
+  REQUIRE(r.model.spaces.size() == 1);
+  CHECK(r.model.spaces[0].area == Approx(12e6 * ft * ft));
+}
+
+TEST_CASE("import_ifc places a storey without placement at its Elevation",
+          "[io][ifc]") {
+  const VariantFile f(
+      variant({{"52", "#52=IFCBUILDINGSTOREY('1RXStorey1000000000000',$,'First "
+                      "Floor',$,$,$,$,$,.ELEMENT.,3100.);"}}));
+  const auto r = import_ifc(f.tmp.path);
+  REQUIRE(r.model.storeys.size() == 2);
+  CHECK(r.model.storeys[1].z_floor == Approx(3.1));
+  const auto md = nlohmann::json::parse(r.model.storeys[1].metadata);
+  CHECK(md["z_source"] == "Elevation");
+  CHECK(r.model.walls[1].storey == 1); // still contained in it
+}
+
+TEST_CASE("import_ifc places an uncontained element by height", "[io][ifc]") {
+  const VariantFile f(variant({{"161", ""}}));
+  const auto r = import_ifc(f.tmp.path);
+  CHECK(r.stats.elements_no_storey == 1);
+  REQUIRE(r.model.walls.size() == 2);
+  CHECK(r.model.walls[1].storey == 1); // its bottom stands at 3.0 m
+}
+
+TEST_CASE("import_ifc reads IsExternal through a property set definition set",
+          "[io][ifc]") {
+  const VariantFile f(variant(
+      {{"92", "#92=IFCRELDEFINESBYPROPERTIES('1RXDefWallA00000000000',$,$,$,"
+              "(#70),IFCPROPERTYSETDEFINITIONSET((#90)));"}}));
+  const auto r = import_ifc(f.tmp.path);
+  REQUIRE(r.model.walls.size() == 2);
+  CHECK(r.model.walls[0].is_external);
+}
+
+TEST_CASE("import_ifc ignores dangling references", "[io][ifc]") {
+  const VariantFile f(variant(
+      {{"160", "#160=IFCRELCONTAINEDINSPATIALSTRUCTURE('1RXContained0000000000'"
+               ",$,$,$,(#70,#120,#140,#999),#998);"},
+       {"92", "#92=IFCRELDEFINESBYPROPERTIES('1RXDefWallA00000000000',$,$,$,"
+              "(#70,#997),#996);"}}));
+  const auto r = import_ifc(f.tmp.path);
+  CHECK(r.stats.products == 4);
+  REQUIRE(r.model.walls.size() == 2);
+  CHECK_FALSE(r.model.walls[0].is_external); // its pset is gone
+  CHECK(r.model.walls[0].storey == 0);       // placed by height
+  CHECK(r.stats.elements_no_storey >= 1);
+}
+
+TEST_CASE("import_ifc meshes only the body representation", "[io][ifc]") {
+  // Wall A also carries a 'Clearance' solid 100 m away.
+  const VariantFile f(variant(
+      {{"73", "#73=IFCPRODUCTDEFINITIONSHAPE($,$,(#74,#250));\n"
+              "#250=IFCSHAPEREPRESENTATION(#23,'Clearance','SweptSolid',"
+              "(#251));\n"
+              "#251=IFCEXTRUDEDAREASOLID(#252,#21,#24,3000.);\n"
+              "#252=IFCRECTANGLEPROFILEDEF(.AREA.,$,#253,1000.,1000.);\n"
+              "#253=IFCAXIS2PLACEMENT2D(#254,$);\n"
+              "#254=IFCCARTESIANPOINT((100000.,0.));"}}));
+  const auto r = import_ifc(f.tmp.path);
+  CHECK(r.stats.non_body_geometries == 1);
+  REQUIRE(r.model.walls.size() == 2);
+  CHECK(r.model.walls[0].x1 == Approx(6.0));
+  const auto *walls = mesh_named(r, "imported/ifc/wall");
+  REQUIRE(walls != nullptr);
+  double xmax = -1e9;
+  for (const auto &v : walls->vertices)
+    xmax = std::max(xmax, v[0]);
+  CHECK(xmax == Approx(6.0));
+}
+
+TEST_CASE("import_ifc refuses truncated and non-IFC files", "[io][ifc]") {
+  const std::string text = fixture_text();
+  SECTION("truncated") {
+    const VariantFile f(text.substr(0, text.size() / 2));
+    CHECK_THROWS_WITH(import_ifc(f.tmp.path),
+                      Catch::Matchers::ContainsSubstring("truncated"));
+  }
+  SECTION("garbage") {
+    const VariantFile f("hello, this is not a building\n");
+    CHECK_THROWS_WITH(import_ifc(f.tmp.path),
+                      Catch::Matchers::ContainsSubstring("not an IFC"));
+  }
+  SECTION("import_ifc_file logs the failure and writes nothing") {
+    const VariantFile f(text.substr(0, text.size() / 2));
+    reusex::test_support::TempPath db_path("test_ifc_import_trunc");
+    reusex::ProjectDB db(db_path.path);
+    CHECK_THROWS_AS(import_ifc_file(db, f.tmp.path), std::runtime_error);
+    const auto runs = db.pipeline_log();
+    REQUIRE_FALSE(runs.empty());
+    CHECK(runs.front().stage == "import_ifc");
+    CHECK(runs.front().status == "failed");
+    CHECK_THAT(runs.front().error_msg,
+               Catch::Matchers::ContainsSubstring("truncated"));
+    CHECK(db.storeys().empty());
+    CHECK(db.list_meshes().empty());
+  }
+}
+
 TEST_CASE("import_ifc refuses a missing file", "[io][ifc]") {
   CHECK_THROWS_AS(import_ifc("/nonexistent/building.ifc"), std::runtime_error);
 }
@@ -243,12 +460,12 @@ TEST_CASE("import_ifc_file stores the model and replaces it on re-import",
     CHECK(first.stored.spaces == 1);
     CHECK(first.meshes_saved == 3);
     CHECK(first.meshes_removed == 0);
-    CHECK(has_mesh(db, "imported/wall"));
-    CHECK(db.mesh_metadata("imported/wall").stage == "import_ifc");
+    CHECK(has_mesh(db, "imported/ifc/wall"));
+    CHECK(db.mesh_metadata("imported/ifc/wall").stage == "import_ifc");
 
     // Meshes another import wrote, and a stale one of an earlier IFC import.
-    save_dummy_mesh(db, "imported/stale", "import_ifc");
-    save_dummy_mesh(db, "imported/walls", "import_speckle");
+    save_dummy_mesh(db, "imported/ifc/stale", "import_ifc");
+    save_dummy_mesh(db, "imported/revit/walls", "import_speckle");
 
     // --no-meshes neither writes nor deletes meshes.
     IfcImportOptions no_meshes;
@@ -257,14 +474,14 @@ TEST_CASE("import_ifc_file stores the model and replaces it on re-import",
     CHECK(again.stored.replaced_imported == 6);
     CHECK(again.meshes_saved == 0);
     CHECK(again.meshes_removed == 0);
-    CHECK(has_mesh(db, "imported/stale"));
+    CHECK(has_mesh(db, "imported/ifc/stale"));
 
     const auto third = import_ifc_file(db, fixture());
     CHECK(third.stored.replaced_imported == 6);
     CHECK(third.meshes_saved == 3);
     CHECK(third.meshes_removed == 1);
-    CHECK_FALSE(has_mesh(db, "imported/stale"));
-    CHECK(has_mesh(db, "imported/walls")); // another stage's mesh stays
+    CHECK_FALSE(has_mesh(db, "imported/ifc/stale"));
+    CHECK(has_mesh(db, "imported/revit/walls")); // another stage's mesh stays
   }
   const reusex::ProjectDB db(tmp.path, /*readOnly*/ true);
   const auto back = reusex::io::load_solid_model(db);

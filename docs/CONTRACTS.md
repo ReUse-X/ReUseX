@@ -882,7 +882,7 @@ object; never the token, which comes from `SPECKLE_TOKEN`).
 | | |
 |---|---|
 | Consumes | a Speckle server, project, model and version (default the latest) |
-| Produces | `storeys`, `walls`, `openings`, `spaces` rows (`source = imported`, locked, as above); meshes `imported/<category slug>` (stage `import_speckle`) |
+| Produces | `storeys`, `walls`, `openings`, `spaces` rows (`source = imported`, locked, as above); meshes `imported/revit/<category slug>` (stage `import_speckle`) |
 | Checks   | the root carries `levelProxies` (a Revit model), else it throws and writes nothing |
 
 Mapping (`libs/reusex/include/io/speckle_revit.hpp`):
@@ -926,8 +926,11 @@ Mapping (`libs/reusex/include/io/speckle_revit.hpp`):
   perimeter, volume, compactness, kind `room`. Unplaced rooms (no volume
   mesh) are skipped, one warn listing their names.
 - **Meshes**: every element's geometry (instance proxies expanded) merged per
-  category, Rooms excepted, in the world frame; a re-import deletes earlier
-  `import_speckle` meshes this version no longer has (`--no-meshes` writes
+  category, Rooms excepted, in the world frame, as `imported/revit/<category
+  slug>` (the importer in the name, so a Revit and an IFC import in one
+  project never write the same mesh); a re-import deletes earlier
+  `import_speckle` meshes this version no longer has, also ones of the
+  older unprefixed naming (`--no-meshes` writes
   and deletes none). An element whose mesh has an invalid face list is
   skipped, counted at warn.
 - **Identity**: GUIDs are `uuid5(project_guid,
@@ -944,20 +947,23 @@ web-ifc, map it with `io::ifc::import_ifc()` and store it with the
 solid-model import write above (`io::ifc::import_ifc_file()`). One
 `pipeline_log` row, stage `import_ifc` (parameters: source, file name).
 web-ifc is an optional dependency: a build without it
-(`REUSEX_HAVE_WEB_IFC` off) refuses with a clear message.
+(`REUSEX_HAVE_WEB_IFC` off) refuses with a clear message. web-ifc's own log
+messages (it logs through spdlog's default logger) are shown as `[web-ifc]`
+at warn and above only, whatever `-v` says.
 
 | | |
 |---|---|
 | Consumes | an IFC file |
-| Produces | `storeys`, `walls`, `openings`, `spaces` rows (`source = imported`, locked, as above); meshes `imported/<IFC class slug>` (stage `import_ifc`) |
-| Checks   | the file parses and has at least one IfcBuildingStorey, else it throws and writes nothing |
+| Produces | `storeys`, `walls`, `openings`, `spaces` rows (`source = imported`, locked, as above); meshes `imported/ifc/<IFC class slug>` (stage `import_ifc`) |
+| Checks   | the file is a complete STEP file (ISO-10303-21 header, ENDSEC / END-ISO-10303-21 at the end), web-ifc parses it without errors, and it has an IfcProject and at least one IfcBuildingStorey; else it throws, writes no record or mesh, and its `pipeline_log` row ends `failed` with the message |
 
 Mapping (`libs/reusex/include/io/ifc.hpp`; the geometric readings are the
 Revit import's, shared in `libs/reusex/src/io/bim_mapping.hpp`):
 
 - **Frame.** World is the file's world coordinate system (z up), in metres
   (the project's length unit, `IfcSIUnit` or `IfcConversionBasedUnit`, is
-  converted; web-ifc's Y-up output is turned back). Nothing is aligned to a
+  read once and applied to geometry and attributes alike; web-ifc's Y-up
+  output is turned back). Nothing is aligned to a
   scan. A model whose plan centre lies more than `--recenter-threshold`
   (10 km) from the origin -- a georeferenced file -- is recentred by a
   whole-km x / y offset, as the Revit import (`world_offset_m` in every
@@ -971,7 +977,8 @@ Revit import's, shared in `libs/reusex/src/io/bim_mapping.hpp`):
 - **Walls**: IfcWall / IfcWallStandardCase / IfcWallElementedCase with a
   straight footprint, as Revit walls: centreline of the footprint's
   minimum-area rectangle, measured thickness, z range, `is_external` from
-  `Pset_WallCommon.IsExternal`. The IFC 'Axis' representation is not used:
+  `Pset_WallCommon.IsExternal` (also through an
+  IfcPropertySetDefinitionSet). The IFC 'Axis' representation is not used:
   it often runs along a layer edge (IfcMaterialLayerSetUsage offset), while
   the solid-model axis is the centreline. Thin and non-straight walls, and
   walls with no body left (e.g. fully voided), are mesh-only, counted at
@@ -986,8 +993,12 @@ Revit import's, shared in `libs/reusex/src/io/bim_mapping.hpp`):
   (else its storey's floor to ceiling) -- common in ArchiCAD exports. Name =
   `LongName`, else `Name`; kind `room`.
 - **Meshes**: every product's body (openings voided by web-ifc) merged per
-  IFC class, StandardCase / ElementedCase folded into the base class
-  (`imported/wall`, `imported/slab`, `imported/door`, ...); spatial
+  IFC class. web-ifc meshes every representation of a product (curves and
+  bounding boxes aside); geometry that traces back only to a non-body
+  representation (anything but 'Body', 'Facetation', 'Body-FallBack' or an
+  unnamed one -- e.g. a 'Clearance' solid) is left out, anything else is
+  kept. Merged StandardCase / ElementedCase folded into the base class
+  (`imported/ifc/wall`, `imported/ifc/slab`, `imported/ifc/door`, ...); spatial
   elements, opening elements, annotations and grids are left out. A
   re-import deletes earlier `import_ifc` meshes the file no longer has;
   `--no-meshes` writes and deletes none.

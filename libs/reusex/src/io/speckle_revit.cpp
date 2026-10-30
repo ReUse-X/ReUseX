@@ -403,7 +403,7 @@ RevitImport import_revit(const json &root, const RevitImportOptions &opt) {
 
   // ---- elements and their geometry
   std::vector<Element> walls, openings, rooms;
-  bim::MeshMerger merger; // per-category meshes
+  bim::MeshMerger merger("imported/revit/"); // per-category meshes
   std::function<void(const json &, const std::string &)> walk =
       [&](const json &node, const std::string &parent) {
         if (node.is_array()) {

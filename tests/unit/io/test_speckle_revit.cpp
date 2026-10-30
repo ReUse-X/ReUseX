@@ -321,14 +321,14 @@ void check_model(const RevitImport &r) {
   std::vector<std::string> names;
   for (const auto &mm : r.meshes)
     names.push_back(mm.name);
-  CHECK(names ==
-        std::vector<std::string>{"imported/doors", "imported/furniture",
-                                 "imported/walls", "imported/windows"});
-  const auto *walls = mesh_named(r, "imported/walls");
+  CHECK(names == std::vector<std::string>{
+                     "imported/revit/doors", "imported/revit/furniture",
+                     "imported/revit/walls", "imported/revit/windows"});
+  const auto *walls = mesh_named(r, "imported/revit/walls");
   REQUIRE(walls);
   CHECK(walls->elements == 3);
   CHECK(walls->triangles.size() == 4 * 12);
-  const auto *chair = mesh_named(r, "imported/furniture");
+  const auto *chair = mesh_named(r, "imported/revit/furniture");
   REQUIRE(chair);
   REQUIRE(chair->vertices.size() == 8);
   // Rotated 90 degrees: x in [1000 - 500, 1000], y in [2000, 3000] mm.
@@ -560,7 +560,7 @@ TEST_CASE("import_revit skips an element with an invalid face list",
   const auto r = import_revit(root);
   CHECK(r.stats.elements_bad_geometry == 1);
   CHECK(r.model.walls.size() == 1);
-  const auto *chair = mesh_named(r, "imported/furniture");
+  const auto *chair = mesh_named(r, "imported/revit/furniture");
   REQUIRE(chair);
   CHECK(chair->elements == 1); // only the chair
 }
@@ -621,8 +621,8 @@ TEST_CASE("import_revit_into stores meshes, removes stale ones, logs",
   auto r1 = import_revit_into(db, [&] { return full; }, opt, source);
   CHECK(r1.meshes_saved == 4);
   CHECK(r1.stored.walls == 1);
-  CHECK(db.has_mesh("imported/furniture"));
-  const auto md = db.mesh_metadata("imported/walls");
+  CHECK(db.has_mesh("imported/revit/furniture"));
+  const auto md = db.mesh_metadata("imported/revit/walls");
   CHECK(md.stage == "import_speckle");
   const auto params = json::parse(md.parameters);
   CHECK(params["version"] == "v1");
@@ -634,14 +634,14 @@ TEST_CASE("import_revit_into stores meshes, removes stale ones, logs",
   auto r2 = import_revit_into(db, [&] { return no_chair; }, no_meshes, source);
   CHECK(r2.meshes_saved == 0);
   CHECK(r2.meshes_removed == 0);
-  CHECK(db.has_mesh("imported/furniture"));
-  CHECK(db.has_mesh("imported/walls"));
+  CHECK(db.has_mesh("imported/revit/furniture"));
+  CHECK(db.has_mesh("imported/revit/walls"));
 
   // A version without the chair removes the furniture mesh.
   auto r3 = import_revit_into(db, [&] { return no_chair; }, opt, source);
   CHECK(r3.meshes_saved == 3);
   CHECK(r3.meshes_removed == 1);
-  CHECK_FALSE(db.has_mesh("imported/furniture"));
+  CHECK_FALSE(db.has_mesh("imported/revit/furniture"));
 
   // A failed fetch is logged and stores nothing.
   CHECK_THROWS_AS(import_revit_into(
@@ -663,5 +663,5 @@ TEST_CASE("import_revit_into stores meshes, removes stale ones, logs",
   }
   CHECK(ok == 3);
   CHECK(failed == 1);
-  CHECK(db.has_mesh("imported/walls"));
+  CHECK(db.has_mesh("imported/revit/walls"));
 }

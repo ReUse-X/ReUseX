@@ -27,7 +27,7 @@ DESCRIPTION:
     - Walls         -> walls (axis + thickness from a straight footprint)
     - Doors/Windows -> openings on their host wall
     - placed Rooms  -> spaces (footprint polygon from the room volume)
-    - every category's geometry -> meshes 'imported/<category>'
+    - every category's geometry -> meshes 'imported/revit/<category>'
   Records are stored as source = imported, locked; a re-import replaces the
   earlier imported rows (docs/CONTRACTS.md, "Import write: solid-model
   plan"). Coordinates stay in Revit's internal frame, in metres; aligning

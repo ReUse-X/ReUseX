@@ -159,12 +159,12 @@ struct RevitStoreResult {
 /// Map a resolved Revit tree and store it in @p db: one pipeline_log row
 /// ("import_speckle", parameters = @p source), import_revit() with the
 /// project GUID as namespace, mark_imported + store_solid_model, and the
-/// category meshes as `imported/<slug>` (stage "import_speckle", parameters
-/// = @p source + category, element count, world_offset_m). When meshes are
-/// on, earlier "import_speckle" meshes this tree no longer has are deleted;
-/// with `options.meshes == false` no mesh is written or deleted. Records and
-/// meshes go in one transaction. @p resolved_root is called once, after the
-/// log row is opened, so a failed download is logged too.
+/// category meshes as `imported/revit/<slug>` (stage "import_speckle",
+/// parameters = @p source + category, element count, world_offset_m). When
+/// meshes are on, earlier "import_speckle" meshes this tree no longer has are
+/// deleted; with `options.meshes == false` no mesh is written or deleted.
+/// Records and meshes go in one transaction. @p resolved_root is called once,
+/// after the log row is opened, so a failed download is logged too.
 /// @throws whatever @p resolved_root or import_revit() throws (the log row
 ///         then ends failed and nothing is stored).
 RevitStoreResult import_revit_into(

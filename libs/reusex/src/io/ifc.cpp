@@ -37,7 +37,11 @@
 #include <glm/glm.hpp>
 #include <modelmanager/ModelManager.h>
 #include <schema/ifc-schema.h>
+#include <spdlog/sinks/base_sink.h>
 #include <spdlog/spdlog.h>
+
+#include <mutex>
+#include <set>
 #endif
 
 namespace reusex::io::ifc {
@@ -112,10 +116,21 @@ constexpr int kMaxSpatialDepth = 32;
 struct Reader {
   webifc::parsing::IfcLoader &L;
 
+  /// A line the file defines (a dangling #ref is not one).
+  bool valid(uint32_t id) const { return id != 0 && L.IsValidExpressID(id); }
+
+  /// The token type of an attribute; EMPTY for a line the file does not
+  /// define (web-ifc's MoveToArgumentOffset would silently stay where the
+  /// tape was and the next read would decode another line).
   IfcTokenType token(uint32_t id, uint32_t arg) const {
+    if (!valid(id))
+      return IfcTokenType::EMPTY;
     L.MoveToArgumentOffset(id, arg);
     return L.GetTokenType();
   }
+
+  /// The line type; 0 for an invalid id.
+  uint32_t type(uint32_t id) const { return valid(id) ? L.GetLineType(id) : 0; }
 
   /// A STRING or ENUM attribute, decoded; "" when empty / another type.
   std::string str(uint32_t id, uint32_t arg) const {
@@ -134,12 +149,13 @@ struct Reader {
     return L.GetDoubleArgument();
   }
 
-  /// A REF attribute; 0 when empty.
+  /// A REF attribute; 0 when empty or dangling.
   uint32_t ref(uint32_t id, uint32_t arg) const {
     if (token(id, arg) != IfcTokenType::REF)
       return 0;
     L.StepBack();
-    return L.GetRefArgument();
+    const uint32_t to = L.GetRefArgument();
+    return valid(to) ? to : 0;
   }
 
   /// The REFs of a SET / LIST attribute.
@@ -151,7 +167,8 @@ struct Reader {
     const auto offsets = L.GetSetArgument();
     for (const auto off : offsets)
       if (L.GetTokenType(off) == IfcTokenType::REF)
-        out.push_back(L.GetRefArgument(off));
+        if (const uint32_t to = L.GetRefArgument(off); valid(to))
+          out.push_back(to);
     return out;
   }
 
@@ -226,7 +243,7 @@ double length_unit(const Reader &r) {
   if (units == 0)
     return 1.0;
   for (const uint32_t u : r.refs(units, 0)) {
-    const auto type = r.L.GetLineType(u);
+    const auto type = r.type(u);
     if (type == schema::IFCSIUNIT) {
       if (r.str(u, 1) == "LENGTHUNIT" && r.str(u, 3) == "METRE")
         return si_prefix(r.str(u, 2));
@@ -240,8 +257,7 @@ double length_unit(const Reader &r) {
       const auto ratio = r.real_in_set(factor, 1);
       const uint32_t si = r.ref(factor, 2);
       double base = 1.0;
-      if (si != 0 && r.L.GetLineType(si) == schema::IFCSIUNIT &&
-          r.str(si, 3) == "METRE")
+      if (si != 0 && r.type(si) == schema::IFCSIUNIT && r.str(si, 3) == "METRE")
         base = si_prefix(r.str(si, 2));
       if (ratio)
         return *ratio * base;
@@ -348,6 +364,162 @@ bool skipped_class(uint32_t type) {
   }
 }
 
+/// web-ifc logs through spdlog's *default* logger: free spdlog::debug /
+/// info / error calls throughout its parser and geometry kernel (about 70
+/// sites; ModelManager::SetLogger reaches none of them). In rux the default
+/// logger is rux's own, so `rux -vvv import ifc` printed web-ifc's debug
+/// trace as [rux] lines. While a WebIfcLog::Scope is alive the default
+/// logger is a logger named "web-ifc" over the same sinks, at warn or
+/// above (never below the previous level), which also counts errors; the
+/// previous default logger is restored when the scope ends. Scopes wrap
+/// web-ifc calls only, never this file's own logging (which goes through
+/// the same default logger in rux). Swaps a process global: not
+/// thread-safe, like web-ifc's own logging.
+class WebIfcLog {
+    public:
+  WebIfcLog() : counter_(std::make_shared<Counter>()) {
+    const auto prev = spdlog::default_logger();
+    std::vector<spdlog::sink_ptr> sinks;
+    if (prev)
+      sinks = prev->sinks();
+    sinks.push_back(counter_);
+    logger_ =
+        std::make_shared<spdlog::logger>("web-ifc", sinks.begin(), sinks.end());
+    const auto level = prev ? prev->level() : spdlog::level::info;
+    logger_->set_level(std::max(level, spdlog::level::warn));
+  }
+  ~WebIfcLog() {
+    if (spdlog::get("web-ifc") == logger_)
+      spdlog::drop("web-ifc");
+  }
+  WebIfcLog(const WebIfcLog &) = delete;
+  WebIfcLog &operator=(const WebIfcLog &) = delete;
+
+  class Scope {
+      public:
+    explicit Scope(const WebIfcLog &log) : prev_(spdlog::default_logger()) {
+      spdlog::set_default_logger(log.logger_);
+    }
+    ~Scope() { spdlog::set_default_logger(prev_); }
+    Scope(const Scope &) = delete;
+    Scope &operator=(const Scope &) = delete;
+
+      private:
+    std::shared_ptr<spdlog::logger> prev_;
+  };
+
+  /// Errors web-ifc logged so far.
+  [[nodiscard]] std::size_t errors() const { return counter_->errors; }
+
+    private:
+  struct Counter : spdlog::sinks::base_sink<std::mutex> {
+    std::size_t errors = 0;
+    void sink_it_(const spdlog::details::log_msg &msg) override {
+      if (msg.level >= spdlog::level::err)
+        ++errors;
+    }
+    void flush_() override {}
+  };
+  std::shared_ptr<Counter> counter_;
+  std::shared_ptr<spdlog::logger> logger_;
+};
+
+/// Shape representations that are the element's body. web-ifc meshes every
+/// representation of a product (it skips bounding boxes and curves, but
+/// e.g. a 'Clearance' solid would be meshed).
+bool is_body_representation(const std::string &identifier) {
+  return identifier.empty() || identifier == "Body" ||
+         identifier == "Facetation" || identifier == "Body-FallBack";
+}
+
+/// The ids web-ifc may file a product's meshed geometry under, split by the
+/// kind of representation they come from. web-ifc files a geometry under
+/// a representation item or a part of one (a mapped item's items, a
+/// boolean operand, a surface model's face sets / shells, a geometric
+/// set's elements), so items are expanded through those.
+struct RepresentationItems {
+  std::set<uint32_t> body, other;
+
+  /// Whether a geometry web-ifc filed under @p id is to be left out: it
+  /// belongs to a non-body representation only. Anything not traced to a
+  /// representation is kept.
+  [[nodiscard]] bool drop(uint32_t id) const {
+    return other.count(id) > 0 && body.count(id) == 0;
+  }
+};
+
+RepresentationItems representation_items(const Reader &r, uint32_t product) {
+  RepresentationItems out;
+  const uint32_t shape = r.ref(product, 6);
+  if (shape == 0)
+    return out;
+  std::function<void(std::set<uint32_t> &, uint32_t, int)> add =
+      [&](std::set<uint32_t> &set, uint32_t item, int depth) {
+        if (depth > 8 || !set.insert(item).second)
+          return;
+        switch (r.type(item)) {
+        case schema::IFCMAPPEDITEM: {
+          const uint32_t map = r.ref(item, 0); // IfcRepresentationMap
+          for (const uint32_t sub : r.refs(r.ref(map, 1), 3))
+            add(set, sub, depth + 1);
+          break;
+        }
+        case schema::IFCBOOLEANRESULT:
+        case schema::IFCBOOLEANCLIPPINGRESULT:
+          for (const uint32_t arg : {1u, 2u})
+            if (const uint32_t operand = r.ref(item, arg); operand != 0)
+              add(set, operand, depth + 1);
+          break;
+        case schema::IFCFACEBASEDSURFACEMODEL:
+        case schema::IFCSHELLBASEDSURFACEMODEL:
+        case schema::IFCGEOMETRICSET:
+        case schema::IFCGEOMETRICCURVESET:
+          for (const uint32_t sub : r.refs(item, 0))
+            add(set, sub, depth + 1);
+          break;
+        default:
+          break;
+        }
+      };
+  for (const uint32_t rep : r.refs(shape, 2)) {
+    auto &set = is_body_representation(r.str(rep, 1)) ? out.body : out.other;
+    for (const uint32_t item : r.refs(rep, 3))
+      add(set, item, 0);
+  }
+  return out;
+}
+
+/// A STEP file ends with END-ISO-10303-21; a truncated download or copy
+/// does not, and web-ifc parses what it has without complaint.
+void check_complete(const std::filesystem::path &file) {
+  std::ifstream in(file, std::ios::binary | std::ios::ate);
+  const auto size = static_cast<std::streamoff>(in.tellg());
+  std::string head(static_cast<std::size_t>(std::min<std::streamoff>(size, 64)),
+                   '\0');
+  in.seekg(0);
+  in.read(head.data(), static_cast<std::streamsize>(head.size()));
+  const std::streamoff n = std::min<std::streamoff>(size, 4096);
+  std::string tail(static_cast<std::size_t>(n), '\0');
+  in.seekg(size - n);
+  in.read(tail.data(), n);
+  auto upper = [](std::string s) {
+    for (auto &ch : s)
+      ch = static_cast<char>(std::toupper(static_cast<unsigned char>(ch)));
+    return s;
+  };
+  if (upper(head).find("ISO-10303-21") == std::string::npos)
+    throw std::runtime_error(fmt::format(
+        "import_ifc: '{}' is not an IFC STEP file (no ISO-10303-21 header)",
+        file.string()));
+  const std::string t = upper(tail);
+  if (t.find("END-ISO-10303-21") == std::string::npos ||
+      t.find("ENDSEC") == std::string::npos)
+    throw std::runtime_error(fmt::format(
+        "import_ifc: '{}' is truncated (no ENDSEC / END-ISO-10303-21 at the "
+        "end)",
+        file.string()));
+}
+
 } // namespace
 
 IfcImport import_ifc(const std::filesystem::path &file,
@@ -357,20 +529,34 @@ IfcImport import_ifc(const std::filesystem::path &file,
     throw std::runtime_error(
         fmt::format("import_ifc: cannot open '{}'", file.string()));
 
+  check_complete(file);
+
   IfcImport out;
   auto &st = out.stats;
   st.schema = file_schema(file);
 
+  WebIfcLog wlog;
+  auto quiet = [&](auto &&f) -> decltype(auto) {
+    WebIfcLog::Scope scope(wlog);
+    return f();
+  };
   webifc::manager::ModelManager manager(false);
-  // Not SetLogLevel(): it re-levels the logger it is handed, and a sink-less
-  // logger of its own keeps web-ifc's model-level messages out of rux's.
-  manager.SetLogger(std::make_shared<spdlog::logger>("web-ifc"));
-  const uint32_t model_id =
-      manager.CreateModel(webifc::manager::LoaderSettings{});
+  // Not SetLogLevel(): it re-levels and re-patterns the logger it is handed.
+  // SetLogger only reaches ModelManager's own messages; the rest of web-ifc
+  // logs through spdlog's default logger, see WebIfcLog.
+  manager.SetLogger(std::make_shared<spdlog::logger>("web-ifc-model"));
+  const uint32_t model_id = quiet(
+      [&] { return manager.CreateModel(webifc::manager::LoaderSettings{}); });
   auto *loader = manager.GetIfcLoader(model_id);
-  if (!loader->LoadFile(in))
+  const bool loaded = quiet([&] { return loader->LoadFile(in); });
+  if (!loaded || wlog.errors() > 0)
     throw std::runtime_error(fmt::format(
-        "import_ifc: '{}' is not a readable IFC (STEP) file", file.string()));
+        "import_ifc: '{}' is not a readable IFC (STEP) file ({} parse "
+        "errors)",
+        file.string(), wlog.errors()));
+  if (loader->GetExpressIDsWithType(schema::IFCPROJECT).empty())
+    throw std::runtime_error(
+        fmt::format("import_ifc: '{}' has no IfcProject", file.string()));
   const auto &schemas = manager.GetSchemaManager();
   auto *gp = manager.GetGeometryProcessor(model_id);
   gp->SetTransformation(ifc_z_up());
@@ -382,12 +568,22 @@ IfcImport import_ifc(const std::filesystem::path &file,
       "import_ifc: '{}' ({}), length unit {} m", file.filename().string(),
       st.schema.empty() ? std::string("schema unknown") : st.schema, unit);
 
+  // A product's body in world metres. web-ifc places it in file units
+  // (applyLinearScalingFactor off): `unit` is the one length unit of this
+  // import, for the meshes as for the attributes.
   auto soup_of = [&](uint32_t id, std::size_t *failed) {
     Soup s;
+    const auto reps = representation_items(r, id);
     try {
-      const auto fm = gp->GetFlatMesh(id);
+      const auto fm = quiet([&] { return gp->GetFlatMesh(id, false); });
       for (const auto &pg : fm.geometries) {
-        const auto &g = gp->GetGeometry(pg.geometryExpressID);
+        if (reps.drop(pg.geometryExpressID)) {
+          ++st.non_body_geometries;
+          continue;
+        }
+        const auto &g = quiet([&]() -> const auto & {
+          return gp->GetGeometry(pg.geometryExpressID);
+        });
         const auto base = static_cast<std::uint32_t>(s.v.size());
         const std::size_t nv = g.vertexData.size() / 6;
         for (std::size_t i = 0; i < nv; ++i) {
@@ -395,7 +591,7 @@ IfcImport import_ifc(const std::filesystem::path &file,
               pg.transformation * glm::dvec4(g.vertexData[6 * i],
                                              g.vertexData[6 * i + 1],
                                              g.vertexData[6 * i + 2], 1.0);
-          s.v.emplace_back(p.x, p.y, p.z);
+          s.v.emplace_back(p.x * unit, p.y * unit, p.z * unit);
         }
         for (std::size_t k = 0; k + 2 < g.indexData.size(); k += 3) {
           const auto a = g.indexData[k], b = g.indexData[k + 1],
@@ -437,7 +633,8 @@ IfcImport import_ifc(const std::filesystem::path &file,
     const uint32_t placement = r.ref(id, 5);
     auto &geo = gp->GetLoader();
     const glm::dmat4 m =
-        placement != 0 ? geo.GetLocalPlacement(placement) : glm::dmat4(1.0);
+        placement != 0 ? quiet([&] { return geo.GetLocalPlacement(placement); })
+                       : glm::dmat4(1.0);
     auto world = [&](double x, double y, double z) {
       const glm::dvec4 p = m * glm::dvec4(x, y, z, 1.0);
       return glm::dvec3(p) * unit;
@@ -446,13 +643,14 @@ IfcImport import_ifc(const std::filesystem::path &file,
     for (const uint32_t rep : r.refs(shape, 2)) {
       const std::string ident = r.str(rep, 1);
       for (const uint32_t item : r.refs(rep, 3)) {
-        const auto type = loader->GetLineType(item);
+        const auto type = r.type(item);
         if (ident == "Box" && type == schema::IFCBOUNDINGBOX) {
           const uint32_t corner = r.ref(item, 0);
           const auto zdim = r.real(item, 3);
           if (corner == 0 || !zdim)
             continue;
-          const glm::dvec3 c = geo.GetCartesianPoint3D(corner);
+          const glm::dvec3 c =
+              quiet([&] { return geo.GetCartesianPoint3D(corner); });
           const double lo = world(c.x, c.y, c.z).z;
           const double hi = world(c.x, c.y, c.z + *zdim).z;
           fp.z = std::pair{std::min(lo, hi), std::max(lo, hi)};
@@ -464,7 +662,7 @@ IfcImport import_ifc(const std::filesystem::path &file,
           for (const uint32_t cid : curves) {
             std::vector<P2> ring;
             try {
-              const auto curve = geo.GetCurve(cid, 2);
+              const auto curve = quiet([&] { return geo.GetCurve(cid, 2); });
               for (const auto &q : curve.points) {
                 const glm::dvec3 w = world(q.x, q.y, 0.0);
                 ring.emplace_back(w.x, w.y);
@@ -516,11 +714,20 @@ IfcImport import_ifc(const std::filesystem::path &file,
   std::unordered_map<uint32_t, std::vector<uint32_t>> psets_of;
   for (const uint32_t rel :
        loader->GetExpressIDsWithType(schema::IFCRELDEFINESBYPROPERTIES)) {
-    const uint32_t def = r.ref(rel, 5);
-    if (def == 0 || loader->GetLineType(def) != schema::IFCPROPERTYSET)
-      continue;
-    for (const uint32_t e : r.refs(rel, 4))
-      psets_of[e].push_back(def);
+    // RelatingPropertyDefinition: one property set, or (IFC4) an
+    // IfcPropertySetDefinitionSet -- a typed value, so a LABEL attribute
+    // followed by its set of property sets.
+    std::vector<uint32_t> defs;
+    if (r.token(rel, 5) == IfcTokenType::LABEL)
+      defs = r.refs(rel, 6);
+    else if (const uint32_t def = r.ref(rel, 5); def != 0)
+      defs.push_back(def);
+    for (const uint32_t def : defs) {
+      if (r.type(def) != schema::IFCPROPERTYSET)
+        continue;
+      for (const uint32_t e : r.refs(rel, 4))
+        psets_of[e].push_back(def);
+    }
   }
   // A boolean single value (IFCBOOLEAN / IFCLOGICAL) of a property set.
   auto bool_property = [&](uint32_t id, std::string_view pset,
@@ -532,7 +739,7 @@ IfcImport import_ifc(const std::filesystem::path &file,
       if (r.str(ps, 2) != pset)
         continue;
       for (const uint32_t pv : r.refs(ps, 4)) {
-        if (loader->GetLineType(pv) != schema::IFCPROPERTYSINGLEVALUE ||
+        if (r.type(pv) != schema::IFCPROPERTYSINGLEVALUE ||
             r.str(pv, 0) != prop)
           continue;
         // NominalValue is a typed value: LABEL (arg 2), then its set (3).
@@ -564,7 +771,8 @@ IfcImport import_ifc(const std::filesystem::path &file,
       s.elevation_m = *e * unit;
     const uint32_t placement = r.ref(id, 5);
     if (placement != 0) {
-      const glm::dmat4 m = gp->GetLoader().GetLocalPlacement(placement);
+      const glm::dmat4 m =
+          quiet([&] { return gp->GetLoader().GetLocalPlacement(placement); });
       s.z = m[3][2] * unit;
       s.z_source = "placement";
     } else if (s.elevation_m) {
@@ -583,7 +791,11 @@ IfcImport import_ifc(const std::filesystem::path &file,
         "import_ifc: '{}' has no IfcBuildingStorey", file.string()));
   std::sort(storeys.begin(), storeys.end(),
             [](const Storey &a, const Storey &b) {
-              return a.z < b.z || (a.z == b.z && a.p.name < b.p.name);
+              if (a.z != b.z)
+                return a.z < b.z;
+              if (a.p.name != b.p.name)
+                return a.p.name < b.p.name;
+              return a.p.id < b.p.id;
             });
   st.storeys = storeys.size();
 
@@ -631,6 +843,16 @@ IfcImport import_ifc(const std::filesystem::path &file,
     core::warn("import_ifc: web-ifc could not mesh {} products; they have "
                "no geometry",
                failed);
+  st.geometry_errors = wlog.errors();
+  if (st.geometry_errors > 0)
+    core::warn("import_ifc: web-ifc logged {} errors while meshing (shown "
+               "above as [web-ifc]); the elements concerned may lack "
+               "geometry",
+               st.geometry_errors);
+  if (st.non_body_geometries > 0)
+    core::debug("import_ifc: left out {} meshed items of non-Body "
+                "representations",
+                st.non_body_geometries);
 
   // ---- precision: recentre a model far from the origin (STANDARDS §4),
   // as the Revit import does. Records are computed in double; the stored
@@ -824,13 +1046,13 @@ IfcImport import_ifc(const std::filesystem::path &file,
     }
     s_lo = std::clamp(s_lo, 0.0, g.length);
     s_hi = std::clamp(s_hi, 0.0, g.length);
-    (s_source == "geometry" && z_source == "geometry"
-         ? st.openings_extent_geometry
-         : st.openings_extent_params)++;
     if (s_hi - s_lo < kMinOpeningM || z_hi - z_lo < kMinOpeningM) {
       ++st.openings_unhosted;
       continue;
     }
+    (s_source == "geometry" && z_source == "geometry"
+         ? st.openings_extent_geometry
+         : st.openings_extent_params)++;
     const auto &wall = out.model.walls[*host];
     core::OpeningRecord rec;
     rec.guid = guid_for("openings", p.global_id, oi);
@@ -932,7 +1154,7 @@ IfcImport import_ifc(const std::filesystem::path &file,
 
   // ---- meshes, one per IFC class (StandardCase folded into its base)
   if (opt.meshes) {
-    bim::MeshMerger merger;
+    bim::MeshMerger merger("imported/ifc/");
     for (const auto *group : {&walls, &openings, &others})
       for (const auto &p : *group)
         merger.add(base_class(p.cls), p.geom, ifc_class_slug(p.cls));

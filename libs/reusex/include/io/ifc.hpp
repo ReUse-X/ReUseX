@@ -28,7 +28,8 @@
 ///    -> IfcOpeningElement -> IfcRelVoidsElement -> wall, else by geometry);
 ///  - IfcSpace -> spaces (footprint polygon from the bottom faces of its
 ///    body, else its 'FootPrint' curve with z from its 'Box');
-///  - every product's body geometry -> one mesh per IFC class.
+///  - every product's body geometry -> one mesh per IFC class
+///    (`imported/ifc/<class slug>`).
 ///
 /// web-ifc is an optional dependency: without it (has_ifc_support() false)
 /// import_ifc() and import_ifc_file() throw.
@@ -81,6 +82,11 @@ struct IfcImportStats {
   std::array<double, 3> world_offset_m{0.0, 0.0, 0.0};
   std::size_t products = 0; ///< products read (spatial ones excluded)
   std::size_t products_no_geometry = 0;
+  /// Meshed items of non-Body representations left out (e.g. 'Clearance').
+  std::size_t non_body_geometries = 0;
+  /// Errors web-ifc logged while meshing (parse errors make import_ifc
+  /// throw instead).
+  std::size_t geometry_errors = 0;
   std::size_t storeys = 0;
   std::size_t walls = 0;              ///< wall records
   std::size_t walls_thin = 0;         ///< below min_wall_thickness_m
@@ -117,7 +123,9 @@ bool has_ifc_support();
 /// class, Name, LongName / ObjectType, storey, ...). Every skipped element
 /// kind is counted in the stats and logged at warn with its count.
 /// @throws std::runtime_error when built without web-ifc, when the file
-///         cannot be read or parsed, or when it has no IfcBuildingStorey.
+///         cannot be read, is not a STEP file, is truncated (no ENDSEC /
+///         END-ISO-10303-21), web-ifc reports parse errors, or it has no
+///         IfcProject / IfcBuildingStorey.
 IfcImport import_ifc(const std::filesystem::path &file,
                      const IfcImportOptions &options = {});
 
@@ -135,11 +143,13 @@ struct IfcFileImportResult {
 
 /// `rux import ifc`: map @p file with import_ifc() (guid_namespace = the
 /// project GUID), store the records as imported (io::mark_imported +
-/// io::store_solid_model) and the class meshes as `imported/<slug>` (stage
+/// io::store_solid_model) and the class meshes as `imported/ifc/<slug>` (stage
 /// "import_ifc"; earlier meshes of that stage this import no longer has are
 /// deleted; with options.meshes false no mesh is written or deleted). One
 /// transaction, one pipeline_log row ("import_ifc").
-/// @throws std::runtime_error as import_ifc(); nothing is written then.
+/// @throws std::runtime_error as import_ifc(); no record or mesh is
+///         written then, and the pipeline_log row ends failed with the
+///         message.
 IfcFileImportResult import_ifc_file(ProjectDB &db,
                                     const std::filesystem::path &file,
                                     const IfcImportOptions &options = {});

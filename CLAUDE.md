@@ -811,7 +811,8 @@ External-format adapters only — project state itself lives in `core/ProjectDB`
   mesh merge / write) live in the private `src/io/bim_mapping.{hpp,cpp}`.
   Mapping rules in `docs/CONTRACTS.md` ("Import write: IFC model")
 - `imported_mesh.hpp`: `ImportedMesh`, the per-category display mesh both
-  BIM imports return (`speckle::RevitMesh` is an alias)
+  BIM imports return (`speckle::RevitMesh` is an alias), named by importer:
+  `imported/revit/<category>`, `imported/ifc/<class>`
 - `exif.hpp`: photo metadata (exiv2)
 - `export_scene.hpp`: serializes a reconstructed scene
 - `solid_model_json.hpp`: the solid-model JSON document (reference plans and
@@ -826,7 +827,7 @@ Top-level commands, as registered in `apps/rux/src/rux.cpp`:
 
 | Command | Sub-commands | Source |
 |---|---|---|
-| `import` | `rtabmap`, `mushroom`, `arkitscenes`, `e57`, `ply`, `gsplat`, `materialepas`, `csv`, `360`, `photos`, `speckle` (Revit model via Speckle, read-only: storeys / walls / openings / spaces as imported rows + `imported/<category>` meshes), `ifc` (IFC file via web-ifc: the same tables + `imported/<IFC class>` meshes; needs `REUSEX_HAVE_WEB_IFC`) | `src/import/` |
+| `import` | `rtabmap`, `mushroom`, `arkitscenes`, `e57`, `ply`, `gsplat`, `materialepas`, `csv`, `360`, `photos`, `speckle` (Revit model via Speckle, read-only: storeys / walls / openings / spaces as imported rows + `imported/revit/<category>` meshes), `ifc` (IFC file via web-ifc: the same tables + `imported/ifc/<IFC class>` meshes; needs `REUSEX_HAVE_WEB_IFC`) | `src/import/` |
 | `create` | `clouds`, `dense`, `annotate`, `annotate-360`, `material`, `project`, `planes`, `rooms`, `instances`, `storeys`, `classify`, `walls`, `openings`, `spaces`, `solids`, `materials`, `survey`, `mesh`, `texture`, `windows` (deprecated) | `src/create/` |
 | `export` | `ply`, `e57`, `materialepas`, `csv`, `rhino`, `semantic-images`, `speckle`, `colmap`, `pdf` | `src/export/` |
 | `align` | `360` (content-based panorama pose refinement) | `src/align/` |
@@ -1025,7 +1026,9 @@ Anything not found there is not a dependency.
   `REUSEX_HAVE_WEB_IFC` (a capability flag: `reusex_io` has IFC support), linked
   PRIVATE into `reusex_io`. Keep its includes inside `src/io/ifc*.cpp`: it
   ships its own pinned glm and generic top-level `geometry/`, `schema/`,
-  `cache/` include dirs
+  `cache/` include dirs. It logs through spdlog's *default* logger (rux's), so
+  `src/io/ifc.cpp` wraps every web-ifc call in a `WebIfcLog::Scope` that
+  swaps in a `[web-ifc]` logger at >= warn and counts its errors
 - OpenCV (`core`, `imgproc`, `highgui`) - image processing
 - VTK (`CommonCore`, `CommonDataModel`, `CommonExecutionModel`, `RenderingCore`,
   `RenderingOpenGL2`, `RenderingFreeType` for the plan overlay's labels) - the rendering backend behind `reusex_visualize`'s

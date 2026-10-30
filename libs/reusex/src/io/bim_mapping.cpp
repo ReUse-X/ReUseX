@@ -487,7 +487,7 @@ std::vector<ImportedMesh> MeshMerger::take() {
   for (auto &[slug, cat_soup] : by_slug_) {
     auto &[cat, soup] = cat_soup;
     ImportedMesh m;
-    m.name = "imported/" + slug;
+    m.name = prefix_ + slug;
     m.category = cat;
     m.elements = elements_[slug];
     m.vertices.reserve(soup.v.size());

@@ -13,13 +13,14 @@
 /// @file
 /// The display meshes a BIM import (Revit via Speckle, IFC) brings along
 /// with its solid-model records: one merged triangle mesh per category,
-/// stored as `imported/<slug>`.
+/// stored as `imported/<importer>/<slug>` (`imported/revit/walls`,
+/// `imported/ifc/wall`).
 
 namespace reusex::io {
 
 /// One merged triangle mesh (world frame, metres).
 struct ImportedMesh {
-  std::string name;     ///< "imported/<category slug>"
+  std::string name;     ///< "imported/<importer>/<category slug>"
   std::string category; ///< source category / class, as received
   std::vector<std::array<double, 3>> vertices;
   std::vector<std::array<std::uint32_t, 3>> triangles;

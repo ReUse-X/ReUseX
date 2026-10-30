@@ -150,9 +150,13 @@ class GuidAllocator {
 
 // --------------------------------------------------------------- meshes ---
 
-/// Merges element soups per category slug into ImportedMesh-es.
+/// Merges element soups per category slug into ImportedMesh-es named
+/// `<prefix><slug>`; the prefix names the importer ("imported/revit/",
+/// "imported/ifc/"), so two imports in one project never write the same
+/// mesh.
 class MeshMerger {
     public:
+  explicit MeshMerger(std::string prefix) : prefix_(std::move(prefix)) {}
   /// @p slug empty = mesh_slug(category).
   void add(const std::string &category, const Soup &soup,
            const std::string &slug = {});
@@ -160,10 +164,11 @@ class MeshMerger {
   void extend(Eigen::Vector3d &lo, Eigen::Vector3d &hi) const;
   /// Subtract @p offset from every merged vertex.
   void shift(const Eigen::Vector3d &offset);
-  /// The merged meshes, sorted by name ("imported/<slug>").
+  /// The merged meshes, sorted by name ("<prefix><slug>").
   std::vector<ImportedMesh> take();
 
     private:
+  std::string prefix_;
   std::map<std::string, std::pair<std::string, Soup>> by_slug_;
   std::map<std::string, std::size_t> elements_;
 };
@@ -174,8 +179,9 @@ struct MeshWriteResult {
 };
 
 /// Save @p meshes (stage @p stage, parameters = @p params plus category,
-/// elements, units), then delete the earlier `imported/` meshes of the same
-/// stage this import no longer has. Call inside the caller's transaction.
+/// elements, units), then delete the earlier `imported/...` meshes of the
+/// same stage this import no longer has (also ones written under an older
+/// naming). Call inside the caller's transaction.
 MeshWriteResult write_meshes(ProjectDB &db,
                              const std::vector<ImportedMesh> &meshes,
                              const std::string &stage,

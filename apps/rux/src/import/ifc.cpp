@@ -26,8 +26,8 @@ DESCRIPTION:
     - IfcDoor/IfcWindow -> openings on their host wall (via the
                            IfcOpeningElement they fill, else geometrically)
     - IfcSpace          -> spaces (footprint polygon from the space body)
-    - every product's geometry -> meshes 'imported/<class>' (e.g.
-                           imported/wall, imported/slab, imported/door)
+    - every product's geometry -> meshes 'imported/ifc/<class>' (e.g.
+                           imported/ifc/wall, imported/ifc/slab, ...)
   Records are stored as source = imported, locked; a re-import replaces the
   earlier imported rows (docs/CONTRACTS.md, "Import write: IFC model").
   Coordinates stay in the file's world frame, in metres; a model whose plan
