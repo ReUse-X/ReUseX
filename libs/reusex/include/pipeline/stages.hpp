@@ -18,6 +18,8 @@
 // (segmentation / reconstruction / slam / io) — it is the one place allowed to
 // link several of them at once. See docs/STANDARDS.md §1.
 
+#include "reusex/io/speckle_transport.hpp"
+
 #include <atomic>
 #include <cstdint>
 #include <filesystem>
@@ -197,6 +199,17 @@ struct StageExecutorOptions {
   /// included [s]; 0 = none (the download is then bounded by a low-speed
   /// abort only).
   long speckle_timeout_s = 0;
+
+  /// Vets every connection the import_speckle stage's server reads open,
+  /// by resolved peer address (io::speckle::ConnectFilter; installing one
+  /// also disables proxies). Empty = none. A multi-user front end (ruxd)
+  /// sets its SSRF guard here (public addresses only). Not consulted when
+  /// speckle_download replaces the network read.
+  io::speckle::ConnectFilter speckle_connect_filter;
+  /// Configures every curl handle of those reads after ReUseX's own options
+  /// (io::speckle::CurlSetup: e.g. no redirects). Empty = none. Not
+  /// consulted when speckle_download replaces the network read.
+  io::speckle::CurlSetup speckle_curl_setup;
 
   /// import_ifc may read a file outside the project's directory. Off (the
   /// default), the path must resolve -- symlinks followed -- inside the

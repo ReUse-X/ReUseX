@@ -9,7 +9,9 @@
 // injected-download tests cannot: the token reaching the Authorization
 // header (and nowhere else), the caller's pipeline_log row threaded through
 // import_speckle_revit (exactly one row), and the cancel token / overall
-// timeout aborting a stalled download.
+// timeout aborting a stalled download, and the transport hooks a multi-user
+// front end guards the reads with (StageExecutorOptions::
+// speckle_connect_filter / speckle_curl_setup).
 
 #include <catch2/catch_test_macros.hpp>
 
@@ -32,6 +34,7 @@
 #include <chrono>
 #include <cstdlib>
 #include <mutex>
+#include <stdexcept>
 #include <string>
 #include <thread>
 #include <vector>
@@ -82,6 +85,8 @@ class FakeSpeckleServer {
     std::lock_guard lock(mutex_);
     return requests_;
   }
+  /// TCP connections accepted so far.
+  int connections() const { return connections_.load(); }
   std::vector<std::string> authorizations() {
     std::lock_guard lock(mutex_);
     return auth_;
@@ -96,6 +101,7 @@ class FakeSpeckleServer {
       const int c = ::accept(fd_, nullptr, nullptr);
       if (c < 0)
         continue;
+      ++connections_;
       serve(c);
       ::close(c);
     }
@@ -198,6 +204,7 @@ class FakeSpeckleServer {
   int fd_ = -1;
   uint16_t port_ = 0;
   std::atomic_bool stop_{false};
+  std::atomic_int connections_{0};
   std::thread thread_;
   std::mutex mutex_;
   std::vector<std::string> requests_;
@@ -303,4 +310,122 @@ TEST_CASE("ImportSpeckleHttp_TimeoutAbortsAStalledDownload",
   CHECK(std::chrono::steady_clock::now() - t0 < std::chrono::seconds(10));
   ProjectDB db(project.path, /*readOnly=*/true);
   CHECK(db.walls().empty());
+}
+
+namespace {
+bool is_loopback(const sockaddr *addr, std::size_t len) {
+  if (addr->sa_family == AF_INET && len >= sizeof(sockaddr_in))
+    return ntohl(
+               reinterpret_cast<const sockaddr_in *>(addr)->sin_addr.s_addr) >>
+               24 ==
+           127;
+  if (addr->sa_family == AF_INET6 && len >= sizeof(sockaddr_in6)) {
+    const auto &a = reinterpret_cast<const sockaddr_in6 *>(addr)->sin6_addr;
+    return IN6_IS_ADDR_LOOPBACK(&a) != 0;
+  }
+  return false;
+}
+} // namespace
+
+TEST_CASE("ImportSpeckleHttp_ConnectFilterRefusingLoopback_NoConnection",
+          "[pipeline][stages][import][speckle][http]") {
+  TempPath project("test_import_speckle_http");
+  FakeSpeckleServer server(/*stall=*/false);
+  auto options = local_options();
+  std::atomic_int calls{0};
+  options.speckle_connect_filter = [&](const sockaddr *addr, std::size_t len) {
+    ++calls;
+    return !is_loopback(addr, len);
+  };
+  const StageResult r = run_stage(context(project, server.url()), options);
+  INFO(r.message);
+  CHECK_FALSE(r.ok);
+  CHECK_FALSE(r.cancelled);
+  CHECK(r.message.find("refused by policy") != std::string::npos);
+  CHECK(r.message.find("127.0.0.1:") != std::string::npos);
+  CHECK(r.message.find(kToken) == std::string::npos);
+  CHECK(calls >= 1);
+  // Refused before the socket existed: the server never saw a connection.
+  CHECK(server.connections() == 0);
+  CHECK(server.requests().empty());
+  ProjectDB db(project.path, /*readOnly=*/true);
+  CHECK(db.walls().empty());
+}
+
+TEST_CASE("ImportSpeckleHttp_ConnectFilterThrowing_IsARefusal",
+          "[pipeline][stages][import][speckle][http]") {
+  TempPath project("test_import_speckle_http");
+  FakeSpeckleServer server(/*stall=*/false);
+  auto options = local_options();
+  options.speckle_connect_filter = [](const sockaddr *, std::size_t) -> bool {
+    throw std::runtime_error("resolver policy unavailable");
+  };
+  const StageResult r = run_stage(context(project, server.url()), options);
+  INFO(r.message);
+  CHECK_FALSE(r.ok);
+  CHECK(r.message.find("refused by policy") != std::string::npos);
+  CHECK(server.connections() == 0);
+}
+
+TEST_CASE("ImportSpeckleHttp_ConnectFilterAllowing_SeesEveryConnection",
+          "[pipeline][stages][import][speckle][http]") {
+  TempPath project("test_import_speckle_http");
+  FakeSpeckleServer server(/*stall=*/false);
+  auto options = local_options();
+  std::mutex mutex;
+  std::vector<std::string> seen;
+  options.speckle_connect_filter = [&](const sockaddr *addr, std::size_t len) {
+    REQUIRE(addr->sa_family == AF_INET);
+    REQUIRE(len >= sizeof(sockaddr_in));
+    const auto *in = reinterpret_cast<const sockaddr_in *>(addr);
+    char text[INET_ADDRSTRLEN] = {};
+    ::inet_ntop(AF_INET, &in->sin_addr, text, sizeof text);
+    std::lock_guard lock(mutex);
+    seen.push_back(std::string(text) + ":" +
+                   std::to_string(ntohs(in->sin_port)));
+    return true;
+  };
+  const StageResult r = run_stage(context(project, server.url()), options);
+  INFO(r.message);
+  REQUIRE(r.ok);
+  // One connection per request (the server closes each): GraphQL + objects.
+  REQUIRE(server.connections() == 2);
+  REQUIRE(seen.size() == 2);
+  const std::string expected =
+      "127.0.0.1:" + server.url().substr(server.url().rfind(':') + 1);
+  for (const auto &s : seen)
+    CHECK(s == expected);
+  ProjectDB db(project.path, /*readOnly=*/true);
+  CHECK(db.walls().size() == 1);
+}
+
+TEST_CASE("ImportSpeckleHttp_CurlSetupRunsOnEveryHandle",
+          "[pipeline][stages][import][speckle][http]") {
+  TempPath project("test_import_speckle_http");
+  FakeSpeckleServer server(/*stall=*/false);
+  auto options = local_options();
+  std::vector<void *> handles;
+  options.speckle_curl_setup = [&](void *curl) { handles.push_back(curl); };
+  const StageResult r = run_stage(context(project, server.url()), options);
+  INFO(r.message);
+  REQUIRE(r.ok);
+  REQUIRE(handles.size() == 2); // GraphQL query + object download
+  for (void *h : handles)
+    CHECK(h != nullptr);
+  CHECK(server.connections() == 2);
+}
+
+TEST_CASE("ImportSpeckleHttp_CurlSetupThrowing_AbortsBeforeConnecting",
+          "[pipeline][stages][import][speckle][http]") {
+  TempPath project("test_import_speckle_http");
+  FakeSpeckleServer server(/*stall=*/false);
+  auto options = local_options();
+  options.speckle_curl_setup = [](void *) {
+    throw std::runtime_error("transport policy: refused");
+  };
+  const StageResult r = run_stage(context(project, server.url()), options);
+  INFO(r.message);
+  CHECK_FALSE(r.ok);
+  CHECK(r.message.find("transport policy: refused") != std::string::npos);
+  CHECK(server.connections() == 0);
 }

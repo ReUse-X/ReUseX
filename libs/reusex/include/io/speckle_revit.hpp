@@ -194,6 +194,12 @@ struct SpeckleRevitImportOptions {
   /// Overall limit per request, the object download included [s]; 0 = none
   /// (SpeckleReader::set_timeout_seconds).
   long timeout_s = 0;
+  /// Vets every connection of the server reads by peer address
+  /// (SpeckleReader::set_connect_filter). Empty = none.
+  ConnectFilter connect_filter;
+  /// Configures every curl handle of the server reads
+  /// (SpeckleReader::set_curl_setup). Empty = none.
+  CurlSetup curl_setup;
 };
 
 struct SpeckleRevitImportResult {
