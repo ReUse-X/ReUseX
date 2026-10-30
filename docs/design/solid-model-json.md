@@ -26,7 +26,8 @@ and `scripts/bench-solid.sh` runs that over a manifest of fixtures.
 | What | Where |
 |---|---|
 | Records (PODs) | `libs/reusex/include/core/solid_model.hpp` (`core::SolidModel`, `WallRecord`, ...) |
-| JSON reader / writer | `libs/reusex/include/io/solid_model_json.hpp` (`solid_model_from_json`, `solid_model_to_json`, `load_solid_model`) |
+| JSON reader / writer | `libs/reusex/include/io/solid_model_json.hpp` (`solid_model_from_json`, `solid_model_to_json`) |
+| Project tables | same header: `load_solid_model` (tables -> model), `store_solid_model` (model -> tables, replacing the project's imported rows; `ProjectDB::replace_imported_solid_model`, rules in [`docs/CONTRACTS.md`](../CONTRACTS.md) "Import write: solid-model plan") |
 | YAML reader / writer | same header (`solid_model_from_yaml`, `solid_model_to_yaml`); converts YAML <-> `nlohmann::json`, then shares the JSON reader's one validator |
 | Extension dispatch | `solid_model_from_file` / `solid_model_to_file`: `.yaml`/`.yml` (case-insensitive) is YAML, everything else JSON |
 | JSON Schema | [`solid-model-reference.schema.json`](solid-model-reference.schema.json) (describes the logical document; a YAML file follows the same schema read through the YAML front end) |

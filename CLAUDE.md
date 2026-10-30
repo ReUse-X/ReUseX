@@ -713,7 +713,13 @@ tree — if a doc mentions `RTABMapDatabase`, that doc is stale.
   `core/space_polygon.hpp`; a boundary goes with its space but names its
   wall by GUID; a re-detected space keeps the GUID of the stored one whose
   centroid and area match, else uuid5 of storey + centroid at 5 cm,
-  `core/space_identity.hpp`). Schema v36 adds `survey_parts.dismissed`
+  `core/space_identity.hpp`). An imported model (`rux edit plan
+  --import`, later Revit / IFC) goes into these four tables through
+  `io::store_solid_model()` / `ProjectDB::replace_imported_solid_model()`:
+  one SAVEPOINT that replaces the project's `source = imported` rows of each
+  kind the model provides and keeps detected / manual rows (an unlocked one
+  with the same guid, or storey idx, is taken over; a locked one wins).
+  Schema v36 adds `survey_parts.dismissed`
   (`SurveyPartRecord::dismissed` / `SurveyPartPatch::dismissed`): a part
   marked as an error stays listed but `core/survey_service` leaves it out
   of its type's quantity (`type_quantity`, `set_type_quantity`) and of
