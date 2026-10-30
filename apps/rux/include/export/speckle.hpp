@@ -8,6 +8,7 @@
 #include <CLI/CLI.hpp>
 #include <filesystem>
 #include <memory>
+#include <reusex/io/export_scene.hpp>
 #include <string>
 
 namespace fs = std::filesystem;
@@ -19,6 +20,8 @@ struct SubcommandExportSpeckleOptions {
   std::string root_folder;
   std::string image_url_base = "https://minio.chrk.site/files/reusex";
   std::size_t max_batch_bytes = 25 * 1024 * 1024; // 25 MB
+  /// Cloud reduction and typed elements; defaults are the library's.
+  reusex::io::ExportSceneOptions scene;
 };
 
 void setup_subcommand_export_speckle(CLI::App &parent,

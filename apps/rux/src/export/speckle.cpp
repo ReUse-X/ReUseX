@@ -45,7 +45,12 @@ MODEL STRUCTURE:
   ├── Model "mesh"        # Collection with individual meshes
   ├── Model "360"         # Collection with sphere meshes + properties
   ├── Model "materials"   # Collection with Points + properties
-  └── Model "components"  # Collection with building component boundaries
+  ├── Model "components"  # Collection with building component boundaries
+  └── Model "elements"    # Storey collections -> type collections (Walls,
+                          #   Slabs, Roof, Spaces, Doors, Windows, Other
+                          #   openings) -> one Objects.Data.DataObject per
+                          #   element (GUID as applicationId, key data in
+                          #   properties, mesh as displayValue)
 
   With --root scan1:
   Project/
@@ -102,6 +107,22 @@ NOTES:
                   "HTTP batch size in bytes (default: 25 MB)")
       ->default_val(opt->max_batch_bytes);
 
+  sub->add_option("--cloud-voxel", opt->scene.cloud_voxel_m,
+                  "Export the cloud with one point per voxel of this size "
+                  "[m] (0 = every point). The stored cloud is not changed.")
+      ->default_val(opt->scene.cloud_voxel_m)
+      ->check(CLI::NonNegativeNumber);
+
+  sub->add_option("--max-cloud-points", opt->scene.max_cloud_points,
+                  "Export at most this many cloud points, an even stride "
+                  "over the stored order, after --cloud-voxel (0 = no cap)")
+      ->default_val(opt->scene.max_cloud_points);
+
+  sub->add_flag("!--no-typed-elements", opt->scene.typed_elements,
+                "Leave out the typed elements (storeys, walls, slabs, "
+                "spaces, openings); the solid_* meshes are then exported as "
+                "plain meshes");
+
   sub->callback([opt, global_opt]() {
     spdlog::trace("calling export speckle subcommand");
     rux::finish(run_subcommand_export_speckle(*opt, *global_opt));
@@ -127,7 +148,7 @@ int run_subcommand_export_speckle(SubcommandExportSpeckleOptions const &opt,
     ProjectDB db(project_path, true);
 
     spdlog::info("Gathering export data...");
-    auto scene = io::gather_export_scene(db);
+    auto scene = io::gather_export_scene(db, opt.scene);
 
     spdlog::info("Building Speckle objects...");
     io::speckle::ExportConfig cfg{opt.project_id, opt.image_url_base};
