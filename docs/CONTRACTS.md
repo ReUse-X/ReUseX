@@ -857,6 +857,58 @@ and scene relations in a document are not stored (reported as not stored).
 `JSON -> tables -> JSON` is lossless up to row order and the document's
 `name` / `description`, which have no table.
 
+### Import write: Revit model via Speckle (rux import speckle)
+
+<!-- No backticks in this heading: not a pipeline stage (see above). -->
+
+Fetch one version of a Speckle model published by the Revit connector
+(Speckle v3; `io::speckle::SpeckleReader`, GraphQL queries and HTTP GETs
+only -- nothing is written to the server), map it with
+`io::speckle::import_revit()` and store it with the solid-model import write
+above (`io::speckle::import_speckle_revit()`). One `pipeline_log` row,
+stage `import_speckle` (parameters: server, project, model, version, root
+object; never the token, which comes from `SPECKLE_TOKEN`).
+
+| | |
+|---|---|
+| Consumes | a Speckle server, project, model and version (default the latest) |
+| Produces | `storeys`, `walls`, `openings`, `spaces` rows (`source = imported`, locked, as above); meshes `imported/<category slug>` (stage `import_speckle`) |
+| Checks   | the root carries `levelProxies` (a Revit model), else it throws and writes nothing |
+
+Mapping (`libs/reusex/include/io/speckle_revit.hpp`):
+
+- **Frame.** World is Revit's internal coordinate system in metres, as the
+  connector writes the meshes (any unit the root declares is converted);
+  nothing is aligned to a scan. Level elevations are relative to their
+  elevation base (often the survey point); the offset to internal z is
+  measured from the walls (bottom = base level + base offset; the mode over
+  all walls, logged with its vote count). All storeys share one level frame,
+  as detected storeys do: `level_transform` translates the lowest level's
+  floor to z = 0, `z_floor` is each level's height above it and `z_ceiling`
+  the next level's (the top storey: + `--storey-height`).
+- **Walls**: a Walls element whose footprint (convex hull, minimum-area
+  rectangle) is a straight rectangle becomes a wall: axis through the
+  rectangle's middle, thickness = the type's width (else measured),
+  `z_base` / `height` from its z range, `is_external` from Function =
+  Exterior. Walls thinner than `--min-wall-thickness` (finish layers) and
+  non-straight footprints are mesh-only, each counted at warn.
+- **Openings**: Doors / Windows hosted on an imported wall, by
+  `parentApplicationId` else geometrically (centre within the wall's
+  thickness + 0.3 m, overlapping its run); `s_start` / `s_end` from the
+  element's extent along the host axis, `z_sill` / `z_head` from its z
+  range. Unhosted ones are mesh-only, counted at warn.
+- **Spaces**: Rooms with a volume mesh; the polygon is the outline of its
+  bottom faces (holes kept), `z_floor` / `z_ceiling` from the mesh, area,
+  perimeter, volume, compactness, kind `room`. Unplaced rooms (no volume
+  mesh) are skipped, one warn listing their names.
+- **Meshes**: every element's geometry (instance proxies expanded) merged per
+  category, Rooms excepted, in the world frame; a re-import deletes earlier
+  `import_speckle` meshes this version no longer has.
+- **Identity**: GUIDs are `uuid5(project_guid,
+  "imported/revit/<kind>/<Revit applicationId>")`, so a re-import of the
+  same model keeps them; each record's `metadata` holds the Revit identity
+  (applicationId, elementId, category, family, type, level, IfcGUID, ...).
+
 ### `attributes` (`rux create attributes`)
 
 Describe each material by cropping its linked instance(s) out of their best

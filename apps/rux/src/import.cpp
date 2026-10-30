@@ -14,6 +14,7 @@
 #include "import/photos.hpp"
 #include "import/ply.hpp"
 #include "import/rtabmap.hpp"
+#include "import/speckle.hpp"
 #include <spdlog/spdlog.h>
 
 void setup_subcommand_import(CLI::App &app,
@@ -38,6 +39,7 @@ SUBCOMMANDS:
   csv           Reimport an edited element CSV (from 'rux export csv')
   360           Import 360 panoramic images
   photos        Import manual survey photos as material passports
+  speckle       Import a Revit model from Speckle (read-only)
 
 EXAMPLES:
   rux import rtabmap scan.db           # Import RTABMap scan
@@ -49,6 +51,7 @@ EXAMPLES:
   rux import csv elements.csv          # Reimport edited element CSV
   rux import 360 /path/to/photos/     # Import 360 panoramic images
   rux import photos ./manual_photos/  # Import survey photos
+  rux import speckle --project P --model M  # Revit model via Speckle
 
 NOTES:
   - Use 'rux import <subcommand> --help' for detailed options
@@ -66,6 +69,7 @@ NOTES:
   setup_subcommand_import_csv(*sub, global_opt);
   setup_subcommand_import_panorama(*sub, global_opt);
   setup_subcommand_import_photos(*sub, global_opt);
+  setup_subcommand_import_speckle(*sub, global_opt);
 
   sub->callback([]() {
     spdlog::trace("calling import subcommand");
