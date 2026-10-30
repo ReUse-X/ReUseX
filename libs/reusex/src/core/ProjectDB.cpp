@@ -5685,9 +5685,9 @@ class ProjectDB::Impl {
 
   // ── Panoramic image CRUD ────────────────────────────────────────
 
-  void savePanoramicImage(const std::string &filename,
-                          const std::vector<uint8_t> &jpegData,
-                          double timestamp, int nodeId) {
+  int savePanoramicImage(const std::string &filename,
+                         const std::vector<uint8_t> &jpegData, double timestamp,
+                         int nodeId) {
     const char *upsert = R"(
       INSERT INTO panoramic_images (filename, image, timestamp, node_id)
       VALUES (?, ?, ?, ?);
@@ -5716,6 +5716,7 @@ class ProjectDB::Impl {
     if (sqlite3_step(stmt) != SQLITE_DONE)
       throw std::runtime_error("Failed to insert panoramic image: " +
                                std::string(sqlite3_errmsg(db)));
+    return static_cast<int>(sqlite3_last_insert_rowid(db));
   }
 
   cv::Mat getPanoramicImageById(int id) const {
@@ -5859,10 +5860,10 @@ class ProjectDB::Impl {
   }
 
   void savePanoramaPose(int id, const std::array<double, 16> &pose, int inliers,
-                        double rms) {
+                        double rms, std::string_view source) {
     const char *sql = R"(
       UPDATE panoramic_images
-      SET pose = ?, pose_source = 'aligned', align_inliers = ?, align_rms = ?
+      SET pose = ?, pose_source = ?, align_inliers = ?, align_rms = ?
       WHERE id = ?;
     )";
     sqlite3_stmt *stmt;
@@ -5873,12 +5874,23 @@ class ProjectDB::Impl {
     sqlite3_bind_blob(stmt, 1, pose.data(),
                       static_cast<int>(pose.size() * sizeof(double)),
                       SQLITE_TRANSIENT);
-    sqlite3_bind_int(stmt, 2, inliers);
-    sqlite3_bind_double(stmt, 3, rms);
-    sqlite3_bind_int(stmt, 4, id);
+    sqlite3_bind_text(stmt, 2, source.data(), static_cast<int>(source.size()),
+                      SQLITE_TRANSIENT);
+    if (inliers >= 0)
+      sqlite3_bind_int(stmt, 3, inliers);
+    else
+      sqlite3_bind_null(stmt, 3);
+    if (rms >= 0.0)
+      sqlite3_bind_double(stmt, 4, rms);
+    else
+      sqlite3_bind_null(stmt, 4);
+    sqlite3_bind_int(stmt, 5, id);
     if (sqlite3_step(stmt) != SQLITE_DONE)
       throw std::runtime_error("Failed to update panorama pose: " +
                                std::string(sqlite3_errmsg(db)));
+    if (sqlite3_changes(db) == 0)
+      throw std::out_of_range("save_panorama_pose: no panorama with id " +
+                              std::to_string(id));
   }
 
   // ── Panorama segmentation CRUD (equirect label maps) ───────────────
@@ -9748,11 +9760,11 @@ int ProjectDB::nearest_sensor_frame_by_timestamp(double timestamp) const {
 
 // --- Panoramic Image Operations ---
 
-void ProjectDB::save_panoramic_image(const std::string &filename,
-                                     const std::vector<uint8_t> &jpeg_data,
-                                     double timestamp, int nodeId) {
+int ProjectDB::save_panoramic_image(const std::string &filename,
+                                    const std::vector<uint8_t> &jpeg_data,
+                                    double timestamp, int nodeId) {
   impl_->checkWritable();
-  impl_->savePanoramicImage(filename, jpeg_data, timestamp, nodeId);
+  return impl_->savePanoramicImage(filename, jpeg_data, timestamp, nodeId);
 }
 
 cv::Mat ProjectDB::panoramic_image(int id) const {
@@ -9796,9 +9808,12 @@ int ProjectDB::panoramic_image_count() const {
 }
 
 void ProjectDB::save_panorama_pose(int id, const std::array<double, 16> &pose,
-                                   int inliers, double rms) {
+                                   int inliers, double rms,
+                                   std::string_view source) {
   impl_->checkWritable();
-  impl_->savePanoramaPose(id, pose, inliers, rms);
+  if (source.empty())
+    throw std::invalid_argument("save_panorama_pose: empty pose_source");
+  impl_->savePanoramaPose(id, pose, inliers, rms, source);
 }
 
 bool ProjectDB::has_panorama_segmentation(int panoId) const {
