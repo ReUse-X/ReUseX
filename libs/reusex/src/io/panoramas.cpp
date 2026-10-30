@@ -17,8 +17,8 @@
 #include <cstdint>
 #include <fstream>
 #include <istream>
-#include <sstream>
 #include <stdexcept>
+#include <streambuf>
 #include <string>
 #include <vector>
 
@@ -78,6 +78,32 @@ std::pair<int, int> read_jpeg_dimensions(std::istream &f) {
   }
   return {0, 0};
 }
+
+/// A read-only, seekable istream buffer over bytes already in memory, so the
+/// header parser runs on an upload without copying it.
+class MemoryBuf : public std::streambuf {
+    public:
+  MemoryBuf(const uint8_t *data, std::size_t size) {
+    char *b = const_cast<char *>(reinterpret_cast<const char *>(data));
+    setg(b, b, b + size);
+  }
+
+    protected:
+  pos_type seekoff(off_type off, std::ios_base::seekdir dir,
+                   std::ios_base::openmode /*which*/) override {
+    char *base = dir == std::ios_base::beg   ? eback()
+                 : dir == std::ios_base::cur ? gptr()
+                                             : egptr();
+    const off_type at = (base - eback()) + off;
+    if (at < 0 || at > egptr() - eback())
+      return pos_type(off_type(-1));
+    setg(eback(), eback() + at, egptr());
+    return pos_type(at);
+  }
+  pos_type seekpos(pos_type pos, std::ios_base::openmode which) override {
+    return seekoff(off_type(pos), std::ios_base::beg, which);
+  }
+};
 
 std::pair<int, int> read_jpeg_dimensions(const fs::path &path) {
   std::ifstream f(path, std::ios::binary);
@@ -168,8 +194,8 @@ int register_panorama(ProjectDB &db, const std::string &filename,
   core::validate_panorama_pose(pose);
   require_new_name(db, filename);
   // The same equirect guard as for a file: the JPEG header's dimensions.
-  std::istringstream in(std::string(jpeg.begin(), jpeg.end()),
-                        std::ios::binary);
+  MemoryBuf buf(jpeg.data(), jpeg.size());
+  std::istream in(&buf);
   const auto [w, h] = read_jpeg_dimensions(in);
   if (!(w > 0 && h > 0 && w == 2 * h))
     throw std::invalid_argument("register_panorama: '" + filename +

@@ -154,3 +154,35 @@ TEST_CASE("WhichStorey_OverlappingBands_NearestFloorBelowWins",
   CHECK(which_storey(s, {0.0, 0.0, 2.9}) == 0);
   CHECK(which_storey(s, {0.0, 0.0, 3.2}) == 1);
 }
+
+TEST_CASE("WhichStorey_OpenTopUnderClosedStorey_CappedAtNextFloor",
+          "[core][storeys]") {
+  // Ground floor with an unknown ceiling under a measured upper storey: a
+  // point on the roof above the upper storey is not on the ground floor.
+  const std::vector<StoreyRecord> s = {storey(0, 0.0, 0.0),
+                                       storey(1, 3.0, 5.6)};
+  CHECK(which_storey(s, {0.0, 0.0, 2.9}) == 0);
+  CHECK(which_storey(s, {0.0, 0.0, 3.1}) == 1);
+  CHECK_FALSE(which_storey(s, {0.0, 0.0, 7.0}).has_value());
+  CHECK(which_storey(s, {0.0, 0.0, 7.0}, clamped()) == 1);
+
+  // The cap is the next floor's world point measured in the open storey's
+  // own frame: upper storey in a frame lifted by 3 m, floor at level 0.
+  const std::array<double, 16> lifted = {1, 0, 0, 0,  0, 1, 0, 0,
+                                         0, 0, 1, -3, 0, 0, 0, 1};
+  const std::vector<StoreyRecord> t = {storey(0, 0.0, 0.0),
+                                       storey(1, 0.0, 2.6, lifted)};
+  CHECK(which_storey(t, {0.0, 0.0, 2.9}) == 0);
+  CHECK(which_storey(t, {0.0, 0.0, 3.5}) == 1);
+  CHECK_FALSE(which_storey(t, {0.0, 0.0, 6.0}).has_value());
+}
+
+TEST_CASE("WhichStorey_NonFiniteFrame_RecordIgnored", "[core][storeys]") {
+  auto broken = storey(1, 0.0, 10.0);
+  broken.level_transform[11] = std::numeric_limits<double>::quiet_NaN();
+  const std::vector<StoreyRecord> s = {storey(0, 0.0, 2.6), broken};
+  CHECK(which_storey(s, {0.0, 0.0, 1.0}) == 0);
+  CHECK_FALSE(which_storey(s, {0.0, 0.0, 5.0}, clamped()) == 1);
+  CHECK(which_storey(s, {0.0, 0.0, 5.0}, clamped()) == 0);
+  CHECK_FALSE(which_storey({broken}, {0.0, 0.0, 5.0}, clamped()).has_value());
+}

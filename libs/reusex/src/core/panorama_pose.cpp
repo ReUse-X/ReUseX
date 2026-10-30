@@ -138,8 +138,10 @@ effective_panorama_pose(const ProjectDB &db,
                         const ProjectDB::PanoramicImage &pano) {
   if (pano.has_pose)
     return pano.pose;
-  if (pano.node_id >= 0 && db.has_sensor_frame_pose(pano.node_id))
-    return db.sensor_frame_pose(pano.node_id);
+  if (pano.node_id >= 0 && db.has_sensor_frame_pose(pano.node_id)) {
+    const auto f = db.sensor_frame_pose(pano.node_id);
+    return upright_panorama_pose({f[3], f[7], f[11]}, 0.0);
+  }
   return std::nullopt;
 }
 
@@ -157,13 +159,22 @@ PanoramaPose nudge_panorama_pose(ProjectDB &db, int id,
     throw std::invalid_argument(
         "panorama nudge: set at least one of x, y, z, yaw");
   const auto pano = panorama_record(db, id);
-  const auto base = effective_panorama_pose(db, pano);
-  if (!base)
-    reusex::info("panorama {} has no pose yet; the nudge starts from an "
-                 "upright panorama at the origin facing yaw 0",
-                 id);
-  const PanoramaPose start =
-      base ? *base : upright_panorama_pose({0.0, 0.0, 0.0}, 0.0, nudge.up);
+  PanoramaPose start;
+  if (pano.has_pose) {
+    start = pano.pose;
+  } else {
+    // The levelled placement it is shown at, upright about nudge.up.
+    std::array<double, 3> centre{0.0, 0.0, 0.0};
+    if (pano.node_id >= 0 && db.has_sensor_frame_pose(pano.node_id)) {
+      const auto f = db.sensor_frame_pose(pano.node_id);
+      centre = {f[3], f[7], f[11]};
+    } else {
+      reusex::info("panorama {} has no pose yet; the nudge starts from an "
+                   "upright panorama at the origin facing yaw 0",
+                   id);
+    }
+    start = upright_panorama_pose(centre, 0.0, nudge.up);
+  }
   const PanoramaPose out = apply_panorama_nudge(start, nudge);
   set_panorama_pose_manual(db, id, out);
   return out;

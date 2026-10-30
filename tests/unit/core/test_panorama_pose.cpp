@@ -169,16 +169,36 @@ TEST_CASE("NudgePanoramaPose_YawAndPosition_KeepPitchAndRoll",
   CHECK_THROWS_AS(core::nudge_panorama_pose(db, id, {}), std::invalid_argument);
 }
 
-TEST_CASE("NudgePanoramaPose_NoOwnPose_StartsFromLinkedFrame",
+TEST_CASE("NudgePanoramaPose_NoOwnPose_StartsLevelledAtLinkedFrame",
           "[core][panorama]") {
   test_support::TempPath tmp("test_panorama_pose_seed");
   ProjectDB db(tmp.path);
+  // A phone camera looking down-left, rolled: a rotation that must NOT leak
+  // into the panorama, which the viewers draw levelled (LEVELLED_BASIS).
+  Eigen::Matrix4d frame = Eigen::Matrix4d::Identity();
+  frame.topLeftCorner<3, 3>() =
+      (Eigen::AngleAxisd(0.7, Eigen::Vector3d::UnitZ()) *
+       Eigen::AngleAxisd(-1.1, Eigen::Vector3d::UnitX()) *
+       Eigen::AngleAxisd(0.3, Eigen::Vector3d::UnitY()))
+          .toRotationMatrix();
+  frame.block<3, 1>(0, 3) = Eigen::Vector3d(7.0, 1.0, 1.4);
   db.save_sensor_frame(3, test_support::make_color(16, 12), cv::Mat(),
-                       cv::Mat(), test_support::translation_pose(7.0, 1.0, 1.4),
+                       cv::Mat(),
+                       core::pose_graph::row_major_from_matrix(frame),
                        test_support::make_intrinsics(
                            8, 8, 8, 6, 16, 12, test_support::identity16()));
   const int linked = db.save_panoramic_image("l.jpg", fake_jpeg(), -1.0, 3);
   const int loose = db.save_panoramic_image("u.jpg", fake_jpeg());
+
+  // The shown pose: levelled at the frame centre.
+  const auto shown =
+      core::effective_panorama_pose(db, core::panorama_record(db, linked));
+  REQUIRE(shown);
+  const Eigen::Matrix4d sm = m4(*shown);
+  CHECK(sm.block<3, 1>(0, 0).isApprox(Eigen::Vector3d(0, -1, 0))); // right
+  CHECK(sm.block<3, 1>(0, 1).isApprox(Eigen::Vector3d(0, 0, -1))); // down
+  CHECK(sm.block<3, 1>(0, 2).isApprox(Eigen::Vector3d(1, 0, 0)));  // fwd
+  CHECK(sm.block<3, 1>(0, 3).isApprox(Eigen::Vector3d(7.0, 1.0, 1.4)));
 
   core::PanoramaPoseNudge n;
   n.y = -2.0;
@@ -186,6 +206,8 @@ TEST_CASE("NudgePanoramaPose_NoOwnPose_StartsFromLinkedFrame",
   CHECK(a[3] == Catch::Approx(7.0));
   CHECK(a[7] == Catch::Approx(-2.0));
   CHECK(a[11] == Catch::Approx(1.4));
+  CHECK(m4(a).topLeftCorner<3, 3>().isApprox(sm.topLeftCorner<3, 3>()));
+  CHECK(core::panorama_yaw_deg(a) == Catch::Approx(0.0).margin(1e-9));
 
   // No pose anywhere: an upright panorama at the origin is the start.
   const auto b = core::nudge_panorama_pose(db, loose, n);

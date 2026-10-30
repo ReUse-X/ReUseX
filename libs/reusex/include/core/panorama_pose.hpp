@@ -69,8 +69,12 @@ PanoramaPose apply_panorama_nudge(const PanoramaPose &pose,
 /// The panorama row with @p id. @throws std::out_of_range when none.
 ProjectDB::PanoramicImage panorama_record(const ProjectDB &db, int id);
 
-/// The pose a panorama is shown at: its own (aligned or manual) pose, else
-/// its linked sensor frame's pose (the timestamp placement), else none.
+/// The pose a panorama is shown at: its own (aligned or manual) pose, else,
+/// for a timestamp placement, an upright panorama at its linked sensor
+/// frame's centre facing yaw 0 (world +x, horizon level, about world +z) —
+/// the levelled basis the viewers draw it with (frontend `LEVELLED_BASIS`,
+/// core/instance_evidence.cpp), never the phone camera's rotation — else
+/// none.
 std::optional<PanoramaPose>
 effective_panorama_pose(const ProjectDB &db,
                         const ProjectDB::PanoramicImage &pano);
@@ -80,8 +84,9 @@ effective_panorama_pose(const ProjectDB &db,
 ///         std::out_of_range for an unknown id.
 void set_panorama_pose_manual(ProjectDB &db, int id, const PanoramaPose &pose);
 
-/// Nudge panorama @p id: start from its effective pose (or, with none, from
-/// upright_panorama_pose({0,0,0}, 0, nudge.up)), apply @p nudge and store the
+/// Nudge panorama @p id: start from its own pose; with none, from an upright
+/// panorama (about nudge.up, yaw 0) at its linked frame's centre, or at the
+/// origin when it has no posed frame either; apply @p nudge and store the
 /// result as a manual pose. @return the stored pose.
 /// @throws std::invalid_argument for an empty nudge or a bad field,
 ///         std::out_of_range for an unknown id.

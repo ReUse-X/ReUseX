@@ -90,6 +90,10 @@ TEST_CASE("PanoramaRouter_SetPose_FullUprightAndNudge",
   const auto got = get(registry, "panoramas[0].pose");
   CHECK(got["pose_source"] == "manual");
   CHECK(got["pose"].size() == 16);
+  // Dotted names resolve the same way for get as for set.
+  const auto by_name = get(registry, "panoramas.hall.jpg.pose");
+  CHECK(by_name["pose"] == got["pose"]);
+  CHECK(get(registry, "panoramas.hall.jpg.metadata")["filename"] == "hall.jpg");
 
   CHECK_THROWS(set(registry, "panoramas.hall.jpg.pose", json{{"roll", 3}}));
   CHECK_THROWS(set(registry, "panoramas.hall.jpg.pose",
@@ -98,6 +102,16 @@ TEST_CASE("PanoramaRouter_SetPose_FullUprightAndNudge",
   CHECK_THROWS(
       set(registry, "panoramas.nope.jpg.pose", json::array({0, 0, 0})));
   CHECK_THROWS(set(registry, "panoramas.hall.jpg.metadata", json::object()));
+
+  // ... and for del.
+  db->save_panoramic_image("b.v2.jpg", equirect_jpeg());
+  {
+    auto components = parse_path("panoramas.b.v2.jpg");
+    std::vector<PathComponent> rel(components.begin() + 1, components.end());
+    registry.get_router("panoramas").del(rel);
+  }
+  CHECK_FALSE(db->has_panoramic_image("b.v2.jpg"));
+  CHECK(db->has_panoramic_image("hall.jpg"));
 }
 
 TEST_CASE("ImportPanorama_PoseFlag_RegistersOneManualPanorama",

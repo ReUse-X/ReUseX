@@ -46,7 +46,11 @@ std::array<double, 3> storey_up(const StoreyRecord &s);
 /// - Bands are half-open, [z_floor, z_ceiling): a point exactly on storey
 ///   k+1's floor, which is also storey k's ceiling, is on storey k+1.
 /// - A storey with z_ceiling <= z_floor (ceiling unknown, e.g. a level
-///   imported from a plan that only has elevations) is open upward.
+///   imported from a plan that only has elevations) is open upward up to
+///   the next storey's floor (that floor's world point, measured in this
+///   storey's frame); only the top storey is unbounded. So a point on the
+///   roof above a closed upper storey is not on the ground floor.
+/// - A record with a non-finite level_transform or heights is ignored.
 /// - When several bands hold the point (overlapping bands, an open-topped
 ///   storey under another one) the storey whose floor is nearest below the
 ///   point wins; equal floors go to the lower idx.

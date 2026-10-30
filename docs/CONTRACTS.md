@@ -128,7 +128,7 @@ on purpose):
 
 | `pose_source` | Written by | Meaning |
 |---|---|---|
-| `timestamp` (or NULL, no `pose`) | `rux import 360` | shown at the linked frame's pose |
+| `timestamp` (or NULL, no `pose`) | `rux import 360` | shown levelled (yaw 0, horizon level) at the linked frame's centre |
 | `aligned` | `rux align 360` (`slam/PanoramaAlignment.hpp`) | content-aligned; `align_inliers` / `align_rms` set |
 | `manual` | `core::set_panorama_pose_manual` / `nudge_panorama_pose`, `io::register_panorama` (`rux set panoramas.<name>.pose`, `rux import 360 --pose`) | placed by hand; `align_inliers` / `align_rms` NULL |
 
@@ -143,10 +143,12 @@ Manual poses (reusex-3iy8.5) bypass alignment. A manual pose is validated
 A nudge sets any of world x / y / z and the yaw (heading of the optical
 forward axis about an up direction, world +z by default) and keeps the rest:
 a yaw nudge rotates about up through the centre, so pitch and roll are kept.
-A panorama with no pose of its own is nudged from its linked frame's pose,
-else from an upright panorama at the origin. `io::register_panorama` stores a
+A panorama with no pose of its own is nudged from the levelled placement it is
+drawn with: upright, yaw 0, at its linked frame's centre (never the phone
+camera's rotation), else at the origin. `io::register_panorama` stores a
 new image unlinked (no timestamp matching) with a manual pose, image and pose
-in one transaction. `rux align 360` never replaces a manual pose, not even with
+in one transaction of its own (it cannot run inside a caller's
+`ProjectDB::Transaction`). `rux align 360` never replaces a manual pose, not even with
 `--overwrite`; only `--force` does (`core::panorama_align_decision`). Content-
 alignment consumers that need a measured pose (`rux export colmap`, gsplat
 training views) keep using `aligned` panoramas only. No storey is stored per
@@ -344,7 +346,9 @@ Which storey a world point is on: `core::which_storey`
 `[z_floor, z_ceiling)` of its own level frame (the point's level z is row 3 of
 `level_transform` applied to it), so shared and per-storey frames both work.
 A row with `z_ceiling <= z_floor` (ceiling unknown, e.g. an imported level
-with only an elevation) is open upward. When several bands hold the point the
+with only an elevation) is open upward to the next storey's floor (unbounded
+only for the top storey); a row with a non-finite frame or heights is
+ignored. When several bands hold the point the
 storey whose floor is nearest below it wins. A point in no band (below the
 lowest floor, above the highest ceiling, inside a slab gap) has no storey,
 unless `clamp_to_nearest` is set: then the nearest band's storey, a tie going

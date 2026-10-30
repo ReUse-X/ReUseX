@@ -55,6 +55,44 @@ std::vector<std::string> PanoramaRouter::list() const {
   return names; // Already sorted by filename from DB query
 }
 
+PanoramaRouter::Resolved PanoramaRouter::resolve_item(
+    const std::vector<PathComponent> &components) const {
+  if (components.empty())
+    throw std::runtime_error("Expected a panorama name or index");
+  if (components[0].is_index()) {
+    auto resolved = resolve_index(*components[0].index);
+    if (!resolved)
+      throw std::runtime_error("Array index out of range: " +
+                               std::to_string(*components[0].index));
+    return {*resolved, 1};
+  }
+  if (!components[0].is_item())
+    throw std::runtime_error("Expected item or index after collection");
+  // The path parser splits on '.', so "hall.jpg.pose" arrives as
+  // hall / jpg / pose: the longest prefix that names a stored panorama is
+  // the name, the rest is the property.
+  for (size_t k = components.size(); k >= 1; --k) {
+    std::string name;
+    bool items = true;
+    for (size_t i = 0; i < k; ++i) {
+      items = items && components[i].is_item();
+      name += (i ? "." : "") + components[i].value;
+    }
+    if (items && db_->has_panoramic_image(name))
+      return {name, k};
+  }
+  // Unknown: name it by every component but a trailing property, so the
+  // caller's "not found" names the whole file name.
+  size_t k = components.size();
+  const auto &last = components.back().value;
+  if (k > 1 && (last == "pose" || last == "metadata" || last == "image"))
+    --k;
+  std::string name;
+  for (size_t i = 0; i < k; ++i)
+    name += (i ? "." : "") + components[i].value;
+  return {name, k};
+}
+
 nlohmann::json PanoramaRouter::get_metadata(std::string_view filename) const {
   auto images = db_->list_panoramic_images();
   for (const auto &img : images) {
@@ -106,33 +144,21 @@ DataPayload PanoramaRouter::get(const std::vector<PathComponent> &components) {
     return arr;
   }
 
-  // Resolve item
-  std::string item_name;
-
-  if (components[0].is_index()) {
-    auto resolved = resolve_index(*components[0].index);
-    if (!resolved) {
-      throw std::runtime_error("Array index out of range: " +
-                               std::to_string(*components[0].index));
-    }
-    item_name = *resolved;
-  } else if (components[0].is_item()) {
-    item_name = components[0].value;
-  } else {
-    throw std::runtime_error("Expected item or index after collection");
-  }
-
+  const auto [item_name, used] = resolve_item(components);
   if (item_name.find('*') != std::string::npos) {
     throw std::runtime_error("Wildcard not expanded: " + item_name);
   }
 
-  if (components.size() == 1) {
+  if (components.size() == used) {
     // panoramas.myfile → return JPEG image data
     return get_image_data(item_name);
   }
+  if (components.size() > used + 1)
+    throw std::runtime_error("Unexpected path after panoramas." + item_name +
+                             "." + components[used].value);
 
   // Property access
-  const auto &prop = components[1].value;
+  const auto &prop = components[used].value;
 
   if (prop == "metadata") {
     return get_metadata(item_name);
@@ -150,26 +176,14 @@ DataPayload PanoramaRouter::get(const std::vector<PathComponent> &components) {
 
 void PanoramaRouter::set(const std::vector<PathComponent> &components,
                          const DataPayload &data) {
-  if (components.size() < 2 || components.back().value != "pose")
+  const auto [item_name, used] =
+      components.empty() ? Resolved{} : resolve_item(components);
+  if (!item_name.empty() && !db_->has_panoramic_image(item_name))
+    throw std::runtime_error("Panoramic image not found: " + item_name);
+  if (components.size() != used + 1 || components[used].value != "pose")
     throw std::runtime_error(
         "Only a panorama's pose can be set: rux set panoramas.<name>.pose "
         "<value>. Use 'rux import 360 <path>' to import panoramic images.");
-
-  std::string item_name;
-  if (components[0].is_index()) {
-    if (components.size() != 2)
-      throw std::runtime_error("Expected panoramas[<i>].pose");
-    auto resolved = resolve_index(*components[0].index);
-    if (!resolved)
-      throw std::runtime_error("Array index out of range: " +
-                               std::to_string(*components[0].index));
-    item_name = *resolved;
-  } else {
-    // The path parser splits on '.', so a file name with an extension
-    // ("hall.jpg") arrives as several components: join them back.
-    for (size_t i = 0; i + 1 < components.size(); ++i)
-      item_name += (i ? "." : "") + components[i].value;
-  }
   int id = -1;
   for (const auto &img : db_->list_panoramic_images())
     if (img.filename == item_name)
@@ -216,20 +230,10 @@ void PanoramaRouter::del(const std::vector<PathComponent> &components) {
                              "Specify a filename: panoramas.<filename>");
   }
 
-  std::string item_name;
-
-  if (components[0].is_index()) {
-    auto resolved = resolve_index(*components[0].index);
-    if (!resolved) {
-      throw std::runtime_error("Array index out of range: " +
-                               std::to_string(*components[0].index));
-    }
-    item_name = *resolved;
-  } else if (components[0].is_item()) {
-    item_name = components[0].value;
-  } else {
-    throw std::runtime_error("Expected item name after collection");
-  }
+  const auto [item_name, used] = resolve_item(components);
+  if (used != components.size())
+    throw std::runtime_error("A panorama is deleted whole: rux del "
+                             "panoramas.<name>");
 
   if (!db_->has_panoramic_image(item_name)) {
     throw std::runtime_error("Panoramic image not found: " + item_name);

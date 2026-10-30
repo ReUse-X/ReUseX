@@ -72,7 +72,10 @@ struct RegisterPanoramaOptions {
 /// the decode/store path of `rux import 360` (equirect guard, .insp
 /// stitching, EXIF timestamp) without timestamp matching or content
 /// alignment. The row is stored unlinked (node_id NULL) with
-/// `pose_source = "manual"`, image and pose in one transaction.
+/// `pose_source = "manual"`, image and pose in one transaction, which this
+/// function opens itself (a `ProjectDB::Transaction`, BEGIN IMMEDIATE): do
+/// not call it inside a caller's transaction, which would make that BEGIN
+/// fail.
 ///
 /// @param pose row-major 4x4 panorama-optical -> world (see
 ///        core/panorama_pose.hpp; core::upright_panorama_pose() builds one
@@ -86,8 +89,8 @@ int register_panorama(ProjectDB &db, const std::filesystem::path &file,
                       const std::array<double, 16> &pose,
                       const RegisterPanoramaOptions &opts = {});
 
-/// The same for an equirect JPEG already in memory (an HTTP upload).
-/// @p timestamp epoch seconds, < 0 unknown.
+/// The same for an equirect JPEG already in memory (an HTTP upload); it too
+/// opens its own transaction. @p timestamp epoch seconds, < 0 unknown.
 int register_panorama(ProjectDB &db, const std::string &filename,
                       const std::vector<uint8_t> &jpeg,
                       const std::array<double, 16> &pose,
