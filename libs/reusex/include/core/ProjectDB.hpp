@@ -277,16 +277,20 @@ class ProjectDB {
     bool has_pose = false;
     std::array<double, 16> pose = {1, 0, 0, 0, 0, 1, 0, 0,
                                    0, 0, 1, 0, 0, 0, 0, 1}; // row-major world
-    std::string pose_source = "timestamp"; // "timestamp" | "aligned"
-    int align_inliers = -1;                // RANSAC inliers, -1 if not aligned
+    // "timestamp" (no own pose) | "aligned" (`rux align 360`) | "manual"
+    // (placed by hand, core/panorama_pose.hpp; `rux align 360` leaves it
+    // alone unless --force)
+    std::string pose_source = "timestamp";
+    int align_inliers = -1; // RANSAC inliers, -1 if not aligned
     // Angular RMS of the inlier bearings after resection, in degrees
     // (PanoramaAlignmentResult::rms_deg). -1 if not aligned.
     double align_rms = -1.0;
   };
 
-  void save_panoramic_image(const std::string &filename,
-                            const std::vector<uint8_t> &jpeg_data,
-                            double timestamp = -1.0, int nodeId = -1);
+  /// Store a panorama's JPEG bytes as they are. @return the new row's id.
+  int save_panoramic_image(const std::string &filename,
+                           const std::vector<uint8_t> &jpeg_data,
+                           double timestamp = -1.0, int nodeId = -1);
 
   cv::Mat panoramic_image(int id) const;
   cv::Mat panoramic_image(std::string_view filename) const;
@@ -298,9 +302,15 @@ class ProjectDB {
   std::vector<PanoramicImage> list_panoramic_images() const;
   int panoramic_image_count() const;
 
-  /// Store a content-aligned pose (row-major 4x4 world) for a panorama.
+  /// Store a panorama's own pose (row-major 4x4, panorama-optical -> world)
+  /// with its provenance: "aligned" (content alignment, the default) or
+  /// "manual" (use core::set_panorama_pose_manual(), which validates the
+  /// pose). @p inliers / @p rms < 0 are stored as unknown (NULL).
+  /// @throws std::out_of_range when no panorama has @p id;
+  ///         std::invalid_argument for an empty @p source.
   void save_panorama_pose(int id, const std::array<double, 16> &pose,
-                          int inliers, double rms);
+                          int inliers, double rms,
+                          std::string_view source = "aligned");
 
   // --- Panorama Segmentation Operations ---
 

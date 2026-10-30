@@ -116,6 +116,43 @@ prior, landmark and virtual links are ignored and counted in the import log.
 Links that are self-links, point to a node that was not imported, or carry an
 invalid (null/non-rigid) transform are skipped with a warning.
 
+### Panoramas: import, alignment and manual poses (rux import 360, rux align 360)
+
+360 panoramas live in `panoramic_images`: the equirect JPEG, its EXIF
+timestamp, the sensor frame it was matched to by timestamp (`node_id`, NULL
+when unmatched) and, optionally, its own pose (`pose`, row-major 4x4
+panorama-optical -> world, optical x right / y down / z forward as in
+`geometry/EquirectProjection.hpp`) with its provenance `pose_source`. Not a
+pipeline stage (no `stage_contract` row; the heading carries no stage name
+on purpose):
+
+| `pose_source` | Written by | Meaning |
+|---|---|---|
+| `timestamp` (or NULL, no `pose`) | `rux import 360` | shown at the linked frame's pose |
+| `aligned` | `rux align 360` (`slam/PanoramaAlignment.hpp`) | content-aligned; `align_inliers` / `align_rms` set |
+| `manual` | `core::set_panorama_pose_manual` / `nudge_panorama_pose`, `io::register_panorama` (`rux set panoramas.<name>.pose`, `rux import 360 --pose`) | placed by hand; `align_inliers` / `align_rms` NULL |
+
+| | |
+|---|---|
+| Consumes | image files (import); `panoramic_images` + linked `sensor_frames` with depth and poses (align) |
+| Produces | `panoramic_images` rows (import); `pose` / `pose_source` / `align_*` (align) |
+| Checks   | import: equirect guard (JPEG width == 2 x height; `.insp` is stitched first) |
+
+Manual poses (reusex-3iy8.5) bypass alignment. A manual pose is validated
+(finite, bottom row `[0 0 0 1]`, proper rotation) before anything is written.
+A nudge sets any of world x / y / z and the yaw (heading of the optical
+forward axis about an up direction, world +z by default) and keeps the rest:
+a yaw nudge rotates about up through the centre, so pitch and roll are kept.
+A panorama with no pose of its own is nudged from its linked frame's pose,
+else from an upright panorama at the origin. `io::register_panorama` stores a
+new image unlinked (no timestamp matching) with a manual pose, image and pose
+in one transaction. `rux align 360` never replaces a manual pose, not even with
+`--overwrite`; only `--force` does (`core::panorama_align_decision`). Content-
+alignment consumers that need a measured pose (`rux export colmap`, gsplat
+training views) keep using `aligned` panoramas only. No storey is stored per
+panorama: the storey is derived from the pose with `core::which_storey` (see
+`storeys`).
+
 ### `graph_init` (`rux graph init`)
 
 Snapshot each frame's current pose into `sensor_frames.initial_transform` and
@@ -301,6 +338,17 @@ warns, with the angle and shift, when a kept locked row's frame differs from
 that of the new row it stands for (same GUID, else nearest floor), and when
 its height range overlaps a new row's (measured in that row's frame). `rux get storeys` prints the table; `rux del storeys` removes it, and
 needs `--force` when any row is locked.
+
+Which storey a world point is on: `core::which_storey`
+(`core/storey_lookup.hpp`, reusex-3iy8.4). Each storey is the half-open band
+`[z_floor, z_ceiling)` of its own level frame (the point's level z is row 3 of
+`level_transform` applied to it), so shared and per-storey frames both work.
+A row with `z_ceiling <= z_floor` (ceiling unknown, e.g. an imported level
+with only an elevation) is open upward. When several bands hold the point the
+storey whose floor is nearest below it wins. A point in no band (below the
+lowest floor, above the highest ceiling, inside a slab gap) has no storey,
+unless `clamp_to_nearest` is set: then the nearest band's storey, a tie going
+to the upper one. The same rule holds for `source = imported` rows.
 
 ### `classify` (`rux create classify`)
 

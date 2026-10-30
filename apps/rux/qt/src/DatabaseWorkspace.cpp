@@ -395,11 +395,12 @@ void DatabaseWorkspace::show_item(ProjectTree::Kind kind, const QString &key,
         sec.rows.push_back({"Billede", p.node_id >= 0
                                            ? QString::number(p.node_id)
                                            : QString("—")});
-        sec.rows.push_back({"Pose",
-                            p.pose_source == "aligned"
-                                ? QString("Justeret (rux align 360)")
-                                : QString("Fra tidsstempel"),
-                            SelectionRow::Style::value});
+        sec.rows.push_back(
+            {"Pose",
+             p.pose_source == "aligned"  ? QString("Justeret (rux align 360)")
+             : p.pose_source == "manual" ? QString("Placeret manuelt")
+                                         : QString("Fra tidsstempel"),
+             SelectionRow::Style::value});
         if (p.align_inliers >= 0)
           sec.rows.push_back({"Inliers", count_text(p.align_inliers)});
         if (p.align_rms >= 0)
