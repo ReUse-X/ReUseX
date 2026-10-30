@@ -79,6 +79,17 @@ struct Pointcloud : Base {
   Pointcloud() { speckle_type = "Objects.Geometry.Pointcloud"; }
 };
 
+/// A typed element (Speckle v3 DataObject, the shape the v3 connectors emit
+/// for BIM elements): a name, its key data under `properties` and its
+/// geometry as `displayValue` meshes. The display meshes are detached under
+/// the plain key `displayValue` (a [DetachProperty] in the v3 SDK), so the
+/// element stays small however large its geometry.
+struct DataObject : Base {
+  std::vector<std::shared_ptr<Mesh>> displayValue;
+
+  DataObject() { speckle_type = "Objects.Data.DataObject"; }
+};
+
 /// Shared definition for instance proxies. The `definitionAppId` is what
 /// InstanceProxy.definitionId must match. The `objects` list holds the
 /// `applicationId` of every geometry object that participates in the

@@ -18,6 +18,7 @@
 #include <cmath>
 #include <cstdlib>
 #include <numeric>
+#include <set>
 #include <sstream>
 #include <stdexcept>
 
@@ -222,6 +223,39 @@ nlohmann::json serialize_base(const Base &obj,
       }
       j["instanceDefinitionProxies"] = std::move(defs);
     }
+  }
+
+  // Detach one child: its JSON becomes a separate object (closure tracked),
+  // the parent keeps a reference stub.
+  const auto detach = [&](const Base &child) {
+    ClosureMap child_closure;
+    nlohmann::json child_json =
+        serialize_base(child, all_objects, child_closure);
+    std::string canonical = child_json.dump(
+        -1, ' ', false, nlohmann::json::error_handler_t::replace);
+    std::string child_id = md5_hash(canonical);
+    child_json["id"] = child_id;
+    child_json["totalChildrenCount"] = nullptr;
+    if (!child_closure.empty()) {
+      nlohmann::json cc;
+      for (const auto &[id, d] : child_closure)
+        cc[id] = d;
+      child_json["__closure"] = std::move(cc);
+    }
+    for (const auto &[id, d] : child_closure)
+      closure[id] = d + 1;
+    closure[child_id] = 1;
+    all_objects.push_back(std::move(child_json));
+    return nlohmann::json({{"referencedId", child_id},
+                           {"speckle_type", "reference"},
+                           {"__closure", nullptr}});
+  };
+  if (auto *data = dynamic_cast<const DataObject *>(&obj)) {
+    nlohmann::json display = nlohmann::json::array();
+    for (const auto &m : data->displayValue)
+      if (m)
+        display.push_back(detach(*m));
+    j["displayValue"] = std::move(display);
   }
 
   // Custom user properties go under a "properties" sub-path (Speckle v3
@@ -1087,6 +1121,89 @@ auto export_to_speckle(const ExportScene &scene, const ExportConfig &cfg)
     models.push_back({"components", root});
     core::debug("Speckle: prepared 'components' model ({} components)",
                 scene.components.size());
+  }
+
+  // --- "elements" model: the typed building elements (W6.2) ---
+  // Root collection -> one collection per storey -> one per element type
+  // ("Walls", "Slabs", "Roof", "Spaces", "Doors", "Windows", "Other
+  // openings") -> one DataObject per element, its GUID as applicationId.
+  if (!scene.elements.empty()) {
+    auto root = std::make_shared<Collection>();
+    root->name = "elements";
+    root->version = 3;
+
+    const auto storey_names = storey_layer_names(scene);
+    std::map<int, std::shared_ptr<Collection>> storey_cols;
+    std::map<std::pair<int, std::string>, std::shared_ptr<Collection>>
+        type_cols;
+    const auto collection_for = [&](const ExportScene::ElementEntry &e) {
+      const int idx = storey_names.count(e.storey) ? e.storey : -1;
+      auto &sc = storey_cols[idx];
+      if (!sc) {
+        sc = std::make_shared<Collection>();
+        sc->name =
+            idx >= 0 ? storey_names.at(idx) : std::string(kNoStoreyLayerName);
+        if (idx >= 0)
+          sc->properties["storey"] = idx;
+      }
+      auto &tc = type_cols[{idx, e.category}];
+      if (!tc) {
+        tc = std::make_shared<Collection>();
+        tc->name = element_layer_name(e.category);
+      }
+      return tc;
+    };
+
+    // Numbers and booleans as JSON numbers / booleans, the rest as text.
+    static const std::set<std::string> kNumeric{
+        "thickness", "height",  "length",    "area",      "volume", "width",
+        "sill",      "z_floor", "z_ceiling", "perimeter", "storey", "part"};
+    static const std::set<std::string> kBoolean{"is_external",
+                                                "thickness_assumed"};
+    for (const auto &e : scene.elements) {
+      if (!e.mesh || e.mesh->polygons.empty())
+        continue;
+      auto obj = std::make_shared<DataObject>();
+      obj->name = element_object_name(e);
+      obj->applicationId = e.guid;
+      for (const auto &[k, v] : e.properties) {
+        if (kBoolean.count(k))
+          obj->properties[k] = (v == "true");
+        else if (kNumeric.count(k)) {
+          try {
+            obj->properties[k] = std::stod(v);
+          } catch (const std::exception &) {
+            obj->properties[k] = v;
+          }
+        } else
+          obj->properties[k] = v;
+      }
+      auto mesh = std::make_shared<Mesh>(to_speckle(*e.mesh));
+      mesh->applicationId = uuid_from_identity("display:" + e.guid);
+      obj->displayValue.push_back(mesh);
+      collection_for(e)->elements.push_back(obj);
+    }
+
+    // Storeys in idx order (no storey last), types in the fixed order.
+    const auto &cats = element_categories();
+    for (auto &[idx, sc] : storey_cols) {
+      if (idx < 0)
+        continue;
+      for (const auto &c : cats)
+        if (auto it = type_cols.find({idx, c}); it != type_cols.end())
+          sc->elements.push_back(it->second);
+      root->elements.push_back(sc);
+    }
+    if (auto it = storey_cols.find(-1); it != storey_cols.end()) {
+      for (const auto &c : cats)
+        if (auto t = type_cols.find({-1, c}); t != type_cols.end())
+          it->second->elements.push_back(t->second);
+      root->elements.push_back(it->second);
+    }
+
+    models.push_back({"elements", root});
+    core::debug("Speckle: prepared 'elements' model ({} elements)",
+                scene.elements.size());
   }
 
   return models;

@@ -10,10 +10,12 @@
 #include <pcl/PolygonMesh.h>
 
 #include <array>
+#include <cstddef>
 #include <cstdint>
 #include <map>
 #include <optional>
 #include <string>
+#include <string_view>
 #include <vector>
 
 namespace reusex {
@@ -85,10 +87,72 @@ struct ExportScene {
     std::map<std::string, std::string> properties;
   };
   std::vector<ComponentEntry> components;
+
+  // --- Typed building elements (W6.2, reusex-z1v.8.2) ---
+  /// One storey of the typed model (core::StoreyRecord).
+  struct StoreyEntry {
+    int idx = 0;
+    std::string guid;
+    std::string name; ///< display name; may be empty
+    double z_floor = 0.0, z_ceiling = 0.0;
+  };
+  std::vector<StoreyEntry> storeys; ///< by idx, lowest first
+
+  /// One typed element: a wall, slab or roof piece, space volume, door,
+  /// window or plain opening, with its own closed mesh.
+  struct ElementEntry {
+    std::string category;       ///< wall|slab|roof|space|door|window|opening
+    std::string guid;           ///< the element's GUID (a slab's is derived)
+    std::string name;           ///< its own name (a space's room name), or ""
+    int storey = -1;            ///< StoreyEntry::idx; -1 = no storey
+    pcl::PolygonMesh::Ptr mesh; ///< world coordinates, metres
+    /// The key data as text: guid, type, storey, storey_name and per type
+    /// thickness / height / length / area / volume / room_name /
+    /// opening_kind / host_wall ... (numbers in metres, m2, m3).
+    std::map<std::string, std::string> properties;
+  };
+  std::vector<ElementEntry> elements;
+};
+
+/// How gather_export_scene() reduces what it gathers.
+struct ExportSceneOptions {
+  /// > 0: keep one point per cube of this edge [m] in the exported cloud
+  /// (the first in stored order, so the selection is deterministic). The
+  /// stored cloud is not touched.
+  double cloud_voxel_m = 0.0;
+  /// > 0: keep at most this many points of the exported cloud (after the
+  /// voxel filter), an even stride over the stored (Morton) order.
+  std::size_t max_cloud_points = 0;
+  /// Gather the typed elements (storeys / walls / slabs / spaces /
+  /// openings) from the solid_* meshes, or, when the solids stage has not
+  /// run, from solids built in memory from the typed tables.
+  bool typed_elements = true;
 };
 
 /// Gather all exportable data from a ProjectDB.
-/// Only populates layers that have data.
-ExportScene gather_export_scene(const ProjectDB &db);
+/// Only populates layers that have data. The semantic layer is built over
+/// the same (reduced) point selection as the cloud. When typed elements are
+/// gathered from the solid_* meshes, those meshes are left out of
+/// ExportScene::meshes so no element is exported twice.
+ExportScene gather_export_scene(const ProjectDB &db,
+                                const ExportSceneOptions &options = {});
+
+/// The layer / collection name of an element category: "Walls", "Slabs",
+/// "Roof", "Spaces", "Doors", "Windows", "Other openings".
+std::string element_layer_name(std::string_view category);
+
+/// The element categories in the order exporters list them.
+const std::vector<std::string> &element_categories();
+
+/// The object name of an element: its name (or its type, "Wall", "Door",
+/// ...) followed by its GUID in parentheses.
+std::string element_object_name(const ExportScene::ElementEntry &element);
+
+/// The layer / collection name of each storey of @p scene, by idx: the
+/// storey's name, else "Storey <idx>"; a repeated name gets " (<idx>)".
+std::map<int, std::string> storey_layer_names(const ExportScene &scene);
+
+/// The layer / collection name of the elements that sit on no storey.
+inline constexpr std::string_view kNoStoreyLayerName = "No storey";
 
 } // namespace reusex::io

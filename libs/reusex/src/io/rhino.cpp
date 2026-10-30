@@ -10,11 +10,16 @@
 #include <pcl/common/colors.h>
 #include <pcl/common/io.h>
 
+#include <algorithm>
 #include <chrono>
 #include <cmath>
 #include <ctime>
 #include <iomanip>
+#include <map>
 #include <sstream>
+#include <string_view>
+#include <utility>
+#include <vector>
 
 namespace reusex::io {
 
@@ -241,15 +246,38 @@ auto make_sphere_mesh(double cx, double cy, double cz, double radius,
 namespace {
 
 /// Create a sublayer under a parent layer, returning its index.
+///
+/// The parent is set BEFORE the layer joins the model: a layer name is
+/// unique only among its siblings, so a layer added by name alone and
+/// re-parented afterwards is renamed ("Walls 01") when another parent
+/// already holds one of that name.
 int add_sublayer(ONX_Model &model, const std::string &name,
                  const ON_Layer *parent, ON_Color color = ON_Color::Black) {
-  ON_wString wname(name.c_str());
-  int idx = model.AddLayer(wname, color);
-  auto *layer = const_cast<ON_Layer *>(
-      ON_Layer::Cast(model.LayerFromIndex(idx).ModelComponent()));
+  ON_Layer layer;
+  layer.SetName(ON_wString(name.c_str()));
+  layer.SetColor(color);
   if (parent)
-    layer->SetParentLayerId(parent->Id());
-  return idx;
+    layer.SetParentLayerId(parent->Id());
+  const ON_ModelComponentReference ref = model.AddModelComponent(layer, true);
+  const ON_Layer *added = ON_Layer::Cast(ref.ModelComponent());
+  return added ? added->Index() : ON_UNSET_INT_INDEX;
+}
+
+/// The layer colour of an element category.
+ON_Color element_color(std::string_view category) {
+  if (category == "wall")
+    return ON_Color(170, 170, 170);
+  if (category == "slab")
+    return ON_Color(110, 110, 110);
+  if (category == "roof")
+    return ON_Color(160, 82, 45);
+  if (category == "space")
+    return ON_Color(120, 170, 220);
+  if (category == "door")
+    return ON_Color(139, 90, 43);
+  if (category == "window")
+    return ON_Color(80, 200, 220);
+  return ON_Color(230, 140, 40);
 }
 
 /// Get the current timestamp as "YYYYMMDD-HHmmss".
@@ -375,9 +403,13 @@ auto export_to_rhino(const ExportScene &scene) -> std::unique_ptr<ONX_Model> {
       attr->m_name = ON_wString(entry.name.c_str());
       attr->m_layer_index = mat_layer_idx;
 
-      // Store all properties as user strings
+      // Store all properties as user strings, except "images": the
+      // passport's base64 JPEG blob (the Speckle export skips it too), which
+      // made up ~40 % of a demo .3dm as UTF-16 user text (reusex-f97m).
       for (const auto &[key, value] : entry.properties)
-        attr->SetUserString(ON_wString(key.c_str()), ON_wString(value.c_str()));
+        if (key != "images")
+          attr->SetUserString(ON_wString(key.c_str()),
+                              ON_wString(value.c_str()));
 
       model->AddManagedModelGeometryComponent(dot, attr);
     }
@@ -423,6 +455,59 @@ auto export_to_rhino(const ExportScene &scene) -> std::unique_ptr<ONX_Model> {
     }
     reusex::debug("Rhino: added components layer ({} components)",
                   scene.components.size());
+  }
+
+  // --- Typed elements: <storey>/<Walls|Slabs|Roof|Spaces|Doors|Windows|
+  // Other openings>, one named mesh per element with its key data as user
+  // text (W6.2, reusex-z1v.8.2) ---
+  if (!scene.elements.empty()) {
+    const auto storey_names = storey_layer_names(scene);
+    std::map<int, int> storey_layer; // idx -> layer index
+    std::map<std::pair<int, std::string>, int> type_layer;
+    const auto layer_for = [&](const ExportScene::ElementEntry &e) {
+      const int idx = storey_names.count(e.storey) ? e.storey : -1;
+      auto [sit, fresh] = storey_layer.try_emplace(idx, -1);
+      if (fresh)
+        sit->second = add_sublayer(*model,
+                                   idx >= 0 ? storey_names.at(idx)
+                                            : std::string(kNoStoreyLayerName),
+                                   root_layer);
+      auto [tit, tfresh] = type_layer.try_emplace({idx, e.category}, -1);
+      if (tfresh) {
+        const ON_Layer *parent =
+            ON_Layer::Cast(model->LayerFromIndex(sit->second).ModelComponent());
+        tit->second = add_sublayer(*model, element_layer_name(e.category),
+                                   parent, element_color(e.category));
+      }
+      return tit->second;
+    };
+    // Create the layers in a fixed order (storey, then category), so the
+    // layer panel reads the same for every project.
+    std::vector<const ExportScene::ElementEntry *> ordered;
+    for (const auto &e : scene.elements)
+      ordered.push_back(&e);
+    const auto &cats = element_categories();
+    const auto rank = [&](const ExportScene::ElementEntry *e) {
+      const int s = storey_names.count(e->storey) ? e->storey : 1 << 30;
+      const auto c = std::find(cats.begin(), cats.end(), e->category);
+      return std::pair<int, long>(s, c - cats.begin());
+    };
+    std::stable_sort(
+        ordered.begin(), ordered.end(),
+        [&](const auto *a, const auto *b) { return rank(a) < rank(b); });
+    for (const auto *e : ordered) {
+      if (!e->mesh || e->mesh->polygons.empty())
+        continue;
+      auto rhino_mesh = make_rhino_mesh(*e->mesh);
+      auto *attr = new ON_3dmObjectAttributes();
+      attr->m_name = ON_wString(element_object_name(*e).c_str());
+      attr->m_layer_index = layer_for(*e);
+      for (const auto &[k, v] : e->properties)
+        attr->SetUserString(ON_wString(k.c_str()), ON_wString(v.c_str()));
+      model->AddManagedModelGeometryComponent(rhino_mesh.release(), attr);
+    }
+    reusex::debug("Rhino: added {} typed elements on {} storey layer(s)",
+                  scene.elements.size(), storey_layer.size());
   }
 
   return model;
