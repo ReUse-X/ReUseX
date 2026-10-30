@@ -841,7 +841,16 @@ External-format adapters only — project state itself lives in `core/ProjectDB`
 - `panoramas.hpp`: companion 360 discovery (`import_panoramas`) and
   `register_panorama()` — one new panorama with a manual pose, unlinked, no
   timestamp matching or alignment (`rux import 360 --pose`)
-- `export_scene.hpp`: serializes a reconstructed scene
+- `export_scene.hpp`: serializes a reconstructed scene for `export rhino` /
+  `export speckle`; `ExportSceneOptions` reduces the cloud for the export
+  only (`--cloud-voxel`, `--max-cloud-points`, reusex-f97m) and gathers the
+  typed elements (W6.2): one mesh per wall / slab / roof / space / door /
+  window / opening split from the `solid_*` meshes by their element index
+  (built in memory when `create solids` has not run), with GUID, name and
+  key data. Rhino: `<storey>/<Walls|Slabs|Roof|Spaces|Doors|Windows|Other
+  openings>` layers, objects `<name or type> (<guid>)` with user text;
+  Speckle: an `elements` model of storey -> type collections of
+  `Objects.Data.DataObject`
 - `solid_model_json.hpp`: the solid-model JSON document (reference plans and
   detected models, `core/solid_model.hpp` records)
 - `reusex.hpp`: legacy custom format
