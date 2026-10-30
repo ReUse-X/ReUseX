@@ -44,6 +44,10 @@ QString stage_name_da(pl::JobStage stage) {
     return "Rum som polygoner";
   case pl::JobStage::solids:
     return "Solider (typede)";
+  case pl::JobStage::import_speckle:
+    return "Importér Revit (Speckle)";
+  case pl::JobStage::import_ifc:
+    return "Importér IFC";
   }
   return {};
 }
@@ -83,6 +87,12 @@ QString stage_blurb_da(pl::JobStage stage) {
   case pl::JobStage::solids:
     return "Byg lukkede solider pr. element: vægge med døre og vinduer "
            "skåret ud, dæk pr. etage og rumvolumener.";
+  case pl::JobStage::import_speckle:
+    return "Hent en Revit-model fra Speckle: etager, vægge, åbninger, rum og "
+           "et mesh pr. kategori.";
+  case pl::JobStage::import_ifc:
+    return "Læs en IFC-fil: etager, vægge, åbninger, rum og et mesh pr. "
+           "IFC-klasse.";
   }
   return {};
 }
@@ -395,6 +405,9 @@ reusex::core::PipelineStage contract_stage(pl::JobStage stage) {
     return P::spaces;
   case pl::JobStage::solids:
     return P::solids;
+  case pl::JobStage::import_speckle:
+  case pl::JobStage::import_ifc:
+    return P::import; // an external source: no in-project prerequisite
   }
   return P::clouds;
 }

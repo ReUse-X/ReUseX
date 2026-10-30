@@ -109,8 +109,9 @@ measure the cloud  ->  write / edit plan.json  ->  rux edit plan --dry-run
    ```
 
    `--dry-run` never opens the project. Without it, `--import` stores the
-   plan in the project's solid-model tables; until those tables exist
-   (storeys, walls, spaces, openings), it stores nothing and fails.
+   plan in the project's solid-model tables (storeys, walls, spaces,
+   openings) as imported, locked rows, replacing the plan imported before;
+   detected rows stay (docs/CONTRACTS.md, "Import write: solid-model plan").
 
 6. **Overlay and compare.**
 
@@ -197,8 +198,10 @@ marks when the plan is accepted.
 ## Where the table-backed path plugs in
 
 `rux edit plan --import` calls `io::store_solid_model()` and `--export`
-calls `io::load_solid_model()` (`libs/reusex/include/io/solid_model_json.hpp`).
-Both are where each solid-model table, as it lands, adds its rows, so that
-`JSON -> tables -> JSON` stays lossless. Until then the authoring loop above
-works on the JSON alone: validate with `--dry-run`, check with
-`rux render --plan`.
+calls `io::load_solid_model()` (`libs/reusex/include/io/solid_model_json.hpp`),
+so `JSON -> tables -> JSON` is lossless (up to row order, and the document's
+`name` / `description`, which no table holds). A re-import replaces the
+project's imported rows of each kind the plan provides and leaves detected
+and manual rows alone; the GUID / storey-idx collision rules are in
+docs/CONTRACTS.md ("Import write: solid-model plan"). The same writer is the
+one model importers (Revit via Speckle, IFC) use.

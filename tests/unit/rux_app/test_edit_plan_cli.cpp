@@ -117,16 +117,31 @@ TEST_CASE("EditPlan_InvalidPlan_IsAnInvalidArgument", "[rux_app][edit_plan]") {
         3);
 }
 
-TEST_CASE("EditPlan_ImportIntoAProjectWithoutTables_FailsLoudly",
+TEST_CASE("EditPlan_ImportThenExport_GivesThePlanBack",
           "[rux_app][edit_plan]") {
-  TempPath project("test_edit_plan_notables");
+  // reusex-3iy8.8: --import stores the plan in the solid-model tables and
+  // --export reads it back out; a second --import replaces the first.
+  TempPath project("test_edit_plan_store");
+  TempPath out("test_edit_plan_store_out", ".json");
   {
     reusex::ProjectDB db(project.path);
   }
-  // Nothing can be stored before the solid-model tables exist: a silent
-  // success would leave the user thinking the reference is in the project.
-  CHECK(rux_exit(project.path,
-                 {"--import", fixture("two_rooms.plan.json").string()}) == 4);
+  const auto plan = fixture("two_rooms.plan.json").string();
+  REQUIRE(rux_exit(project.path, {"--import", plan}) == 0);
+  REQUIRE(rux_exit(project.path,
+                   {"--import", plan, "--export", out.path.string()}) == 0);
+
+  auto expected = reusex::io::solid_model_from_file(plan);
+  reusex::io::mark_imported(expected);
+  const auto exported = reusex::io::solid_model_from_file(out.path);
+  CHECK(exported.storeys.size() == expected.storeys.size());
+  CHECK(exported.walls.size() == expected.walls.size());
+  CHECK(exported.wall_joins.size() == expected.wall_joins.size());
+  CHECK(exported.spaces.size() == expected.spaces.size());
+  CHECK(exported.space_boundaries.size() == expected.space_boundaries.size());
+  CHECK(exported.openings.size() == expected.openings.size());
+  for (const auto &w : exported.walls)
+    CHECK((w.source == "imported" && w.locked));
 }
 
 TEST_CASE("EditPlan_Export_WritesTheProjectModel", "[rux_app][edit_plan]") {

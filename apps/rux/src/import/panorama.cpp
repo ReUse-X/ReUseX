@@ -6,8 +6,10 @@
 #include "exit_status.hpp"
 
 #include <reusex/core/ProjectDB.hpp>
+#include <reusex/core/panorama_pose.hpp>
 #include <reusex/io/exif.hpp>
 #include <reusex/io/insta360_x4.hpp>
+#include <reusex/io/panoramas.hpp>
 #include <spdlog/fmt/std.h>
 #include <spdlog/spdlog.h>
 
@@ -88,6 +90,8 @@ EXAMPLES:
   rux import 360 img.insp img2.jpg       # Mix of .insp and .jpg
   rux -p office.rux import 360 ./360/    # Custom project path
   rux import 360 --no-stitch ./360/      # Skip .insp stitching
+  rux import 360 --pose 4.2,1.5,1.6,90 hall.jpg
+                                         # Place one panorama by hand
 
 WORKFLOW:
   1. rux import rtabmap scan.db           # Import SLAM data (with timestamps)
@@ -100,6 +104,11 @@ NOTES:
   - Requires sensor frames with timestamps (import RTABMap data first)
   - Reads EXIF DateTimeOriginal to determine capture time
   - Use --no-stitch to import equirects only (skip .insp files)
+  - --pose x,y,z[,yaw] registers exactly one file at that world position
+    (m), upright, facing yaw degrees about world +z (0 = +x, default 0). It
+    is stored unlinked with pose_source "manual" and is not timestamp
+    matched; `rux align 360` leaves it alone. Move it later with
+    `rux set panoramas.<name>.pose '{"x":..,"y":..,"yaw_deg":..}'`.
 )");
 
   sub->add_option("paths", opt->input_paths,
@@ -110,6 +119,12 @@ NOTES:
   sub->add_flag("--no-stitch", opt->no_stitch,
                 "Skip .insp dual-fisheye stitching; import only pre-stitched "
                 "equirect JPEGs");
+
+  sub->add_option("--pose", opt->pose,
+                  "Place one panorama by hand at x,y,z[,yaw_deg] (world, m / "
+                  "deg); skips timestamp matching and alignment")
+      ->delimiter(',')
+      ->expected(3, 4);
 
   sub->callback([opt, global_opt]() {
     spdlog::trace("calling run_subcommand_import_panorama");
@@ -127,6 +142,38 @@ int run_subcommand_import_panorama(SubcommandImportPanoramaOptions const &opt,
 
   // Collect panorama files (.jpg/.jpeg equirects and .insp dual-fisheye)
   auto files = collect_panorama_files(opt.input_paths);
+
+  if (!opt.pose.empty()) {
+    if (files.size() != 1) {
+      spdlog::error("--pose places exactly one panorama; {} file(s) given",
+                    files.size());
+      return RuxError::INVALID_ARGUMENT;
+    }
+    if (opt.pose.size() < 3 || opt.pose.size() > 4) {
+      spdlog::error("--pose takes x,y,z[,yaw_deg]; {} value(s) given",
+                    opt.pose.size());
+      return RuxError::INVALID_ARGUMENT;
+    }
+    const int log_id = db.log_pipeline_start(
+        "import_360", fmt::format(R"({{"file_count":1,"manual_pose":true}})"));
+    try {
+      const auto pose = reusex::core::upright_panorama_pose(
+          {opt.pose[0], opt.pose[1], opt.pose[2]},
+          opt.pose.size() == 4 ? opt.pose[3] : 0.0);
+      reusex::io::RegisterPanoramaOptions ro;
+      ro.stitch_insp = !opt.no_stitch;
+      const int id = reusex::io::register_panorama(db, files[0], pose, ro);
+      db.log_pipeline_end(log_id, true);
+      spdlog::info("Registered {} as panorama {} (manual pose)",
+                   files[0].filename().string(), id);
+    } catch (const std::exception &e) {
+      db.log_pipeline_end(log_id, false, e.what());
+      spdlog::error("Cannot register {}: {}", files[0].string(), e.what());
+      return RuxError::INVALID_ARGUMENT;
+    }
+    return RuxError::SUCCESS;
+  }
+
   if (files.empty()) {
     spdlog::warn(
         "No panorama files (.jpg/.jpeg/.insp) found in the specified paths");

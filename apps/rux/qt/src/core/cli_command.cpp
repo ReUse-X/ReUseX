@@ -26,7 +26,8 @@ struct StageSpec {
   std::vector<FlagSpec> flags;
 };
 
-/// Mirrors apps/rux/src/create/*.cpp, optimize.cpp and graph/discover.cpp.
+/// Mirrors apps/rux/src/create/*.cpp, optimize.cpp, graph/discover.cpp and
+/// import/{speckle,ifc}.cpp.
 /// Keys absent here have no flag (rooms.propagate_k) and are reported as
 /// unmapped.
 const std::vector<StageSpec> &stage_specs() {
@@ -314,6 +315,31 @@ const std::vector<StageSpec> &stage_specs() {
         {"slab_min_area_m2", "--slab-min-area", {}, {}},
         {"slab_min_hole_area_m2", "--slab-min-hole-area", {}, {}},
         {"roof", {}, {}, "--no-roof"}}},
+      // pipeline/import_parameters.hpp (the token is never a parameter).
+      {"import_speckle",
+       {"import", "speckle"},
+       {{"server", "--server", {}, {}},
+        {"project", "--project", {}, {}},
+        {"model", "--model", {}, {}},
+        {"version", "--version", {}, {}},
+        {"meshes", {}, {}, "--no-meshes"},
+        {"storey_height", "--storey-height", {}, {}},
+        {"min_wall_thickness", "--min-wall-thickness", {}, {}},
+        {"min_wall_fill", "--min-wall-fill", {}, {}},
+        {"opening_host_tolerance", "--opening-host-tolerance", {}, {}},
+        {"elevation_offset", "--elevation-offset", {}, {}},
+        {"recenter", {}, {}, "--no-recenter"},
+        {"recenter_threshold", "--recenter-threshold", {}, {}}}},
+      {"import_ifc",
+       {"import", "ifc"},
+       {{"path", "--path", {}, {}},
+        {"meshes", {}, {}, "--no-meshes"},
+        {"storey_height", "--storey-height", {}, {}},
+        {"min_wall_thickness", "--min-wall-thickness", {}, {}},
+        {"min_wall_fill", "--min-wall-fill", {}, {}},
+        {"opening_host_tolerance", "--opening-host-tolerance", {}, {}},
+        {"recenter", {}, {}, "--no-recenter"},
+        {"recenter_threshold", "--recenter-threshold", {}, {}}}},
   };
   return specs;
 }

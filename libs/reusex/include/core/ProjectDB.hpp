@@ -277,16 +277,20 @@ class ProjectDB {
     bool has_pose = false;
     std::array<double, 16> pose = {1, 0, 0, 0, 0, 1, 0, 0,
                                    0, 0, 1, 0, 0, 0, 0, 1}; // row-major world
-    std::string pose_source = "timestamp"; // "timestamp" | "aligned"
-    int align_inliers = -1;                // RANSAC inliers, -1 if not aligned
+    // "timestamp" (no own pose) | "aligned" (`rux align 360`) | "manual"
+    // (placed by hand, core/panorama_pose.hpp; `rux align 360` leaves it
+    // alone unless --force)
+    std::string pose_source = "timestamp";
+    int align_inliers = -1; // RANSAC inliers, -1 if not aligned
     // Angular RMS of the inlier bearings after resection, in degrees
     // (PanoramaAlignmentResult::rms_deg). -1 if not aligned.
     double align_rms = -1.0;
   };
 
-  void save_panoramic_image(const std::string &filename,
-                            const std::vector<uint8_t> &jpeg_data,
-                            double timestamp = -1.0, int nodeId = -1);
+  /// Store a panorama's JPEG bytes as they are. @return the new row's id.
+  int save_panoramic_image(const std::string &filename,
+                           const std::vector<uint8_t> &jpeg_data,
+                           double timestamp = -1.0, int nodeId = -1);
 
   cv::Mat panoramic_image(int id) const;
   cv::Mat panoramic_image(std::string_view filename) const;
@@ -298,9 +302,15 @@ class ProjectDB {
   std::vector<PanoramicImage> list_panoramic_images() const;
   int panoramic_image_count() const;
 
-  /// Store a content-aligned pose (row-major 4x4 world) for a panorama.
+  /// Store a panorama's own pose (row-major 4x4, panorama-optical -> world)
+  /// with its provenance: "aligned" (content alignment, the default) or
+  /// "manual" (use core::set_panorama_pose_manual(), which validates the
+  /// pose). @p inliers / @p rms < 0 are stored as unknown (NULL).
+  /// @throws std::out_of_range when no panorama has @p id;
+  ///         std::invalid_argument for an empty @p source.
   void save_panorama_pose(int id, const std::array<double, 16> &pose,
-                          int inliers, double rms);
+                          int inliers, double rms,
+                          std::string_view source = "aligned");
 
   // --- Panorama Segmentation Operations ---
 
@@ -904,6 +914,71 @@ class ProjectDB {
   /// action).
   void delete_spaces();
 
+  // --- Solid-model import (io::store_solid_model, `rux edit plan --import`)
+
+  /// What replace_imported_solid_model() wrote and replaced.
+  struct SolidModelImportResult {
+    size_t storeys = 0, walls = 0, spaces = 0, openings = 0; ///< rows written
+    /// Rows with source "imported" deleted (locked ones included), over the
+    /// kinds the model provides; their joins / boundaries not counted.
+    size_t replaced_imported = 0;
+    /// Unlocked detected / manual rows an imported record replaced because
+    /// it holds the same guid (a storey: the same guid or idx).
+    size_t taken_over = 0;
+    /// Records not written because a locked detected / manual row holds
+    /// their guid (a storey: guid or idx) -- the locked row wins.
+    size_t skipped_locked = 0;
+    /// Wall joins and space boundaries that went (ON DELETE CASCADE) with
+    /// a taken-over wall / space.
+    size_t dropped_relations = 0;
+    /// Imported wall joins not written because both their walls were held
+    /// back by locked rows.
+    size_t skipped_joins = 0;
+  };
+
+  /// Store an imported building model (a reference plan, a Revit / IFC
+  /// model): for each element kind @p model provides (SolidModel::has_*),
+  /// delete the project's rows whose source is "imported" -- locked ones
+  /// included, joins / boundaries with their walls / spaces -- and write
+  /// @p model's records as they are (callers stamp source "imported",
+  /// locked with io::mark_imported()). Every other row stays, with two
+  /// exceptions, each logged at warn with the count:
+  ///  - a record whose guid (a storey: guid or idx) an UNLOCKED detected /
+  ///    manual row holds replaces that row: storeys are keyed by idx, so an
+  ///    imported storey 0 becomes the project's storey 0, and an exported
+  ///    and re-imported detected element becomes the imported version;
+  ///  - a record whose guid (a storey: guid or idx) a LOCKED detected /
+  ///    manual row holds is not written: the locked row wins, as for
+  ///    save_storeys() and the other writers.
+  /// A taken-over row's wall joins / space boundaries go with it
+  /// (dropped_relations). An imported storey that matches one unlocked row
+  /// by guid and ANOTHER by idx takes over both, so the walls / spaces of
+  /// the first row's idx are left on a storey the table no longer holds:
+  /// the call counts walls / spaces of every source on a missing storey idx
+  /// and warns with the number (load_solid_model() still returns them).
+  /// Kinds the model does not provide are not touched. A wall join may name
+  /// any wall the table holds after the import, but must touch at least one
+  /// wall of @p model's walls: joins have no source column and go only with
+  /// their walls, so a join between two stored walls could never be
+  /// replaced by a re-import; one whose walls were both held back by locked
+  /// rows is not written (skipped_joins). An opening or a space boundary
+  /// must name a wall the table holds (std::invalid_argument otherwise).
+  /// Every diagnostic is counted before the SAVEPOINT is released, so a
+  /// failure rolls the import back rather than surfacing after the commit. The
+  /// whole call is one SAVEPOINT (it nests in a ProjectDB::Transaction): a
+  /// refused record leaves every table as it was. Plane classes and scene
+  /// relations in @p model are not stored (plane classes belong to a detected
+  /// cloud).
+  /// @p run_id is the pipeline_log row that produced them (-1 = none).
+  /// @throws std::invalid_argument for a record save_storeys(),
+  ///         save_walls(), save_openings() or save_spaces() refuses, a join
+  ///         touching no wall of @p model, or an opening / boundary naming
+  ///         a wall the project does not hold;
+  ///         std::runtime_error on a read-only project or one without a
+  ///         table for a kind the model provides.
+  SolidModelImportResult
+  replace_imported_solid_model(const core::SolidModel &model, int run_id = -1);
+
   // --- Scans (multi-session import, #129) ---
 
   /// One row of the `scans` table.  Each `rux import` creates one record;
@@ -1379,6 +1454,21 @@ class ProjectDB {
   [[nodiscard]] std::optional<std::vector<std::uint8_t>>
   report_pdf(int64_t id) const;
 
+  // --- Report assets (schema v38) ---
+
+  /// Insert or replace a named report image (today only "cover", the
+  /// uploaded cover image, core/report_cover.hpp).
+  /// @throws std::runtime_error on a read-only or pre-v38 project;
+  ///         std::invalid_argument for an empty name or empty data.
+  void set_report_asset(std::string_view name,
+                        const std::vector<std::uint8_t> &data,
+                        std::string_view mime_type);
+  /// {bytes, MIME type}, or nullopt when absent (or pre-v38).
+  [[nodiscard]] std::optional<std::pair<std::vector<std::uint8_t>, std::string>>
+  report_asset(std::string_view name) const;
+  /// False when absent. @throws std::runtime_error on a read-only project.
+  bool delete_report_asset(std::string_view name);
+
   // --- Resource templates (schema v25) ---
   /// One row of `templates` (resources/templates spec §5.1). members_json
   /// and csv_json are parsed by core/resource_templates.hpp.
@@ -1424,6 +1514,14 @@ class ProjectDB {
     int semantic_class = -1; // the class sync_survey seeded it from
     std::string created_at;  // ISO 8601 UTC
     std::string updated_at;
+    /// The chosen build-up (schema v37, survey_types.buildup_id): an id in
+    /// core::buildup_library(). nullopt: none chosen, or before v37.
+    std::optional<std::string> buildup_id{};
+    /// What building element the type's element-backed parts are
+    /// (core::BuildupCategory text: ydervaeg | indervaeg | daek | tag), set
+    /// when core::measure_survey seeded the type from the typed model;
+    /// nullopt for every other type. Kept LAST for aggregate initializers.
+    std::optional<std::string> element_category{};
   };
   /// Sparse update; an engaged optional sets the field. For the nullable
   /// numbers the outer optional says "change it", the inner one the new value.
@@ -1433,8 +1531,13 @@ class ProjectDB {
     // Unchecked storage write — set approval through core::set_review_status,
     // which enforces the sample gate.
     std::optional<core::ReviewStatus> review_status;
+    /// mass_t is the user's override (schema v37): null clears it, and
+    /// the type's mass is then calculated (core/survey_mass.hpp).
     std::optional<std::optional<double>> confidence, mass_t;
     std::optional<bool> starred;
+    /// Choose (or clear) the build-up (schema v37). Throws
+    /// std::runtime_error on a project below v37 (opened read-only).
+    std::optional<std::optional<std::string>> buildup_id{};
   };
   struct SurveyPartRecord {
     std::string code; // "RX-001"
@@ -1463,15 +1566,40 @@ class ProjectDB {
     /// The resource's chosen image (schema v27: survey_parts.view_*).
     /// nullopt when none was chosen, before v27, or when the frame/panorama
     /// it names no longer exists (logged at warn). Read-only on add/patch:
-    /// set through set_survey_part_view. Kept LAST so positional aggregate
-    /// initializers still compile.
+    /// set through set_survey_part_view. Kept before dismissed so positional
+    /// aggregate initializers still compile.
     std::optional<core::ResourceView> view{};
+    /// Marked as an error ("Markér som fejl", schema v36:
+    /// survey_parts.dismissed). Non-destructive and reversible: the part is
+    /// still listed and keeps its code, passport and links, but
+    /// core/survey_service leaves it out of its type's quantity
+    /// (set_type_quantity, report_survey_rows) and of rooms_without_parts.
+    /// sync_survey never re-creates or un-dismisses it. Always false before
+    /// v36. Kept before the geometry fields so positional aggregate
+    /// initializers still compile.
+    bool dismissed = false;
+    /// Model geometry the part is grounded in (schema v37), written by
+    /// core::measure_survey through set_survey_part_geometry; read-only on
+    /// add (except element_guid) and patch. element_guid names the wall,
+    /// opening or slab piece (walls.guid, openings.guid, or the slab
+    /// piece's deterministic guid); an element-backed part (no instance)
+    /// is keyed on it. geom_quantity is the measured quantity in geom_unit
+    /// ("m²" | "m³" | "stk"); geom_source says how it was measured:
+    /// solid_volume | wall_area | opening_area | slab_area | plane_area |
+    /// count. All empty before v37 or before the first measure.
+    std::optional<std::string> element_guid{};
+    std::optional<double> geom_quantity{};
+    std::string geom_unit{};
+    std::string geom_source{};
   };
   struct SurveyPartPatch {
     std::optional<int64_t> type_id;
     std::optional<double> quantity;
     std::optional<bool> starred;
     std::optional<std::string> note, room_name;
+    /// Dismiss / restore the part (schema v36). Throws std::runtime_error on
+    /// a project below v36 (opened read-only, so not migrated). Kept LAST.
+    std::optional<bool> dismissed{};
   };
 
   SurveyTypeRecord
@@ -1513,6 +1641,61 @@ class ProjectDB {
   ///         std::out_of_range (no part, no sensor frame, no panorama).
   void set_survey_part_view(std::string_view code,
                             const std::optional<core::ResourceView> &view);
+  /// Set or clear (nullopt quantity) a part's measured geometry (schema
+  /// v37). @p element_guid replaces the stored one (nullopt clears it).
+  /// Does not open a transaction. @throws std::out_of_range (no part),
+  /// std::invalid_argument (unknown source, empty unit with a quantity),
+  /// std::runtime_error (below v37).
+  void set_survey_part_geometry(std::string_view code,
+                                const std::optional<std::string> &element_guid,
+                                std::optional<double> geom_quantity,
+                                std::string_view geom_unit,
+                                std::string_view geom_source);
+  /// The part filed under @p element_guid, if any (schema v37).
+  [[nodiscard]] std::optional<SurveyPartRecord>
+  survey_part_for_element(std::string_view element_guid) const;
+  /// True when the survey tables carry the v37 mass columns.
+  [[nodiscard]] bool has_survey_mass_columns() const;
+
+  // --- Build-up overrides (schema v37) ---
+  /// One row of `buildups`: a project build-up (core/buildups.hpp JSON
+  /// object) that replaces the library entry of the same id or adds one.
+  struct ProjectBuildupRecord {
+    std::string id;
+    std::string definition; ///< JSON object, parsed by core::parse_buildup
+    std::string updated_at;
+  };
+  /// By id. Empty before v37.
+  [[nodiscard]] std::vector<ProjectBuildupRecord> project_buildups() const;
+  /// Upsert. Storage only: validate with core::parse_buildup first.
+  void set_project_buildup(std::string_view id, std::string_view definition);
+  bool delete_project_buildup(std::string_view id); // false when absent
+
+  // --- Value provenance (schema v37) ---
+  /// Where one survey value came from (gap 2): scope "type" (id = the
+  /// type id as text) or "part" (id = the part code); field is the record
+  /// field ("quantity", "mass_t", "buildup_id", ...); kind is
+  /// core::ProvenanceKind text (scan | measured | calculated | entered |
+  /// suggested); source says which step or element (free text, e.g.
+  /// "measure:wall_area" or "user"); confidence 0..1 when known.
+  struct ValueProvenanceRecord {
+    std::string scope, id, field, kind, source;
+    std::optional<double> confidence;
+    std::string updated_at; ///< ISO 8601 UTC; ignored on write
+  };
+  /// Upsert on (scope, id, field). Does not open a transaction.
+  /// @throws std::invalid_argument (scope / kind outside the vocabulary),
+  ///         std::runtime_error (below v37).
+  void set_value_provenance(const ValueProvenanceRecord &rec);
+  /// False when there was none (or before v37).
+  bool delete_value_provenance(std::string_view scope, std::string_view id,
+                               std::string_view field);
+  /// The rows of one value holder, by field. Empty before v37.
+  [[nodiscard]] std::vector<ValueProvenanceRecord>
+  value_provenance(std::string_view scope, std::string_view id) const;
+  /// Every row, by scope, id, field. Empty before v37.
+  [[nodiscard]] std::vector<ValueProvenanceRecord> all_value_provenance() const;
+
   /// Deletes a survey type; its parts and sample links cascade. Storage only:
   /// tombstones and passports are core::delete_survey_type's job.
   /// @throws std::out_of_range when @p id is unknown.
@@ -1601,7 +1784,9 @@ class ProjectDB {
   void set_sample_part_links(int64_t id,
                              const std::vector<std::string> &part_codes);
   /// Samples that bear on @p type_id: linked to it directly, or linked to a
-  /// survey part currently filed under it. By id, each sample once.
+  /// non-dismissed survey part currently filed under it (a dismissed part,
+  /// schema v36, is a misdetection and bears on nothing). By id, each sample
+  /// once.
   [[nodiscard]] std::vector<SampleRecord>
   samples_for_type(int64_t type_id) const;
 

@@ -238,6 +238,22 @@ configure_file(
     @ONLY
 )
 
+# -----------------------------------------------
+# Embed the default build-up library (Opbygninger, survey mass, reusex-uprf)
+# -----------------------------------------------
+# include/core/buildups.json is the only copy; a project overrides entries by
+# id in its `buildups` table (schema v37).
+set(REUSEX_BUILDUPS_JSON
+    ${CMAKE_CURRENT_SOURCE_DIR}/include/core/buildups.json)
+set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS
+    ${REUSEX_BUILDUPS_JSON})
+file(READ ${REUSEX_BUILDUPS_JSON} REUSEX_BUILDUPS_TEXT)
+configure_file(
+    ${CMAKE_CURRENT_SOURCE_DIR}/include/core/buildups_default.hpp.in
+    ${CMAKE_BINARY_DIR}/generated/reusex/core/buildups_default.hpp
+    @ONLY
+)
+
 # ===============================================
 # Shared usage requirements (include dirs, flags, external deps)
 # ===============================================
@@ -398,6 +414,20 @@ target_link_libraries(reusex_io PRIVATE opencv_imgcodecs opencv_stitching)
 # yaml-cpp: the solid-model YAML front-end (solid_model_json.cpp). PRIVATE:
 # not part of any public header (reusex-yf4.1).
 target_link_libraries(reusex_io PRIVATE yaml-cpp::yaml-cpp)
+# web-ifc: IFC STEP parsing + geometry (Dependencies.cmake, optional).
+# PRIVATE: no public header exposes a web-ifc type, and web-ifc includes must
+# stay confined to the src/io/ifc*.cpp TUs. Its include dirs are generic and
+# would shadow or collide elsewhere: it installs its own pinned glm and
+# top-level directories named geometry/, schema/, cache/, parsing/.
+#
+# REUSEX_HAVE_WEB_IFC (PUBLIC) is a capability flag only: "reusex_io was built
+# with IFC support". It does NOT mean web-ifc headers are includable by a
+# consumer -- the static library's PRIVATE dep travels as
+# $<LINK_ONLY:web-ifc::web-ifc>, which carries no include directories.
+if(REUSEX_HAVE_WEB_IFC)
+    target_link_libraries(reusex_io PRIVATE web-ifc::web-ifc)
+    target_compile_definitions(reusex_io PUBLIC REUSEX_HAVE_WEB_IFC)
+endif()
 
 reusex_add_module(reusex_vision ${REUSEX_VISION_SOURCES})
 target_link_libraries(reusex_vision PUBLIC reusex_core)
@@ -599,5 +629,6 @@ if(NOT CMAKE_CURRENT_SOURCE_DIR STREQUAL CMAKE_SOURCE_DIR)
     set(USE_MIP_SOLVER ${USE_MIP_SOLVER} PARENT_SCOPE)
     set(ENABLED_ML_BACKENDS ${ENABLED_ML_BACKENDS} PARENT_SCOPE)
     set(REUSEX_HAVE_GSPLAT ${REUSEX_HAVE_GSPLAT} PARENT_SCOPE)
+    set(REUSEX_HAVE_WEB_IFC ${REUSEX_HAVE_WEB_IFC} PARENT_SCOPE)
     set(REUSEX_PACKAGE_TARGETS ${REUSEX_PACKAGE_TARGETS} PARENT_SCOPE)
 endif()

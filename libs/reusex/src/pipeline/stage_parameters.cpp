@@ -6,6 +6,7 @@
 #include <reusex/pipeline/stage_parameters.hpp>
 
 #include <reusex/core/storey_identity.hpp>
+#include <reusex/pipeline/import_parameters.hpp>
 #include <reusex/pipeline/mesh_parameters.hpp>
 #include <reusex/pipeline/opening_parameters.hpp>
 #include <reusex/pipeline/solid_parameters.hpp>
@@ -707,6 +708,10 @@ const std::vector<ParameterDescriptor> &stage_parameters(JobStage stage) {
     return space_stage_parameters();
   case JobStage::solids:
     return solid_stage_parameters();
+  case JobStage::import_speckle:
+    return speckle_stage_parameters();
+  case JobStage::import_ifc:
+    return ifc_stage_parameters();
   }
   throw std::logic_error("unhandled JobStage in stage_parameters()");
 }

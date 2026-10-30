@@ -450,7 +450,12 @@ scene builder, `visualize::populate_scene()` (`visualize/scene.hpp`); its
 Pipeline workspace runs stages in-process through `pipeline::JobRunner` with
 `pipeline::stage_executor_with_optimize()` (which runs `optimize` and
 `graph_discover`; handed over in `GuiLaunch`; `ruxd`
-injects the same executor for the web GUI, from its own repo), and "Kopiér som
+injects the same executor for the web GUI, from its own repo, passing
+`StageExecutorOptions` whose `speckle_token(ctx, server)` supplies the
+submitting user's token to `import_speckle` — a credential is never a job
+parameter, and a `token` key is refused for every stage; the Qt client
+passes `StageExecutorOptions::local_user()`; the Qt Pipeline
+list hides `annotate`, `import_speckle` and `import_ifc`), and "Kopiér som
 rux-kommando" (`rux_qt/cli_command.hpp`) is round-trip tested against the real
 CLI (`tests/unit/rux_app/test_cli_command_roundtrip.cpp`, via
 `rux::set_stage_params_sink`). `RUX_QT_PAGE=oversigt|3d|rediger|pipeline|log`
@@ -713,7 +718,36 @@ tree — if a doc mentions `RTABMapDatabase`, that doc is stale.
   `core/space_polygon.hpp`; a boundary goes with its space but names its
   wall by GUID; a re-detected space keeps the GUID of the stored one whose
   centroid and area match, else uuid5 of storey + centroid at 5 cm,
-  `core/space_identity.hpp`)
+  `core/space_identity.hpp`). An imported model (`rux edit plan
+  --import`, `rux import speckle`, `rux import ifc`) goes into these four
+  tables through
+  `io::store_solid_model()` / `ProjectDB::replace_imported_solid_model()`:
+  one SAVEPOINT that replaces the project's `source = imported` rows of each
+  kind the model provides and keeps detected / manual rows (an unlocked one
+  with the same guid, or storey idx, is taken over; a locked one wins).
+  Schema v36 adds `survey_parts.dismissed`
+  (`SurveyPartRecord::dismissed` / `SurveyPartPatch::dismissed`): a part
+  marked as an error stays listed but `core/survey_service` leaves it out
+  of its type's quantity (`type_quantity`, `set_type_quantity`) and of
+  `rooms_without_parts`; reversible, and `sync_survey` leaves it alone.
+  Schema v37 grounds survey quantities and mass in the model (reusex-uprf):
+  `survey_parts.element_guid` / `geom_quantity` / `geom_unit` /
+  `geom_source` (written by `core::measure_survey`,
+  `core/survey_measure.hpp`, run at the end of `sync_survey`: wall / slab /
+  roof element parts, opening areas, counts), `survey_types.buildup_id` /
+  `element_category`, the `buildups` table (project overrides of the
+  embedded `core/buildups.json` library, `core/buildups.hpp`) and
+  `value_provenance` (scan / measured / calculated / entered / suggested
+  per type or part field). `survey_types.mass_t` is now the user's
+  override; `core/survey_mass.hpp` computes the effective mass (override,
+  else build-up × quantity) that `type_totals` and the report read.
+  Schema v38 adds `report_assets` (named report images,
+  `set_report_asset` / `report_asset`): the uploaded cover of the PDF
+  report. The cover choice itself is project setting `report/cover_image`
+  (`core/report_cover.hpp`: a frame or panorama + region, or the upload);
+  the BEK 496 Sagsdata fields are project settings
+  `sagsdata/<project id>/<field>` (`core/sagsdata.hpp`), shared by ruxd and
+  `write_report_data`
 - Migrating schema; `LATEST_SCHEMA_VERSION` is defined in
   `src/core/ProjectDB.cpp` — read it there rather than trusting a doc (it moves
   most releases)
@@ -752,7 +786,13 @@ tree — if a doc mentions `RTABMapDatabase`, that doc is stale.
 Other core pieces: `logging.hpp`, `stages.hpp` (`Stage` enum),
 `validate.hpp` (`check_stage_inputs`, backing `rux validate --stage`),
 `MaterialPassport.hpp` + `materialepas_*`, `guid.hpp`, `SensorIntrinsics.hpp`,
-`processing_observer.hpp` / `visual_observer.hpp`, `filter_expression.hpp`.
+`processing_observer.hpp` / `visual_observer.hpp`, `filter_expression.hpp`,
+`storey_lookup.hpp` (`which_storey()`: world point -> storey idx through each
+row's level frame, half-open `[z_floor, z_ceiling)`, optional clamp to the
+nearest band; reusex-3iy8.4), `panorama_pose.hpp` (manual 360 poses:
+`set_panorama_pose_manual()`, `nudge_panorama_pose()` for x/y/z/yaw keeping
+pitch and roll, `panorama_align_decision()` — `rux align 360` keeps a
+`pose_source = "manual"` pose unless `--force`; reusex-3iy8.5).
 
 ### I/O Module
 
@@ -763,8 +803,41 @@ External-format adapters only — project state itself lives in `core/ProjectDB`
 - `e57.hpp`, `ply.hpp`: point cloud exchange
 - `rhino.hpp`: OpenNURBS (.3dm) import/export
 - `colmap.hpp`: COLMAP sparse model export
-- `speckle.hpp`: Speckle export
+- `speckle.hpp`: Speckle export (upload-only `SpeckleClient`)
+- `speckle_reader.hpp`: Speckle receive, read-only by construction
+  (`SpeckleReader`: GraphQL queries + HTTP GETs only). Project / model /
+  version lookup, the whole object tree in one GET (`ObjectTree`), and
+  `ObjectTree::resolve` (references, `@`-detached keys, DataChunk joins)
+- `speckle_revit.hpp`: Revit model (Speckle v3 Revit connector) -> solid
+  model + per-category meshes (`import_revit`, pure), and the entry point
+  `import_speckle_revit` (fetch, map, store as imported) of the job stage
+  `JobStage::import_speckle` (`rux import speckle`, ruxd jobs; the Speckle
+  token comes from `StageExecutorOptions::speckle_token` -- none set, the
+  stage is refused; the CLI and the Qt client pass
+  `StageExecutorOptions::local_user()`, which reads `SPECKLE_TOKEN` -- never
+  from parameters; cancellable, `speckle_timeout_s`; server policy
+  `default_speckle_server_allowed()` or the `allowed_speckle_server` hook). Revit internal frame in metres, one shared level frame;
+  mapping rules in `docs/CONTRACTS.md` ("Import write: Revit model via
+  Speckle")
+- `ifc.hpp`: IFC file -> solid model + per-class meshes through web-ifc
+  (`import_ifc`, pure apart from reading the file) and the entry point
+  `import_ifc_file` of the job stage `JobStage::import_ifc` (`rux import
+  ifc`, ruxd jobs; the path must lie in the project's directory unless
+  `allow_paths_outside_project`). Both stages' parameters (keys, CLI flags,
+  bounds) come from one table each, `pipeline/import_parameters.hpp`, and
+  are strict: unknown keys are refused and only the re-serialised table
+  keys are stored (`normalize_import_parameters()`). Same rules as the Revit import; the
+  geometric readings both share (wall axis from the footprint rectangle,
+  room outline from bottom faces, opening hosting, GUID scheme, recentring,
+  mesh merge / write) live in the private `src/io/bim_mapping.{hpp,cpp}`.
+  Mapping rules in `docs/CONTRACTS.md` ("Import write: IFC model")
+- `imported_mesh.hpp`: `ImportedMesh`, the per-category display mesh both
+  BIM imports return (`speckle::RevitMesh` is an alias), named by importer:
+  `imported/revit/<category>`, `imported/ifc/<class>`
 - `exif.hpp`: photo metadata (exiv2)
+- `panoramas.hpp`: companion 360 discovery (`import_panoramas`) and
+  `register_panorama()` — one new panorama with a manual pose, unlinked, no
+  timestamp matching or alignment (`rux import 360 --pose`)
 - `export_scene.hpp`: serializes a reconstructed scene
 - `solid_model_json.hpp`: the solid-model JSON document (reference plans and
   detected models, `core/solid_model.hpp` records)
@@ -778,21 +851,21 @@ Top-level commands, as registered in `apps/rux/src/rux.cpp`:
 
 | Command | Sub-commands | Source |
 |---|---|---|
-| `import` | `rtabmap`, `mushroom`, `arkitscenes`, `e57`, `ply`, `gsplat`, `materialepas`, `csv`, `360`, `photos` | `src/import/` |
+| `import` | `rtabmap`, `mushroom`, `arkitscenes`, `e57`, `ply`, `gsplat`, `materialepas`, `csv`, `360`, `photos`, `speckle` (Revit model via Speckle, read-only: storeys / walls / openings / spaces as imported rows + `imported/revit/<category>` meshes), `ifc` (IFC file via web-ifc: the same tables + `imported/ifc/<IFC class>` meshes; needs `REUSEX_HAVE_WEB_IFC`) | `src/import/` |
 | `create` | `clouds`, `dense`, `annotate`, `annotate-360`, `material`, `project`, `planes`, `rooms`, `instances`, `storeys`, `classify`, `walls`, `openings`, `spaces`, `solids`, `materials`, `survey`, `mesh`, `texture`, `windows` (deprecated) | `src/create/` |
 | `export` | `ply`, `e57`, `materialepas`, `csv`, `rhino`, `semantic-images`, `speckle`, `colmap`, `pdf` | `src/export/` |
-| `align` | `360` (content-based panorama pose refinement) | `src/align/` |
+| `align` | `360` (content-based panorama pose refinement; skips manually placed panoramas unless `--force`) | `src/align/` |
 | `edit` | `downsample`, `perturb-poses` (drift synthesis, #338) | `src/edit/` |
 | `analyze` | `quality`, `accuracy`, `solid` (typed model vs a reference plan), `drift` (where the stored poses disagree: pass-to-pass residual vs noise floor, segment pairs + ICP suggestions, through-wall crossings) | `src/analyze/` |
 | `optimize` | — (solves the stored pose graph; `--edits e.yaml` steers it with pose edits, `--edits e.yaml --watch` is the hot-reload pose loop: in-memory re-solve on every save, preview cloud, drift renders, metrics block with a shear indicator and paste-ready YAML suggestions, `optimize_watch.hpp`, [`docs/guides/pose-reference-authoring.md`](docs/guides/pose-reference-authoring.md)) | `src/optimize.cpp` |
 | `graph` | `init`, `discover`, `prune` (stored pose graph) | `src/graph/` |
 | `register` | — (joint pairwise registration) | `src/register.cpp` |
 | `validate` | — (`--stage`, `--json`) | `src/validate.cpp` |
-| `get` / `set` / `del` | path-based DB access (`src/database/*_router.cpp`) | `src/get.cpp`, `src/set.cpp`, `src/del.cpp` |
+| `get` / `set` / `del` | path-based DB access (`src/database/*_router.cpp`; `rux set panoramas.<name>.pose` takes a 4x4, `[x,y,z,yaw]` or a `{x,y,z,yaw_deg}` nudge) | `src/get.cpp`, `src/set.cpp`, `src/del.cpp` |
 | `info` | — (project summary) | `src/info.cpp` |
 | `log` | — (pipeline execution history) | `src/log.cpp` |
 | `view` | — (interactive viewer, needs a display; `--plan gt.yaml --watch` = hot-reloading ground-truth workbench over `populate_scene`, `view/plan_workbench.hpp`) | `src/view/` |
-| `render` | — (headless render to PNG: `--view top\|plan[:h]\|front\|back\|left\|right\|orbit:N\|frame:<id>`, `--section x=<m>\|y=<m>\|<x0>,<y0>:<x1>,<y1>`; layers incl. `frustums`, `panoramas`, `deviation` (cloud coloured by distance to the mesh), `walls` (the walls table: footprints on a sheet over the cut in plan/top, boxes in 3D; assumed or < 50 % seen dimmer — also a Qt 3D layer, "Vægge"), `openings` (the openings table: bars on the walls in plan/top, rectangles in both wall faces in 3D, coloured by kind — Qt 3D "Åbninger"), `spaces` (the spaces table: translucent polygons in their room's label colour with name and area, at floor height in 3D, a sheet under the walls in plan/top — Qt 3D "Rum (polygoner)"), `solids` (the `solid_*` meshes: walls blue with door / window reveals in their kind's colour, slabs grey, spaces translucent orange, cut with the scene — Qt 3D "Solider (typede)", on by default when present, walls / openings rows then off); label layers on the `--label-*` token scale; `--qa` writes the mesh-QA contact sheet, `visualize/qa_sheet.hpp`; `--plan gt.yaml --watch` re-renders and prints plan scores on every save, `render_watch.hpp`) | `src/render.cpp` |
+| `render` | — (headless render to PNG: `--view top\|plan[:h]\|front\|back\|left\|right\|orbit:N\|frame:<id>`, `--section x=<m>\|y=<m>\|<x0>,<y0>:<x1>,<y1>`; layers incl. `frustums`, `panoramas`, `deviation` (cloud coloured by distance to the mesh), `walls` (the walls table: footprints on a sheet over the cut in plan/top, boxes in 3D; assumed or < 50 % seen dimmer — Qt 3D "Vægbokse"), `openings` (the openings table: bars on the walls in plan/top, rectangles in both wall faces in 3D, coloured by kind — Qt 3D "Åbningsrammer"), `spaces` (the spaces table: translucent polygons in their room's label colour with name and area, at floor height in 3D, a sheet under the walls in plan/top — Qt 3D "Rumflader"), `solids` (the `solid_*` meshes: walls blue with door / window reveals in their kind's colour, slabs grey, spaces translucent orange, cut with the scene — Qt 3D "Solider (typede)", on by default when present, walls / openings rows then off; every one of these layers tags its actors with an element category and storey, `SceneLayer::actor_categories` / `actor_storeys`, so the Qt 3D group "Bygningsdele" shows and hides walls / slabs / roof / spaces / doors / windows / other openings and one storey across all of them, `rux_qt/element_filter.hpp`); label layers on the `--label-*` token scale; `--qa` writes the mesh-QA contact sheet, `visualize/qa_sheet.hpp`; `--plan gt.yaml --watch` re-renders and prints plan scores on every save, `render_watch.hpp`) | `src/render.cpp` |
 | `assemble` | — (multi-scan assembly) | `src/assemble.cpp` |
 
 With **no** subcommand, `rux` launches the Qt client (help without a display).
@@ -972,6 +1045,14 @@ Anything not found there is not a dependency.
 - RTABMap - SLAM database import
 - E57Format - point cloud exchange format
 - OpenNURBS - Rhino 3D (.3dm) files
+- web-ifc - IFC (STEP) parsing + geometry, the native C++ core of That Open's
+  web-ifc (MPL-2.0, `pkgs/web-ifc`). **Optional**: found ->
+  `REUSEX_HAVE_WEB_IFC` (a capability flag: `reusex_io` has IFC support), linked
+  PRIVATE into `reusex_io`. Keep its includes inside `src/io/ifc*.cpp`: it
+  ships its own pinned glm and generic top-level `geometry/`, `schema/`,
+  `cache/` include dirs. It logs through spdlog's *default* logger (rux's), so
+  `src/io/ifc.cpp` wraps every web-ifc call in a `WebIfcLog::Scope` that
+  swaps in a `[web-ifc]` logger at >= warn and counts its errors
 - OpenCV (`core`, `imgproc`, `highgui`) - image processing
 - VTK (`CommonCore`, `CommonDataModel`, `CommonExecutionModel`, `RenderingCore`,
   `RenderingOpenGL2`, `RenderingFreeType` for the plan overlay's labels) - the rendering backend behind `reusex_visualize`'s

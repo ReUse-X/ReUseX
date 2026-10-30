@@ -6,7 +6,8 @@
 // command that really does what the GUI run did. The key -> flag table lives
 // in rux_qt/cli_command.cpp, far from the CLI it describes; this test parses
 // every generated command back through the REAL CLI11 setup of each stage
-// subcommand (setup_subcommand_create / _optimize / _graph) and checks
+// subcommand (setup_subcommand_create / _optimize / _graph / _import) and
+// checks
 // that the stage receives the same parameters — key by key, for every
 // parameter pipeline::stage_parameters() lists, and all at once.
 //
@@ -20,6 +21,7 @@
 #include <create/stage_bridge.hpp>
 #include <global-params.hpp>
 #include <graph.hpp>
+#include <import.hpp>
 #include <optimize.hpp>
 
 #include <reusex/pipeline/mesh_parameters.hpp>
@@ -90,6 +92,7 @@ Captured parse_through_cli(const std::vector<std::string> &args) {
   setup_subcommand_create(app, global);
   setup_subcommand_optimize(app, global);
   setup_subcommand_graph(app, global);
+  setup_subcommand_import(app, global);
 
   Captured got;
   rux::set_stage_params_sink(
@@ -153,6 +156,8 @@ std::string changed_value(const pl::ParameterDescriptor &d) {
       return "leiden"; // differs from the "band" default (reusex-icg)
     if (d.key == "loop_proposal")
       return "spatial";
+    if (d.key == "path") // import_ifc: the CLI makes a relative one absolute
+      return "/tmp/x_path.ifc";
     return "x_" + d.key;
   case pl::ParameterType::integer_list:
     return "1,4";

@@ -171,8 +171,13 @@ inline StageResult run_graph_discover_stage(ProjectDB &db,
 /// written, under the same log name (reusex-xlg.5) — instead of the silent
 /// gap stage_executor_with_optimize() left by calling the two stage bodies
 /// directly.
-inline StageExecutor stage_executor_with_optimize() {
-  auto default_exec = default_stage_executor();
+///
+/// @p options reach every other stage (default_stage_executor): ruxd sets
+/// StageExecutorOptions::speckle_token here so `import_speckle` jobs use the
+/// submitting user's Speckle token.
+inline StageExecutor
+stage_executor_with_optimize(StageExecutorOptions options = {}) {
+  auto default_exec = default_stage_executor(std::move(options));
   return [default_exec =
               std::move(default_exec)](const StageContext &ctx) -> StageResult {
     if (ctx.stage == JobStage::optimize ||

@@ -7,6 +7,7 @@
 #include "reusex/core/guid.hpp"
 #include "reusex/core/logging.hpp"
 #include "reusex/core/processing_observer.hpp"
+#include "reusex/pipeline/import_parameters.hpp"
 
 #include <nlohmann/json.hpp>
 
@@ -341,6 +342,7 @@ void JobScheduler::Core::worker_loop() {
       ctx.parameters = record.parameters;
       ctx.cancel_token = &q->cancel_flag;
       ctx.job_id = record.id;
+      ctx.submitted_by = record.submitted_by;
 
       started = make_event(*q, JobEvent::Type::started, record);
       store->save(q->key, record);
@@ -563,6 +565,23 @@ std::string JobQueue::submit(JobStage stage, std::string parameters,
     if (parsed.is_discarded() || !parsed.is_object())
       throw std::runtime_error(
           "job parameters must be a JSON object (or empty for defaults)");
+    // Records go to the job store (Postgres in server mode) and into
+    // pipeline_log: a credential must never be one. The Speckle token comes
+    // from StageExecutorOptions::speckle_token instead.
+    if (parsed.contains(std::string(kSecretParameterKey)))
+      throw std::runtime_error(
+          "job parameters must not carry a credential: 'token' is refused "
+          "(the Speckle token comes from the executor's token provider)");
+  }
+  // An import stage's record holds its table's keys only, re-serialised:
+  // an unknown key (a misspelt secret such as "speckle_token") is refused
+  // here, before the record is stored anywhere.
+  if (is_import_stage(stage)) {
+    try {
+      parameters = normalize_import_parameters(stage, parameters);
+    } catch (const std::invalid_argument &e) {
+      throw std::runtime_error(e.what());
+    }
   }
 
   JobRecord record;

@@ -6,6 +6,7 @@
 #include "exit_status.hpp"
 
 #include <reusex/core/ProjectDB.hpp>
+#include <reusex/core/panorama_pose.hpp>
 #include <reusex/slam/PanoramaAlignment.hpp>
 
 #include <spdlog/fmt/std.h>
@@ -37,6 +38,7 @@ EXAMPLES:
   rux align 360                    # align all panoramas, write refined poses
   rux align 360 --dry-run          # report inliers / RMS / correction only
   rux align 360 --overwrite        # re-align panoramas already aligned
+  rux align 360 --force            # also replace poses placed by hand
   rux align 360 --fix-translation  # rotation-only (recommended when EXIF reliable)
   rux -vv align 360 --dry-run --diagnostics diag.json
                                    # why each panorama aligned or not
@@ -48,6 +50,9 @@ WORKFLOW:
 
 NOTES:
   - Requires panoramas linked to a sensor frame (node_id) with depth.
+  - A panorama placed by hand (pose_source "manual": `rux set
+    panoramas.<name>.pose`, `rux import 360 --pose`) is never re-aligned,
+    not even with --overwrite; --force replaces it.
   - A panorama that fails to align keeps its timestamp placement; the log
     names the gate that rejected it and its numbers (no_slice_pnp,
     below_noise_floor, upside_down, too_few_pooled_inliers,
@@ -71,6 +76,9 @@ NOTES:
                 "Compute and report only; do not write poses");
   sub->add_flag("--overwrite", opt->overwrite,
                 "Re-align panoramas that are already aligned");
+  sub->add_flag("--force", opt->force,
+                "Also re-align panoramas whose pose was placed by hand "
+                "(pose_source manual); implies --overwrite");
   auto &ao = opt->align; // flags bind to the library struct (STANDARDS §4)
   sub->add_flag(
       "--fix-translation", ao.fix_translation,
@@ -242,12 +250,22 @@ int run_subcommand_align_panorama(SubcommandAlignPanoramaOptions const &opt,
 
     try {
       for (const auto &pano : panos) {
-        if (pano.node_id < 0) {
+        using reusex::core::PanoramaAlignDecision;
+        const auto decision = reusex::core::panorama_align_decision(
+            pano, opt.overwrite, opt.force);
+        if (decision == PanoramaAlignDecision::skip_unlinked) {
           spdlog::info("{}: no linked sensor frame, skipping", pano.filename);
           ++skipped;
           continue;
         }
-        if (pano.has_pose && !opt.overwrite) {
+        if (decision == PanoramaAlignDecision::skip_manual) {
+          spdlog::info("{}: placed by hand (pose_source manual), keeping it "
+                       "(use --force to re-align)",
+                       pano.filename);
+          ++skipped;
+          continue;
+        }
+        if (decision == PanoramaAlignDecision::skip_aligned) {
           spdlog::info("{}: already aligned (use --overwrite to redo)",
                        pano.filename);
           ++skipped;

@@ -18,6 +18,10 @@ namespace rux::database {
  * - panoramas.myfile.image → get JPEG image data (binary)
  * - panoramas[0] → get first panorama by filename order (binary)
  * - panoramas[0].metadata → get first panorama metadata (JSON)
+ * - panoramas.myfile.pose → get / set its pose (JSON). Set takes a
+ *   16-number row-major array, [x,y,z(,yaw_deg)] (upright there) or a
+ *   nudge object with any of x, y, z, yaw_deg; stored as pose_source
+ *   "manual" (core/panorama_pose.hpp)
  */
 class PanoramaRouter : public ResourceRouter {
     public:
@@ -30,6 +34,15 @@ class PanoramaRouter : public ResourceRouter {
   std::vector<std::string> list() const override;
 
     private:
+  /// A panorama named by a path: its file name and how many path
+  /// components that took (an index is one; a dotted file name is split
+  /// by the path parser, so the longest prefix naming a stored panorama).
+  struct Resolved {
+    std::string name;
+    size_t used = 0;
+  };
+  Resolved resolve_item(const std::vector<PathComponent> &components) const;
+
   nlohmann::json get_metadata(std::string_view filename) const;
   std::vector<uint8_t> get_image_data(std::string_view filename) const;
 };
