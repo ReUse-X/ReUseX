@@ -873,8 +873,8 @@ skips rejected types and creates a new one when only a rejected type matches.
 <!-- No backticks in this heading: test_stage_contract parses backticked
      `### ` headings as pipeline stages, and this is not one. -->
 
-Store an imported building model -- an authored reference plan, later a
-Revit (via Speckle) or IFC model -- in the solid-model tables
+Store an imported building model -- an authored reference plan, a Revit
+(via Speckle) or an IFC model -- in the solid-model tables
 (`io::store_solid_model()` over `ProjectDB::replace_imported_solid_model()`).
 Not a pipeline stage: no `Stage`, no `rux validate --stage` entry.
 
@@ -918,6 +918,145 @@ and scene relations in a document are not stored (reported as not stored).
 `rux edit plan --export` reads the tables back (`io::load_solid_model()`);
 `JSON -> tables -> JSON` is lossless up to row order and the document's
 `name` / `description`, which have no table.
+
+### Import write: Revit model via Speckle (rux import speckle)
+
+<!-- No backticks in this heading: not a pipeline stage (see above). -->
+
+Fetch one version of a Speckle model published by the Revit connector
+(Speckle v3; `io::speckle::SpeckleReader`, GraphQL queries and HTTP GETs
+only -- nothing is written to the server), map it with
+`io::speckle::import_revit()` and store it with the solid-model import write
+above (`io::speckle::import_speckle_revit()`). One `pipeline_log` row,
+stage `import_speckle` (parameters: server, project, model, version, root
+object; never the token, which comes from `SPECKLE_TOKEN`).
+
+| | |
+|---|---|
+| Consumes | a Speckle server, project, model and version (default the latest) |
+| Produces | `storeys`, `walls`, `openings`, `spaces` rows (`source = imported`, locked, as above); meshes `imported/revit/<category slug>` (stage `import_speckle`) |
+| Checks   | the root carries `levelProxies` (a Revit model), else it throws and writes nothing |
+
+Mapping (`libs/reusex/include/io/speckle_revit.hpp`):
+
+- **Frame.** World is the frame the connector wrote the mesh vertices in,
+  in metres (any unit the root declares is converted): Revit's internal
+  origin, or the project base / survey point, depending on the connector's
+  reference-point setting -- so x / y depend on that setting. Nothing is
+  aligned to a scan. A model whose plan centre lies more than 10 km from the
+  origin is recentred by a whole-km x / y offset (`world_offset_m` in every
+  storey's metadata and every mesh's parameters; world = connector frame -
+  offset), so the float meshes keep mm precision (STANDARDS §4); a warn is
+  logged either way. Level elevations are relative to their
+  elevation base (often the survey point); the offset to internal z is
+  measured from the walls (bottom = base level + base offset; the mode over
+  all walls, logged with its vote count; `--elevation-offset` overrides
+  it). Only levels flagged as a building storey (`LEVEL_IS_BUILDING_STORY`)
+  become storeys; elements on a reference level go to the storey at or
+  below it, and that storey's metadata lists the reference level. All
+  storeys share one level frame, as detected storeys do: `level_transform`
+  translates the lowest storey's floor to z = 0, `z_floor` is each storey's
+  height above it and `z_ceiling` the next storey's (the top storey: +
+  `--storey-height`).
+- **Walls**: a Walls element whose footprint (convex hull, minimum-area
+  rectangle) is a straight rectangle becomes a wall: axis through the
+  rectangle's middle, thickness = the type's width (else measured),
+  `z_base` / `height` from its z range, `is_external` from Function =
+  Exterior. Walls thinner than `--min-wall-thickness` (finish layers) and
+  non-straight footprints are mesh-only, each counted at warn.
+- **Openings**: Doors / Windows hosted on an imported wall, by
+  `parentApplicationId`, else the element they are nested under, else
+  geometrically (centre within the wall's thickness + 0.3 m, overlapping
+  its run). Width and height come from the Revit rough opening (else the
+  nominal width / height), the width centred on the element's extent along
+  the host axis and the height from its sill height above its level; the
+  geometry (casings included) is the fallback. `metadata.extent_source`
+  says which. Unhosted ones are mesh-only, counted at warn.
+- **Spaces**: Rooms with a volume mesh; the polygon is the outline of its
+  bottom faces (holes kept; disjoint pieces and islands inside holes are
+  dropped, counted at warn), `z_floor` / `z_ceiling` from the mesh, area,
+  perimeter, volume, compactness, kind `room`. Unplaced rooms (no volume
+  mesh) are skipped, one warn listing their names.
+- **Meshes**: every element's geometry (instance proxies expanded) merged per
+  category, Rooms excepted, in the world frame, as `imported/revit/<category
+  slug>` (the importer in the name, so a Revit and an IFC import in one
+  project never write the same mesh); a re-import deletes earlier
+  `import_speckle` meshes this version no longer has, also ones of the
+  older unprefixed naming (`--no-meshes` writes
+  and deletes none). An element whose mesh has an invalid face list is
+  skipped, counted at warn.
+- **Identity**: GUIDs are `uuid5(project_guid,
+  "imported/revit/<kind>/<Revit applicationId>")`, so a re-import of the
+  same model keeps them; each record's `metadata` holds the Revit identity
+  (applicationId, elementId, category, family, type, level, IfcGUID, ...).
+
+### Import write: IFC model (rux import ifc)
+
+<!-- No backticks in this heading: not a pipeline stage (see above). -->
+
+Read an IFC file (IFC2X3 / IFC4 / IFC4X3, STEP) with the native C++ core of
+web-ifc, map it with `io::ifc::import_ifc()` and store it with the
+solid-model import write above (`io::ifc::import_ifc_file()`). One
+`pipeline_log` row, stage `import_ifc` (parameters: source, file name).
+web-ifc is an optional dependency: a build without it
+(`REUSEX_HAVE_WEB_IFC` off) refuses with a clear message. web-ifc's own log
+messages (it logs through spdlog's default logger) are shown as `[web-ifc]`
+at warn and above only, whatever `-v` says.
+
+| | |
+|---|---|
+| Consumes | an IFC file |
+| Produces | `storeys`, `walls`, `openings`, `spaces` rows (`source = imported`, locked, as above); meshes `imported/ifc/<IFC class slug>` (stage `import_ifc`) |
+| Checks   | the file is a complete STEP file (ISO-10303-21 header, ENDSEC / END-ISO-10303-21 at the end), web-ifc parses it without errors, and it has an IfcProject and at least one IfcBuildingStorey; else it throws, writes no record or mesh, and its `pipeline_log` row ends `failed` with the message |
+
+Mapping (`libs/reusex/include/io/ifc.hpp`; the geometric readings are the
+Revit import's, shared in `libs/reusex/src/io/bim_mapping.hpp`):
+
+- **Frame.** World is the file's world coordinate system (z up), in metres
+  (the project's length unit, `IfcSIUnit` or `IfcConversionBasedUnit`, is
+  read once and applied to geometry and attributes alike; web-ifc's Y-up
+  output is turned back). Nothing is aligned to a
+  scan. A model whose plan centre lies more than `--recenter-threshold`
+  (10 km) from the origin -- a georeferenced file -- is recentred by a
+  whole-km x / y offset, as the Revit import (`world_offset_m` in every
+  storey's metadata and every mesh's parameters; world = file - offset).
+  Storeys are the IfcBuildingStoreys, at the world z of their placement
+  (`Elevation` when there is none), sorted, in one shared level frame: the
+  lowest storey's floor at z = 0, `z_ceiling` the next storey's (the top
+  one: + `--storey-height`). Elements find their storey through
+  IfcRelContainedInSpatialStructure / IfcRelAggregates (walking up), else
+  by height (counted at warn).
+- **Walls**: IfcWall / IfcWallStandardCase / IfcWallElementedCase with a
+  straight footprint, as Revit walls: centreline of the footprint's
+  minimum-area rectangle, measured thickness, z range, `is_external` from
+  `Pset_WallCommon.IsExternal` (also through an
+  IfcPropertySetDefinitionSet). The IFC 'Axis' representation is not used:
+  it often runs along a layer edge (IfcMaterialLayerSetUsage offset), while
+  the solid-model axis is the centreline. Thin and non-straight walls, and
+  walls with no body left (e.g. fully voided), are mesh-only, counted at
+  warn.
+- **Openings**: IfcDoor / IfcWindow hosted through IfcRelFillsElement ->
+  IfcOpeningElement -> IfcRelVoidsElement -> an imported wall, else
+  geometrically (as Revit). Extent: the IfcOpeningElement they fill (the
+  hole), else `OverallWidth` / `OverallHeight`, else the geometry;
+  `metadata.extent_source` says which. Unhosted ones are mesh-only.
+- **Spaces**: IfcSpace; the polygon is the outline of its body's bottom
+  faces (as Revit rooms), else its 'FootPrint' curve with z from its 'Box'
+  (else its storey's floor to ceiling) -- common in ArchiCAD exports. Name =
+  `LongName`, else `Name`; kind `room`.
+- **Meshes**: every product's body (openings voided by web-ifc) merged per
+  IFC class. web-ifc meshes every representation of a product (curves and
+  bounding boxes aside); geometry that traces back only to a non-body
+  representation (anything but 'Body', 'Facetation', 'Body-FallBack' or an
+  unnamed one -- e.g. a 'Clearance' solid) is left out, anything else is
+  kept. Merged StandardCase / ElementedCase folded into the base class
+  (`imported/ifc/wall`, `imported/ifc/slab`, `imported/ifc/door`, ...); spatial
+  elements, opening elements, annotations and grids are left out. A
+  re-import deletes earlier `import_ifc` meshes the file no longer has;
+  `--no-meshes` writes and deletes none.
+- **Identity**: GUIDs are `uuid5(project_guid,
+  "imported/ifc/<kind>/<GlobalId>")`; each record's `metadata` holds the IFC
+  identity (GlobalId, class, Name, ObjectType, Tag, express id).
 
 ### `attributes` (`rux create attributes`)
 

@@ -714,7 +714,8 @@ tree — if a doc mentions `RTABMapDatabase`, that doc is stale.
   wall by GUID; a re-detected space keeps the GUID of the stored one whose
   centroid and area match, else uuid5 of storey + centroid at 5 cm,
   `core/space_identity.hpp`). An imported model (`rux edit plan
-  --import`, later Revit / IFC) goes into these four tables through
+  --import`, `rux import speckle`, `rux import ifc`) goes into these four
+  tables through
   `io::store_solid_model()` / `ProjectDB::replace_imported_solid_model()`:
   one SAVEPOINT that replaces the project's `source = imported` rows of each
   kind the model provides and keeps detected / manual rows (an unlocked one
@@ -802,6 +803,22 @@ External-format adapters only — project state itself lives in `core/ProjectDB`
   (`SpeckleReader`: GraphQL queries + HTTP GETs only). Project / model /
   version lookup, the whole object tree in one GET (`ObjectTree`), and
   `ObjectTree::resolve` (references, `@`-detached keys, DataChunk joins)
+- `speckle_revit.hpp`: Revit model (Speckle v3 Revit connector) -> solid
+  model + per-category meshes (`import_revit`, pure), and `rux import
+  speckle`'s entry point `import_speckle_revit` (fetch, map, store as
+  imported). Revit internal frame in metres, one shared level frame;
+  mapping rules in `docs/CONTRACTS.md` ("Import write: Revit model via
+  Speckle")
+- `ifc.hpp`: IFC file -> solid model + per-class meshes through web-ifc
+  (`import_ifc`, pure apart from reading the file) and `rux import ifc`'s
+  entry point `import_ifc_file`. Same rules as the Revit import; the
+  geometric readings both share (wall axis from the footprint rectangle,
+  room outline from bottom faces, opening hosting, GUID scheme, recentring,
+  mesh merge / write) live in the private `src/io/bim_mapping.{hpp,cpp}`.
+  Mapping rules in `docs/CONTRACTS.md` ("Import write: IFC model")
+- `imported_mesh.hpp`: `ImportedMesh`, the per-category display mesh both
+  BIM imports return (`speckle::RevitMesh` is an alias), named by importer:
+  `imported/revit/<category>`, `imported/ifc/<class>`
 - `exif.hpp`: photo metadata (exiv2)
 - `panoramas.hpp`: companion 360 discovery (`import_panoramas`) and
   `register_panorama()` — one new panorama with a manual pose, unlinked, no
@@ -819,7 +836,7 @@ Top-level commands, as registered in `apps/rux/src/rux.cpp`:
 
 | Command | Sub-commands | Source |
 |---|---|---|
-| `import` | `rtabmap`, `mushroom`, `arkitscenes`, `e57`, `ply`, `gsplat`, `materialepas`, `csv`, `360`, `photos` | `src/import/` |
+| `import` | `rtabmap`, `mushroom`, `arkitscenes`, `e57`, `ply`, `gsplat`, `materialepas`, `csv`, `360`, `photos`, `speckle` (Revit model via Speckle, read-only: storeys / walls / openings / spaces as imported rows + `imported/revit/<category>` meshes), `ifc` (IFC file via web-ifc: the same tables + `imported/ifc/<IFC class>` meshes; needs `REUSEX_HAVE_WEB_IFC`) | `src/import/` |
 | `create` | `clouds`, `dense`, `annotate`, `annotate-360`, `material`, `project`, `planes`, `rooms`, `instances`, `storeys`, `classify`, `walls`, `openings`, `spaces`, `solids`, `materials`, `survey`, `mesh`, `texture`, `windows` (deprecated) | `src/create/` |
 | `export` | `ply`, `e57`, `materialepas`, `csv`, `rhino`, `semantic-images`, `speckle`, `colmap`, `pdf` | `src/export/` |
 | `align` | `360` (content-based panorama pose refinement; skips manually placed panoramas unless `--force`) | `src/align/` |
@@ -1018,7 +1035,9 @@ Anything not found there is not a dependency.
   `REUSEX_HAVE_WEB_IFC` (a capability flag: `reusex_io` has IFC support), linked
   PRIVATE into `reusex_io`. Keep its includes inside `src/io/ifc*.cpp`: it
   ships its own pinned glm and generic top-level `geometry/`, `schema/`,
-  `cache/` include dirs
+  `cache/` include dirs. It logs through spdlog's *default* logger (rux's), so
+  `src/io/ifc.cpp` wraps every web-ifc call in a `WebIfcLog::Scope` that
+  swaps in a `[web-ifc]` logger at >= warn and counts its errors
 - OpenCV (`core`, `imgproc`, `highgui`) - image processing
 - VTK (`CommonCore`, `CommonDataModel`, `CommonExecutionModel`, `RenderingCore`,
   `RenderingOpenGL2`, `RenderingFreeType` for the plan overlay's labels) - the rendering backend behind `reusex_visualize`'s
