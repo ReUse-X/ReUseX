@@ -5,6 +5,7 @@
 #include "io/panoramas.hpp"
 #include "core/ProjectDB.hpp"
 #include "core/logging.hpp"
+#include "core/panorama_pose.hpp"
 #include "io/exif.hpp"
 #include "io/insta360_x4.hpp"
 
@@ -15,7 +16,9 @@
 #include <cmath>
 #include <cstdint>
 #include <fstream>
+#include <istream>
 #include <stdexcept>
+#include <streambuf>
 #include <string>
 #include <vector>
 
@@ -28,10 +31,7 @@ namespace fs = std::filesystem;
 /// Parse JPEG image dimensions (width, height) from the SOF0/SOF1/SOF2
 /// marker without decoding the image. Reads at most ~64 KB of the file.
 /// Returns {0, 0} if the file is not a valid JPEG or no SOF marker is found.
-std::pair<int, int> read_jpeg_dimensions(const fs::path &path) {
-  std::ifstream f(path, std::ios::binary);
-  if (!f)
-    return {0, 0};
+std::pair<int, int> read_jpeg_dimensions(std::istream &f) {
 
   // SOI: FF D8
   uint8_t soi[2];
@@ -79,6 +79,39 @@ std::pair<int, int> read_jpeg_dimensions(const fs::path &path) {
   return {0, 0};
 }
 
+/// A read-only, seekable istream buffer over bytes already in memory, so the
+/// header parser runs on an upload without copying it.
+class MemoryBuf : public std::streambuf {
+    public:
+  MemoryBuf(const uint8_t *data, std::size_t size) {
+    char *b = const_cast<char *>(reinterpret_cast<const char *>(data));
+    setg(b, b, b + size);
+  }
+
+    protected:
+  pos_type seekoff(off_type off, std::ios_base::seekdir dir,
+                   std::ios_base::openmode /*which*/) override {
+    char *base = dir == std::ios_base::beg   ? eback()
+                 : dir == std::ios_base::cur ? gptr()
+                                             : egptr();
+    const off_type at = (base - eback()) + off;
+    if (at < 0 || at > egptr() - eback())
+      return pos_type(off_type(-1));
+    setg(eback(), eback() + at, egptr());
+    return pos_type(at);
+  }
+  pos_type seekpos(pos_type pos, std::ios_base::openmode which) override {
+    return seekoff(off_type(pos), std::ios_base::beg, which);
+  }
+};
+
+std::pair<int, int> read_jpeg_dimensions(const fs::path &path) {
+  std::ifstream f(path, std::ios::binary);
+  if (!f)
+    return {0, 0};
+  return read_jpeg_dimensions(f);
+}
+
 std::vector<uint8_t> read_file_bytes(const fs::path &path) {
   std::ifstream file(path, std::ios::binary | std::ios::ate);
   if (!file)
@@ -90,7 +123,87 @@ std::vector<uint8_t> read_file_bytes(const fs::path &path) {
   return data;
 }
 
+/// Stitch a .insp dual fisheye to an equirect JPEG (quality 90, as
+/// `rux import 360`). Throws std::runtime_error.
+std::vector<uint8_t> stitch_insp_to_jpeg(const fs::path &file) {
+  const cv::Mat dual = cv::imread(file.string());
+  if (dual.empty())
+    throw std::runtime_error("cannot read .insp file: " + file.string());
+  const cv::Mat equirect_img = stitch_insta360_x4(dual);
+  std::vector<uint8_t> jpeg_data;
+  cv::imencode(".jpg", equirect_img, jpeg_data, {cv::IMWRITE_JPEG_QUALITY, 90});
+  return jpeg_data;
+}
+
+int store_with_manual_pose(ProjectDB &db, const std::string &filename,
+                           const std::vector<uint8_t> &jpeg, double timestamp,
+                           const std::array<double, 16> &pose) {
+  ProjectDB::Transaction tx(db);
+  const int id = db.save_panoramic_image(filename, jpeg, timestamp, -1);
+  db.save_panorama_pose(id, pose, -1, -1.0, core::kPanoramaPoseManual);
+  tx.commit();
+  reusex::info("register_panorama: {} stored as panorama {} at ({:.3f}, "
+               "{:.3f}, {:.3f}), pose_source manual",
+               filename, id, pose[3], pose[7], pose[11]);
+  return id;
+}
+
+void require_new_name(const ProjectDB &db, const std::string &filename) {
+  if (filename.empty())
+    throw std::invalid_argument("register_panorama: empty filename");
+  if (db.has_panoramic_image(filename))
+    throw std::invalid_argument("register_panorama: a panorama named '" +
+                                filename + "' is already stored");
+}
+
 } // anonymous namespace
+
+int register_panorama(ProjectDB &db, const fs::path &file,
+                      const std::array<double, 16> &pose,
+                      const RegisterPanoramaOptions &opts) {
+  core::validate_panorama_pose(pose);
+  if (!fs::is_regular_file(file))
+    throw std::runtime_error("register_panorama: no such file: " +
+                             file.string());
+  const bool insp = is_insta360_dual_fisheye(file);
+  if (insp && !opts.stitch_insp)
+    throw std::invalid_argument("register_panorama: " + file.string() +
+                                " is an .insp and stitching is off");
+  const std::string filename =
+      !opts.filename.empty()
+          ? opts.filename
+          : (insp ? file.stem().string() + ".jpg" : file.filename().string());
+  require_new_name(db, filename);
+  if (!insp) {
+    const auto [w, h] = read_jpeg_dimensions(file);
+    if (!(w > 0 && h > 0 && w == 2 * h))
+      throw std::invalid_argument("register_panorama: " + file.string() +
+                                  " is not an equirect JPEG (" +
+                                  std::to_string(w) + "x" + std::to_string(h) +
+                                  ", need width == 2*height)");
+  }
+  const std::vector<uint8_t> jpeg =
+      insp ? stitch_insp_to_jpeg(file) : read_file_bytes(file);
+  return store_with_manual_pose(db, filename, jpeg, read_exif_timestamp(file),
+                                pose);
+}
+
+int register_panorama(ProjectDB &db, const std::string &filename,
+                      const std::vector<uint8_t> &jpeg,
+                      const std::array<double, 16> &pose, double timestamp) {
+  core::validate_panorama_pose(pose);
+  require_new_name(db, filename);
+  // The same equirect guard as for a file: the JPEG header's dimensions.
+  MemoryBuf buf(jpeg.data(), jpeg.size());
+  std::istream in(&buf);
+  const auto [w, h] = read_jpeg_dimensions(in);
+  if (!(w > 0 && h > 0 && w == 2 * h))
+    throw std::invalid_argument("register_panorama: '" + filename +
+                                "' is not an equirect JPEG (" +
+                                std::to_string(w) + "x" + std::to_string(h) +
+                                ", need width == 2*height)");
+  return store_with_manual_pose(db, filename, jpeg, timestamp, pose);
+}
 
 std::size_t import_panoramas(ProjectDB &db, const fs::path &dir,
                              const ImportPanoramasOptions &opts) {
@@ -229,26 +342,14 @@ std::size_t import_panoramas(ProjectDB &db, const fs::path &dir,
 
     auto [timestamp, node_id] = match_to_frame(file, file.filename().string());
 
-    // Read and stitch
-    const cv::Mat dual = cv::imread(file.string());
-    if (dual.empty()) {
-      reusex::warn("import_panoramas: cannot read .insp file: {}",
-                   file.filename().string());
-      continue;
-    }
-
-    cv::Mat equirect_img;
+    std::vector<uint8_t> jpeg_data;
     try {
-      equirect_img = stitch_insta360_x4(dual);
+      jpeg_data = stitch_insp_to_jpeg(file);
     } catch (const std::exception &ex) {
       reusex::warn("import_panoramas: stitch failed for {}: {}",
                    file.filename().string(), ex.what());
       continue;
     }
-
-    std::vector<uint8_t> jpeg_data;
-    cv::imencode(".jpg", equirect_img, jpeg_data,
-                 {cv::IMWRITE_JPEG_QUALITY, 90});
 
     db.save_panoramic_image(filename, jpeg_data, timestamp, node_id);
     ++imported;

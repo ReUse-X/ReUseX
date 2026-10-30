@@ -90,12 +90,25 @@ void solid_model_to_file(const core::SolidModel &model,
 /// project, so no re-run of a detecting stage overwrites it.
 void mark_imported(core::SolidModel &model);
 
-/// What store_solid_model() wrote.
+/// What store_solid_model() wrote (ProjectDB::SolidModelImportResult).
 struct SolidModelStoreResult {
   std::size_t storeys = 0, walls = 0, spaces = 0, openings = 0; ///< rows
-  /// Element kinds the model provides (SolidModel::has_*) that were not
-  /// stored because the project has no table for them yet, in the order
-  /// storeys, walls, spaces, openings.
+  /// Previously imported rows (source "imported") the store deleted.
+  std::size_t replaced_imported = 0;
+  /// Unlocked detected / manual rows a record replaced (same guid; a
+  /// storey: same guid or idx).
+  std::size_t taken_over = 0;
+  /// Records not written: a locked detected / manual row holds their guid
+  /// (a storey: guid or idx).
+  std::size_t skipped_locked = 0;
+  /// Wall joins / space boundaries that went with a taken-over row.
+  std::size_t dropped_relations = 0;
+  /// Imported wall joins not written: both walls held back by locked rows.
+  std::size_t skipped_joins = 0;
+  /// Parts of the model no table holds for an import, so they were not
+  /// stored: "plane_classes" (they belong to a detected cloud's planes) and
+  /// "scene_relations", in that order. Storeys, walls, spaces and openings
+  /// are always stored.
   std::vector<std::string> not_stored;
 
   [[nodiscard]] std::size_t stored() const {
@@ -104,22 +117,53 @@ struct SolidModelStoreResult {
 };
 
 /// Write @p model's elements into the project's solid-model tables, the
-/// inverse of load_solid_model() (`rux edit plan --import`).
+/// inverse of load_solid_model() (`rux edit plan --import`; the shared
+/// writer for model importers).
 ///
-/// Each kind is written where its table exists; at WP0 none does, so every
-/// provided kind lands in SolidModelStoreResult::not_stored and nothing is
-/// written. WP1 (storeys), WP3 (walls), WP4 (spaces) and WP5 (openings) each
-/// add their part here, next to their part of load_solid_model(), so that
-/// `JSON -> tables -> JSON` stays lossless.
+/// Records are written as the model gives them; call mark_imported() first
+/// to store them as source "imported", locked. For each element kind the
+/// model provides (SolidModel::has_*; wall joins go with walls, space
+/// boundaries with spaces) the project's earlier imported rows of that kind
+/// are replaced, so a re-import does not pile up; detected and manual rows
+/// stay, except that an imported record takes over an UNLOCKED row holding
+/// its guid (a storey: its guid or idx) and gives way to a LOCKED one. Kinds
+/// the model does not provide are left alone.
+///
+/// A storey, wall, space or opening with no guid (the document allows that
+/// where nothing refers to the element) gets a deterministic one, so a
+/// re-import of the same document writes the same rows:
+/// `core::deterministic_guid(project_guid, "imported/storeys/<idx>")`, and
+/// `"imported/<walls|spaces|openings>/<index in the model>"` for the rest.
+/// Caveat: that index is the element's position in the document, so
+/// reordering, inserting or deleting elements before it gives the element a
+/// different guid on the next import (its row is replaced as a new one, and
+/// anything keyed by the old guid -- a survey part's element_guid, a
+/// quantity -- no longer finds it). Give elements a guid when they must
+/// keep their identity across edits of the document. All
+/// in one SAVEPOINT; the rules, and what throws, are
+/// ProjectDB::replace_imported_solid_model's.
+///
+/// For a model whose records are imported and locked, and a project with no
+/// other rows on the same guids / idx,
+/// `load_solid_model(db)` gives back the model's storeys, walls, joins,
+/// openings, spaces and boundaries unchanged: `JSON -> tables -> JSON` is
+/// lossless up to the order the tables list records in (and record ids,
+/// which the document does not carry).
+///
+/// @throws std::invalid_argument for a record the tables refuse, or an
+///         opening / space boundary naming a wall the project does not
+///         hold; std::runtime_error on a read-only project.
 SolidModelStoreResult store_solid_model(ProjectDB &db,
                                         const core::SolidModel &model);
 
-/// The typed building model stored in a project.
-///
-/// Fills each element kind from its ProjectDB table as the table exists. At
-/// WP0 no solid-model table exists yet, so this returns an empty model with
-/// nothing provided (every benchmark metric reports n/a); WP1 (storeys), WP3
-/// (walls), WP4 (spaces) and WP5 (openings) each add their part here.
+/// The typed building model stored in a project: storeys, plane classes
+/// (of the "planes" cloud), walls and joins, openings, spaces and space
+/// boundaries, from their ProjectDB tables -- detected, manual and imported
+/// rows alike. A kind counts as provided when its table has rows; an empty
+/// table reads as "not provided" (n/a in the benchmark), since it cannot
+/// tell "the stage has not run" from "it found nothing". An opening or
+/// space boundary naming a wall the walls table no longer holds is left out
+/// (logged at warn).
 core::SolidModel load_solid_model(const ProjectDB &db);
 
 } // namespace reusex::io

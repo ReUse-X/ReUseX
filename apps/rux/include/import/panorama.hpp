@@ -16,6 +16,9 @@ struct SubcommandImportPanoramaOptions {
   std::vector<fs::path> input_paths; // directories or individual files
   bool no_stitch =
       false; // --no-stitch: skip .insp stitching, import equirects only
+  /// --pose x,y,z[,yaw_deg]: register ONE panorama placed by hand
+  /// (io::register_panorama, pose_source manual; no timestamp matching).
+  std::vector<double> pose;
 };
 
 void setup_subcommand_import_panorama(CLI::App &app,
