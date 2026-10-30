@@ -3393,6 +3393,11 @@ class ProjectDB::Impl {
     size_t replaced_imported = 0; ///< earlier imported rows deleted
     size_t taken_over = 0;        ///< unlocked rows a record replaced
     size_t skipped_locked = 0;    ///< records a locked row held back
+    /// Wall joins / space boundaries that went with a taken-over row.
+    size_t dropped_relations = 0;
+    /// Imported joins not written: both their walls were held back by
+    /// locked rows, so the join would belong to no imported wall.
+    size_t skipped_joins = 0;
   };
 
   /// Execute one statement and return the rows it changed (cascaded
@@ -3417,10 +3422,35 @@ class ProjectDB::Impl {
     return out;
   }
 
+  /// One COUNT(*) query with one bound text parameter.
+  size_t countRowsFor(const char *sql, std::string_view param,
+                      const char *who) {
+    sqlite3_stmt *s = prepare_or_throw(db, sql, who);
+    StmtGuard guard(s);
+    bind_text(s, 1, param);
+    if (sqlite3_step(s) != SQLITE_ROW)
+      throw std::runtime_error(std::string(who) + ": " + sqlite3_errmsg(db));
+    return static_cast<size_t>(sqlite3_column_int64(s, 0));
+  }
+
   /// Import mode: delete the unlocked row of @p table that holds @p guid
   /// (and, for storeys, @p idx), so the imported record can take its place.
+  /// The wall joins / space boundaries that cascade with a taken-over wall /
+  /// space are counted in ImportTally::dropped_relations.
   void takeOverUnlocked(const char *table, std::string_view guid,
                         const int *idx, ImportTally &tally, const char *who) {
+    const std::string_view t(table);
+    if (t == "walls")
+      tally.dropped_relations +=
+          countRowsFor("SELECT COUNT(*) FROM wall_joins j JOIN walls w "
+                       "ON w.id = j.wall_a OR w.id = j.wall_b "
+                       "WHERE w.locked = 0 AND w.guid = ?;",
+                       guid, who);
+    else if (t == "spaces")
+      tally.dropped_relations += countRowsFor(
+          "SELECT COUNT(*) FROM space_boundaries b JOIN spaces s "
+          "ON s.id = b.space_id WHERE s.locked = 0 AND s.guid = ?;",
+          guid, who);
     const std::string sql =
         std::string("DELETE FROM ") + table +
         (idx ? " WHERE locked = 0 AND (guid = ? OR idx = ?);"
@@ -4007,6 +4037,14 @@ class ProjectDB::Impl {
               where + " names wall " + g +
               (imp ? ", which is neither saved nor stored"
                    : ", which is neither saved nor locked"));
+      // An imported join must touch a wall of the same import: joins have
+      // no source column and go only with their walls, so a join between
+      // two stored walls could never be replaced by a re-import.
+      if (imp && !guids.count(j.wall_a) && !guids.count(j.wall_b))
+        throw std::invalid_argument(where +
+                                    " names no wall of this import; an "
+                                    "imported join must touch an imported "
+                                    "wall");
     }
     // Joins of unlocked walls go with them (ON DELETE CASCADE).
     if (!imp)
@@ -4025,6 +4063,7 @@ class ProjectDB::Impl {
     StmtGuard guard(ins);
     size_t written = 0;
     size_t skipped = 0;
+    std::set<std::string, std::less<>> writtenGuids;
     for (const auto &r : walls) {
       if (lockedGuids.count(r.guid)) {
         ++skipped;
@@ -4032,6 +4071,7 @@ class ProjectDB::Impl {
       }
       if (imp)
         takeOverUnlocked("walls", r.guid, nullptr, *imp, "save_walls");
+      writtenGuids.insert(r.guid);
       sqlite3_reset(ins);
       sqlite3_clear_bindings(ins);
       bind_text(ins, 1, r.guid);
@@ -4077,6 +4117,13 @@ class ProjectDB::Impl {
         "save_walls");
     StmtGuard joinGuard(join);
     for (const auto &j : joins) {
+      // Import mode: both walls held back by locked rows -- the join would
+      // belong to no imported wall (see the validation above).
+      if (imp && !writtenGuids.count(j.wall_a) &&
+          !writtenGuids.count(j.wall_b)) {
+        ++imp->skipped_joins;
+        continue;
+      }
       sqlite3_reset(join);
       sqlite3_clear_bindings(join);
       bind_text(join, 1, j.kind);
@@ -4897,62 +4944,71 @@ class ProjectDB::Impl {
                 "project does not hold",
                 who, b.space, b.wall));
     }
+    // Diagnostics, counted inside the SAVEPOINT so a failing query rolls
+    // the import back instead of throwing after it was committed.
+    // Openings / boundaries naming a wall that is gone (earlier ones on a
+    // re-imported wall that this import dropped).
+    size_t orphanOpenings = 0, orphanBounds = 0, offStorey = 0;
+    if (m.has_walls() && hasOpeningsTable)
+      orphanOpenings = countRows("SELECT COUNT(*) FROM openings WHERE "
+                                 "wall_guid NOT IN (SELECT guid FROM walls);",
+                                 who);
+    if (m.has_walls() && hasSpacesTable)
+      orphanBounds = countRows(
+          "SELECT COUNT(*) FROM space_boundaries WHERE wall_guid NOT IN "
+          "(SELECT guid FROM walls);",
+          who);
+    // Walls / spaces of ANY source on a storey idx the table does not hold:
+    // a storey taken over by guid and idx at once can remove two detected
+    // storeys, leaving the walls / spaces of the other idx without one.
+    if (hasStoreysTable &&
+        (m.has_storeys() || m.has_walls() || m.has_spaces())) {
+      if (hasWallsTable)
+        offStorey += countRows("SELECT COUNT(*) FROM walls WHERE storey NOT "
+                               "IN (SELECT idx FROM storeys);",
+                               who);
+      if (hasSpacesTable)
+        offStorey += countRows("SELECT COUNT(*) FROM spaces WHERE storey NOT "
+                               "IN (SELECT idx FROM storeys);",
+                               who);
+    }
     sp.release();
 
     r.replaced_imported = tally.replaced_imported;
     r.taken_over = tally.taken_over;
     r.skipped_locked = tally.skipped_locked;
+    r.dropped_relations = tally.dropped_relations;
+    r.skipped_joins = tally.skipped_joins;
     if (r.replaced_imported > 0)
       reusex::info("{}: replaced {} previously imported row(s)", who,
                    r.replaced_imported);
     if (r.taken_over > 0)
-      reusex::warn("{}: {} imported record(s) replaced an unlocked detected / "
-                   "manual row holding the same guid (a storey: or idx)",
-                   who, r.taken_over);
+      reusex::warn("{}: imported records replaced {} unlocked detected / "
+                   "manual row(s) holding the same guid (a storey: or idx); "
+                   "{} wall join(s) / space boundar(y/ies) went with them",
+                   who, r.taken_over, r.dropped_relations);
     if (r.skipped_locked > 0)
       reusex::warn("{}: {} imported record(s) were not written: a locked "
                    "detected / manual row holds their guid (a storey: or "
                    "idx), and the locked row wins",
                    who, r.skipped_locked);
-    // Rows the import left without the element they name: earlier openings
-    // or boundaries on a re-imported wall that is gone now, or imported
-    // walls / spaces on a storey idx the project does not hold.
-    if (m.has_walls() && hasOpeningsTable) {
-      const size_t n = countRows("SELECT COUNT(*) FROM openings WHERE "
-                                 "wall_guid NOT IN (SELECT guid FROM walls);",
-                                 who);
-      if (n > 0)
-        reusex::warn("{}: {} stored opening(s) name a wall the walls table no "
-                     "longer holds; load_solid_model() leaves them out",
-                     who, n);
-    }
-    if (m.has_walls() && hasSpacesTable) {
-      const size_t n = countRows(
-          "SELECT COUNT(*) FROM space_boundaries WHERE wall_guid NOT IN "
-          "(SELECT guid FROM walls);",
-          who);
-      if (n > 0)
-        reusex::warn("{}: {} stored space boundar(y/ies) name a wall the "
-                     "walls table no longer holds; load_solid_model() leaves "
-                     "them out",
-                     who, n);
-    }
-    if (hasStoreysTable &&
-        countRows("SELECT COUNT(*) FROM storeys;", who) > 0) {
-      size_t n = 0;
-      if (m.has_walls())
-        n += countRows("SELECT COUNT(*) FROM walls WHERE source = 'imported' "
-                       "AND storey NOT IN (SELECT idx FROM storeys);",
-                       who);
-      if (m.has_spaces())
-        n += countRows("SELECT COUNT(*) FROM spaces WHERE source = 'imported' "
-                       "AND storey NOT IN (SELECT idx FROM storeys);",
-                       who);
-      if (n > 0)
-        reusex::warn("{}: {} imported wall(s) / space(s) stand on a storey idx "
-                     "the storeys table does not hold",
-                     who, n);
-    }
+    if (r.skipped_joins > 0)
+      reusex::warn("{}: {} imported wall join(s) were not written: both "
+                   "their walls are held by locked rows",
+                   who, r.skipped_joins);
+    if (orphanOpenings > 0)
+      reusex::warn("{}: {} stored opening(s) name a wall the walls table no "
+                   "longer holds; load_solid_model() leaves them out",
+                   who, orphanOpenings);
+    if (orphanBounds > 0)
+      reusex::warn("{}: {} stored space boundar(y/ies) name a wall the "
+                   "walls table no longer holds; load_solid_model() leaves "
+                   "them out",
+                   who, orphanBounds);
+    if (offStorey > 0)
+      reusex::warn("{}: {} wall(s) / space(s) (any source) stand on a storey "
+                   "idx the storeys table does not hold",
+                   who, offStorey);
     return r;
   }
 

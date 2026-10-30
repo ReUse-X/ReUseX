@@ -848,9 +848,19 @@ touched. Detected and manual rows stay, with two exceptions, each logged at
   detected / manual row holds is not written: the locked row wins, as in
   every stage.
 
+A taken-over wall's joins and a taken-over space's boundaries go with it
+(counted, `warn`). An imported storey matching one unlocked storey by GUID
+and another by `idx` takes over both; walls and spaces (any source) left on
+an `idx` the storeys table no longer holds are counted and warned about.
+An imported wall join must touch at least one wall of the same import (joins
+carry no source and go only with their walls, so that is what lets a
+re-import replace them); a join between two stored walls is refused.
+
 An element without a GUID gets `uuid5(project_guid, "imported/storeys/<idx>")`
 or `uuid5(project_guid, "imported/<kind>/<index in the document>")`, so
-importing the same document twice writes the same rows. The whole import is
+importing the same document twice writes the same rows. The index is the
+element's position in the document, so reordering elements without a GUID
+changes theirs; give elements a GUID when their identity must survive edits. The whole import is
 one SAVEPOINT: a refused element leaves every table as it was. Plane classes
 and scene relations in a document are not stored (reported as not stored).
 `rux edit plan --export` reads the tables back (`io::load_solid_model()`);

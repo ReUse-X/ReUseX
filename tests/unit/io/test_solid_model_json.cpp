@@ -597,20 +597,16 @@ TEST_CASE("StoreSolidModel_Collisions_UnlockedTakenOverLockedWins",
   CHECK(db.wall_by_guid("w3")); // not named by the import: untouched
 }
 
-TEST_CASE("StoreSolidModel_RefusedRecord_LeavesEveryTableAsItWas",
-          "[io][solid_model]") {
-  reusex::test_support::TempPath tmp("test_store_solid_atomic");
-  reusex::ProjectDB db(tmp.path);
-  SolidModel a = solid_model_from_json(minimal_doc().dump());
-  reusex::io::mark_imported(a);
-  reusex::io::store_solid_model(db, a);
+namespace {
 
-  // A model built in C++ (no JSON validator) whose opening names a wall
-  // nothing holds: refused after its storeys and walls were written, so
-  // those writes roll back too.
+/// A model built in C++ (no JSON validator) whose opening names a wall
+/// nothing holds: refused only after its storeys, walls and (empty) spaces
+/// were written, so those writes must roll back too.
+SolidModel refused_model() {
   SolidModel bad;
   bad.storeys = {detected_storey("other-s0", 0)};
   bad.walls = {detected_wall("wx", 0)};
+  bad.provided.spaces = true; // deletes the imported spaces + boundaries
   reusex::core::OpeningRecord o;
   o.guid = "ox";
   o.wall = "no-such-wall";
@@ -618,13 +614,156 @@ TEST_CASE("StoreSolidModel_RefusedRecord_LeavesEveryTableAsItWas",
   o.z_head = 2.0;
   bad.openings = {o};
   reusex::io::mark_imported(bad);
-  CHECK_THROWS_AS(reusex::io::store_solid_model(db, bad),
+  return bad;
+}
+
+/// Everything the solid-model tables hold, as one comparable document.
+nlohmann::json table_state(const reusex::ProjectDB &db) {
+  return canonical(reusex::io::load_solid_model(db));
+}
+
+} // namespace
+
+TEST_CASE("StoreSolidModel_RefusedRecord_LeavesEveryTableAsItWas",
+          "[io][solid_model]") {
+  reusex::test_support::TempPath tmp("test_store_solid_atomic");
+  reusex::ProjectDB db(tmp.path);
+  SolidModel a =
+      reusex::io::solid_model_from_file(fixture("two_rooms.plan.json"));
+  reusex::io::mark_imported(a);
+  reusex::io::store_solid_model(db, a);
+  const auto joins = db.wall_joins().size();
+  const auto bounds = db.space_boundaries().size();
+  REQUIRE(joins > 0);
+  REQUIRE(bounds > 0);
+  const auto before = table_state(db);
+
+  CHECK_THROWS_AS(reusex::io::store_solid_model(db, refused_model()),
                   std::invalid_argument);
-  CHECK(wall_guids(db) == std::vector<std::string>{"w1", "w2"});
-  REQUIRE(db.storeys().size() == 1);
-  CHECK(db.storeys()[0].guid != "other-s0");
-  REQUIRE(db.openings().size() == 1);
-  CHECK(db.openings()[0].guid == "o1");
+  CHECK(db.wall_joins().size() == joins);
+  CHECK(db.space_boundaries().size() == bounds);
+  CHECK_FALSE(db.wall_by_guid("wx"));
+  CHECK(table_state(db) == before);
+}
+
+TEST_CASE("StoreSolidModel_InsideATransaction_NestsAndRollsBack",
+          "[io][solid_model]") {
+  reusex::test_support::TempPath tmp("test_store_solid_tx");
+  reusex::ProjectDB db(tmp.path);
+  SolidModel a = solid_model_from_json(minimal_doc().dump());
+  reusex::io::mark_imported(a);
+
+  SECTION("a refused import inside a transaction keeps the earlier one") {
+    {
+      reusex::ProjectDB::Transaction tx(db);
+      reusex::io::store_solid_model(db, a);
+      CHECK_THROWS_AS(reusex::io::store_solid_model(db, refused_model()),
+                      std::invalid_argument);
+      tx.commit();
+    }
+    CHECK(wall_guids(db) == std::vector<std::string>{"w1", "w2"});
+    CHECK(db.openings().size() == 1);
+    CHECK(db.spaces().size() == 1);
+  }
+
+  SECTION("a transaction that is not committed takes the import with it") {
+    {
+      reusex::ProjectDB::Transaction tx(db);
+      reusex::io::store_solid_model(db, a);
+      CHECK(wall_guids(db) == std::vector<std::string>{"w1", "w2"});
+    } // no commit
+    CHECK(db.walls().empty());
+    CHECK(db.storeys().empty());
+    CHECK(db.spaces().empty());
+  }
+}
+
+TEST_CASE("StoreSolidModel_StoreyMatchingTwoRows_TakesBothOverAndSaysSo",
+          "[io][solid_model]") {
+  reusex::test_support::TempPath tmp("test_store_solid_storey2");
+  reusex::ProjectDB db(tmp.path);
+  db.save_storeys({detected_storey("det-s0", 0), detected_storey("det-s1", 1)});
+  db.save_walls({detected_wall("dw0", 0), detected_wall("dw1", 1)}, {});
+
+  // Imported storey with det-s1's guid but det-s0's idx.
+  SolidModel m;
+  m.storeys = {detected_storey("det-s1", 0)};
+  reusex::io::mark_imported(m);
+  const auto r = reusex::io::store_solid_model(db, m);
+  CHECK(r.storeys == 1);
+  CHECK(r.taken_over == 2);
+  const auto st = db.storeys();
+  REQUIRE(st.size() == 1);
+  CHECK(st[0].guid == "det-s1");
+  CHECK(st[0].idx == 0);
+  CHECK(st[0].source == "imported");
+  // dw1 stands on idx 1, which no storey holds now: kept (and warned).
+  CHECK(wall_guids(db) == std::vector<std::string>{"dw0", "dw1"});
+}
+
+TEST_CASE("StoreSolidModel_WallJoins_GoWithTheImportedWalls",
+          "[io][solid_model]") {
+  reusex::test_support::TempPath tmp("test_store_solid_joins");
+  reusex::ProjectDB db(tmp.path);
+  db.save_walls({detected_wall("da", 0), detected_wall("db", 0),
+                 detected_wall("la", 0, /*locked*/ true),
+                 detected_wall("lb", 0, /*locked*/ true)},
+                {{"da", "db", "corner", "end", "start"}});
+
+  SolidModel m;
+  m.walls = {detected_wall("w1", 0), detected_wall("w2", 0)};
+  m.wall_joins = {{"w1", "w2", "corner", "end", "start"},
+                  {"w1", "da", "tee", "path", "end"}};
+  reusex::io::mark_imported(m);
+  reusex::io::store_solid_model(db, m);
+  CHECK(db.wall_joins().size() == 3);
+
+  SECTION("a re-import replaces the imported joins") {
+    m.wall_joins = {{"w1", "w2", "tee", "path", "start"}};
+    reusex::io::store_solid_model(db, m);
+    const auto joins = db.wall_joins();
+    REQUIRE(joins.size() == 2); // da-db (detected) + the new w1-w2
+    bool found = false;
+    for (const auto &j : joins)
+      if (j.wall_a == "w1" && j.wall_b == "w2") {
+        CHECK(j.kind == "tee");
+        found = true;
+      }
+    CHECK(found);
+  }
+
+  SECTION("a join between two stored walls is refused") {
+    SolidModel bad = m;
+    bad.wall_joins = {{"da", "db", "tee", "path", "end"}};
+    CHECK_THROWS_AS(reusex::io::store_solid_model(db, bad),
+                    std::invalid_argument);
+    CHECK(db.wall_joins().size() == 3); // rolled back
+  }
+
+  SECTION("a join whose walls are both held back by locked rows is skipped") {
+    SolidModel locked;
+    locked.walls = {detected_wall("la", 0), detected_wall("lb", 0)};
+    locked.wall_joins = {{"la", "lb", "corner", "end", "start"}};
+    reusex::io::mark_imported(locked);
+    const auto r = reusex::io::store_solid_model(db, locked);
+    CHECK(r.walls == 0);
+    CHECK(r.skipped_locked == 2);
+    CHECK(r.skipped_joins == 1);
+    // The import replaced w1 / w2 (and their joins); da-db stays.
+    CHECK(db.wall_joins().size() == 1);
+  }
+
+  SECTION("a taken-over wall's joins are counted") {
+    SolidModel take;
+    take.walls = {detected_wall("da", 0)};
+    reusex::io::mark_imported(take);
+    const auto r = reusex::io::store_solid_model(db, take);
+    CHECK(r.taken_over == 1);
+    // da's joins: da-db (detected) and w1-da went with it; w1 / w2 were
+    // replaced as imported rows before that, taking w1-da already.
+    CHECK(r.dropped_relations == 1);
+    CHECK(db.wall_joins().empty());
+  }
 }
 
 TEST_CASE("StoreSolidModel_PlaneClassesAndRelations_AreReportedNotStored",
