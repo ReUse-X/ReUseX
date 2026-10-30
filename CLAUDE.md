@@ -785,7 +785,11 @@ External-format adapters only — project state itself lives in `core/ProjectDB`
 - `e57.hpp`, `ply.hpp`: point cloud exchange
 - `rhino.hpp`: OpenNURBS (.3dm) import/export
 - `colmap.hpp`: COLMAP sparse model export
-- `speckle.hpp`: Speckle export
+- `speckle.hpp`: Speckle export (upload-only `SpeckleClient`)
+- `speckle_reader.hpp`: Speckle receive, read-only by construction
+  (`SpeckleReader`: GraphQL queries + HTTP GETs only). Project / model /
+  version lookup, the whole object tree in one GET (`ObjectTree`), and
+  `ObjectTree::resolve` (references, `@`-detached keys, DataChunk joins)
 - `exif.hpp`: photo metadata (exiv2)
 - `export_scene.hpp`: serializes a reconstructed scene
 - `solid_model_json.hpp`: the solid-model JSON document (reference plans and
