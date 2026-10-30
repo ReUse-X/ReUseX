@@ -943,11 +943,30 @@ stages) are `{table, storeys|walls|openings|spaces, rows written}` and
 history, `pipeline_log.parameters`), so the Speckle token is resolved per run
 by `StageExecutorOptions::speckle_token(ctx, server_url)`, which a multi-user
 front end (ruxd) sets to the submitting user's token
-(`StageContext::submitted_by`); unset, it reads `SPECKLE_TOKEN` (the CLI).
-No token -> the stage is refused ("no Speckle token configured") before
-anything is fetched. A `token` key is refused for every stage, by
-`JobQueue::submit()` and before the `pipeline_log` row is opened. The token
-appears in no log line, row, result or mesh parameter.
+(`StageContext::submitted_by`). With no provider set, or one that returns
+none, the stage is refused ("no Speckle token configured") before anything
+is fetched; the environment is read only through the explicit
+`StageExecutorOptions::env_speckle_token`, which the `rux` CLI and the Qt
+client pass (`StageExecutorOptions::local_user()`). A `token` key is refused
+for every stage, by `JobQueue::submit()` and before the `pipeline_log` row
+is opened. For both import stages the parameters are **strict**: a key not
+in the table (`speckle_token`, `Token`, ...) is refused, and what
+`JobQueue::submit()` stores and `pipeline_log` records is the table's keys
+re-serialised (`normalize_import_parameters()`), never the submitted blob.
+The token appears in no log line, row, result or mesh parameter.
+
+**Server policy.** Before the token is asked for, the server must pass
+`StageExecutorOptions::allowed_speckle_server` (a hook that is the whole
+policy when set) or, by default, `default_speckle_server_allowed()`:
+`https://` to a public host (not localhost, not a literal loopback /
+private / link-local / CGNAT address, no userinfo); `http://` / `https://`
+to localhost only with `allow_insecure_localhost` (set by `local_user()`).
+
+**Cancellation and timeout.** `import_speckle` is cancellable: the job's
+cancel token aborts the Speckle requests (curl progress callback) and is
+checked again after the download, so a cancelled run stores nothing and its
+`pipeline_log` row ends `cancelled`. `StageExecutorOptions::speckle_timeout_s`
+bounds each request, the object download included (0 = none).
 
 | | |
 |---|---|
@@ -1020,11 +1039,14 @@ one `pipeline_log` row, stage `import_ifc`, parameters `path`, `meshes`,
 `storey_height`, `min_wall_thickness`, `min_wall_fill`,
 `opening_host_tolerance`, `recenter`, `recenter_threshold` (+ `job_id`).
 `path` is absolute, or relative to the directory holding the `.rux` (the
-case directory ruxd uploads into); a relative path may not leave it (`..`),
-and it must name an existing file, else the stage is refused. `rux import
-ifc FILE` makes a relative FILE absolute against the working directory.
-Which absolute paths a user may name is the front end's call: ruxd passes
-only case-relative ones.
+case directory ruxd uploads into). By default it must resolve -- symlinks
+followed (`canonical`) -- to an existing regular file **inside** that
+directory; an absolute path elsewhere, a `..` escape or a symlink out are
+refused with the same message as a missing file ("is not a file in the
+project's directory"), so the refusal is no existence oracle.
+`StageExecutorOptions::allow_paths_outside_project` (set by `local_user()`:
+the CLI and the Qt client) lifts the confinement. `rux import ifc FILE`
+makes a relative FILE absolute against the working directory.
 web-ifc is an optional dependency: a build without it
 (`REUSEX_HAVE_WEB_IFC` off) refuses with a clear message. web-ifc's own log
 messages (it logs through spdlog's default logger) are shown as `[web-ifc]`

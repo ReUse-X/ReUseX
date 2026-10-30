@@ -6,6 +6,7 @@
 
 #include <nlohmann/json.hpp>
 
+#include <atomic>
 #include <cstddef>
 #include <functional>
 #include <map>
@@ -216,6 +217,17 @@ class SpeckleReader {
     return max_download_bytes_;
   }
 
+  /// Abort any request in flight once `*cancel` is set (checked by curl's
+  /// progress callback, about once a second even while stalled); the call
+  /// then throws std::runtime_error ("... cancelled"). nullptr = never.
+  /// The flag must outlive the reader's calls.
+  void set_cancel_token(const std::atomic_bool *cancel) { cancel_ = cancel; }
+
+  /// Overall time limit for one request, the object download included
+  /// (0 = none: the download is bounded by a low-speed abort only, queries
+  /// by their own 60 s).
+  void set_timeout_seconds(long seconds) { timeout_s_ = seconds; }
+
   /// Project name and all of its models.
   [[nodiscard]] ProjectInfo query_project(const std::string &project) const;
 
@@ -254,6 +266,8 @@ class SpeckleReader {
   std::string server_url_;
   std::string token_;
   std::size_t max_download_bytes_ = std::size_t{4} << 30; // 4 GiB
+  const std::atomic_bool *cancel_ = nullptr;
+  long timeout_s_ = 0;
 };
 
 } // namespace reusex::io::speckle

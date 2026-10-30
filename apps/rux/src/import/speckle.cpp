@@ -67,6 +67,12 @@ NOTES:
     if (rux::capture_stage_params("import_speckle",
                                   speckle_stage_parameters(*opt)))
       return;
+    // Usage errors before any project is opened (or created) and before a
+    // pipeline_log row exists: the exit code CLI11's ->required() gave.
+    if (opt->stage.import.project.empty())
+      throw CLI::RequiredError("--project");
+    if (opt->stage.import.model.empty())
+      throw CLI::RequiredError("--model");
     rux::finish(run_subcommand_import_speckle(*opt, *global_opt));
   });
 }
@@ -78,14 +84,25 @@ speckle_stage_parameters(SubcommandImportSpeckleOptions const &opt) {
 
 int run_subcommand_import_speckle(SubcommandImportSpeckleOptions const &opt,
                                   const RuxOptions &global_opt) {
+  // Bad values (ids, bounds, server) are refused before the project is
+  // opened, so a usage error neither creates a .rux nor logs a run.
+  try {
+    (void)reusex::pipeline::speckle_options_from_parameters(
+        speckle_stage_parameters(opt));
+  } catch (const std::invalid_argument &e) {
+    spdlog::error("import speckle: {}", e.what());
+    return RuxError::INVALID_ARGUMENT;
+  }
   try {
     reusex::ProjectDB db(global_opt.project_db);
     reusex::pipeline::StageContext ctx;
     ctx.project = global_opt.project_db;
     ctx.stage = reusex::pipeline::JobStage::import_speckle;
     ctx.parameters = speckle_stage_parameters(opt);
-    // Default executor options: the token comes from SPECKLE_TOKEN.
-    const auto result = reusex::pipeline::run_stage(db, ctx);
+    // A local user: the token comes from SPECKLE_TOKEN, a localhost Speckle
+    // server is allowed.
+    const auto result = reusex::pipeline::run_stage(
+        db, ctx, reusex::pipeline::StageExecutorOptions::local_user());
     if (result.ok)
       spdlog::info("Imported {}", result.message);
     return rux::exit_code_for(result);

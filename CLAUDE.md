@@ -453,7 +453,8 @@ Pipeline workspace runs stages in-process through `pipeline::JobRunner` with
 injects the same executor for the web GUI, from its own repo, passing
 `StageExecutorOptions` whose `speckle_token(ctx, server)` supplies the
 submitting user's token to `import_speckle` — a credential is never a job
-parameter, and a `token` key is refused for every stage; the Qt Pipeline
+parameter, and a `token` key is refused for every stage; the Qt client
+passes `StageExecutorOptions::local_user()`; the Qt Pipeline
 list hides `annotate`, `import_speckle` and `import_ifc`), and "Kopiér som
 rux-kommando" (`rux_qt/cli_command.hpp`) is round-trip tested against the real
 CLI (`tests/unit/rux_app/test_cli_command_roundtrip.cpp`, via
@@ -811,15 +812,21 @@ External-format adapters only — project state itself lives in `core/ProjectDB`
   model + per-category meshes (`import_revit`, pure), and the entry point
   `import_speckle_revit` (fetch, map, store as imported) of the job stage
   `JobStage::import_speckle` (`rux import speckle`, ruxd jobs; the Speckle
-  token comes from `StageExecutorOptions::speckle_token`, default
-  `SPECKLE_TOKEN`, never from parameters). Revit internal frame in metres, one shared level frame;
+  token comes from `StageExecutorOptions::speckle_token` -- none set, the
+  stage is refused; the CLI and the Qt client pass
+  `StageExecutorOptions::local_user()`, which reads `SPECKLE_TOKEN` -- never
+  from parameters; cancellable, `speckle_timeout_s`; server policy
+  `default_speckle_server_allowed()` or the `allowed_speckle_server` hook). Revit internal frame in metres, one shared level frame;
   mapping rules in `docs/CONTRACTS.md` ("Import write: Revit model via
   Speckle")
 - `ifc.hpp`: IFC file -> solid model + per-class meshes through web-ifc
   (`import_ifc`, pure apart from reading the file) and the entry point
   `import_ifc_file` of the job stage `JobStage::import_ifc` (`rux import
-  ifc`, ruxd jobs). Both stages' parameters (keys, CLI flags, bounds) come
-  from one table each, `pipeline/import_parameters.hpp`. Same rules as the Revit import; the
+  ifc`, ruxd jobs; the path must lie in the project's directory unless
+  `allow_paths_outside_project`). Both stages' parameters (keys, CLI flags,
+  bounds) come from one table each, `pipeline/import_parameters.hpp`, and
+  are strict: unknown keys are refused and only the re-serialised table
+  keys are stored (`normalize_import_parameters()`). Same rules as the Revit import; the
   geometric readings both share (wall axis from the footprint rectangle,
   room outline from bottom faces, opening hosting, GUID scheme, recentring,
   mesh merge / write) live in the private `src/io/bim_mapping.{hpp,cpp}`.

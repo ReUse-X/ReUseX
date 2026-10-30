@@ -29,6 +29,7 @@
 #include <nlohmann/json.hpp>
 
 #include <algorithm>
+#include <atomic>
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
@@ -230,13 +231,14 @@ TEST_CASE("ImportSpeckleStage_ProviderHasNoToken_RefusedWithoutFetching",
   CHECK(runs.front().status == "failed");
 }
 
-TEST_CASE("ImportSpeckleStage_NoProvider_FallsBackToSpeckleTokenEnv",
+TEST_CASE("ImportSpeckleStage_NoProvider_RefusedEvenWithSpeckleTokenEnv",
           "[pipeline][stages][import][speckle]") {
-  // Without a provider the stage reads SPECKLE_TOKEN, as `rux import
-  // speckle` always has. Restore whatever the environment had.
+  // No provider = no token: the environment is only read when the front end
+  // says so (StageExecutorOptions::env_speckle_token, local_user()).
   const char *had = std::getenv("SPECKLE_TOKEN");
   const std::optional<std::string> saved =
       had ? std::optional<std::string>(had) : std::nullopt;
+  ::setenv("SPECKLE_TOKEN", "env-token-91", 1);
 
   TempPath project("test_import_stages");
   FakeSpeckle fake;
@@ -248,25 +250,115 @@ TEST_CASE("ImportSpeckleStage_NoProvider_FallsBackToSpeckleTokenEnv",
   ctx.stage = JobStage::import_speckle;
   ctx.parameters = kSpeckleParams;
 
-  SECTION("unset: refused") {
-    ::unsetenv("SPECKLE_TOKEN");
+  SECTION("no provider: refused") {
     const StageResult r = run_stage(ctx, options);
     CHECK(r.invalid_input);
-    CHECK(r.message.find("SPECKLE_TOKEN") != std::string::npos);
+    CHECK(r.message.find("no Speckle token configured") != std::string::npos);
     CHECK(fake.downloads == 0);
+    // ... also through the default executor, with no options at all
+    const StageResult d = default_stage_executor()(ctx);
+    CHECK(d.invalid_input);
   }
-  SECTION("set: used") {
-    ::setenv("SPECKLE_TOKEN", "env-token-91", 1);
+  SECTION("env_speckle_token: used") {
+    options.speckle_token = &StageExecutorOptions::env_speckle_token;
     const StageResult r = run_stage(ctx, options);
     INFO(r.message);
     CHECK(r.ok);
     CHECK(fake.last.token == "env-token-91");
+  }
+  SECTION("local_user(): env token, localhost and outside files allowed") {
+    const auto local = StageExecutorOptions::local_user();
+    REQUIRE(local.speckle_token);
+    CHECK(local.speckle_token(ctx, kServer) == std::string("env-token-91"));
+    CHECK(local.allow_insecure_localhost);
+    CHECK(local.allow_paths_outside_project);
   }
 
   if (saved)
     ::setenv("SPECKLE_TOKEN", saved->c_str(), 1);
   else
     ::unsetenv("SPECKLE_TOKEN");
+}
+
+TEST_CASE("ImportSpeckleStage_ServerPolicy_CheckedBeforeTheToken",
+          "[pipeline][stages][import][speckle]") {
+  TempPath project("test_import_stages");
+  FakeSpeckle fake;
+  StageContext ctx;
+  ctx.project = project.path;
+  ctx.stage = JobStage::import_speckle;
+  const auto with_server = [](const std::string &server) {
+    return json{{"server", server}, {"project", "p1"}, {"model", "m1"}}.dump();
+  };
+
+  SECTION("default policy refuses localhost and private addresses") {
+    for (const char *server :
+         {"http://localhost:3000", "https://localhost", "https://127.0.0.1",
+          "https://10.1.2.3", "https://192.168.0.5", "https://169.254.169.254",
+          "https://[::1]", "https://[fd00::1]", "https://user@speckle.xyz"}) {
+      INFO(server);
+      ctx.parameters = with_server(server);
+      const StageResult r = run_stage(ctx, fake.options());
+      CHECK(r.invalid_input);
+    }
+    CHECK(fake.token_calls == 0);
+    CHECK(fake.downloads == 0);
+  }
+  SECTION("allow_insecure_localhost lets localhost through") {
+    auto options = fake.options();
+    options.allow_insecure_localhost = true;
+    ctx.parameters = with_server("http://localhost:3000");
+    CHECK(run_stage(ctx, options).ok);
+  }
+  SECTION("a hook is the whole policy") {
+    auto options = fake.options();
+    std::string asked;
+    options.allowed_speckle_server = [&](const std::string &url) {
+      asked = url;
+      return false;
+    };
+    ctx.parameters = kSpeckleParams;
+    const StageResult r = run_stage(ctx, options);
+    CHECK(r.invalid_input);
+    CHECK(asked == kServer);
+    CHECK(fake.token_calls == 0);
+  }
+  CHECK(default_speckle_server_allowed("https://app.speckle.systems", false));
+  CHECK(default_speckle_server_allowed("https://speckle.example.org:8443/x",
+                                       false));
+  CHECK_FALSE(
+      default_speckle_server_allowed("http://speckle.example.org", true));
+  CHECK_FALSE(
+      default_speckle_server_allowed("ftp://speckle.example.org", true));
+}
+
+TEST_CASE("ImportSpeckleStage_CancelDuringDownload_StoresNothing",
+          "[pipeline][stages][import][speckle]") {
+  TempPath project("test_import_stages");
+  FakeSpeckle fake;
+  std::atomic_bool cancel{false};
+  auto options = fake.options();
+  const auto inner = options.speckle_download;
+  options.speckle_download = [&](const auto &r) {
+    cancel = true; // the user cancels while the download runs
+    return inner(r);
+  };
+  StageContext ctx;
+  ctx.project = project.path;
+  ctx.stage = JobStage::import_speckle;
+  ctx.parameters = kSpeckleParams;
+  ctx.cancel_token = &cancel;
+
+  CHECK(stage_supports_cancellation(JobStage::import_speckle));
+  const StageResult r = run_stage(ctx, options);
+  CHECK(r.cancelled);
+  CHECK_FALSE(r.ok);
+  ProjectDB db(project.path, /*readOnly=*/true);
+  CHECK(db.walls().empty());
+  CHECK_FALSE(db.has_mesh("imported/revit/walls"));
+  const auto runs = db.pipeline_log();
+  REQUIRE(runs.size() == 1);
+  CHECK(runs.front().status == "cancelled");
 }
 
 TEST_CASE("ImportSpeckleStage_TokenParameter_RefusedBeforeAnythingIsStored",
@@ -317,6 +409,73 @@ TEST_CASE("ImportSpeckleStage_TokenParameter_RefusedBeforeAnythingIsStored",
     CHECK_THROWS_AS(speckle_options_from_parameters(with_token),
                     std::invalid_argument);
   }
+}
+
+TEST_CASE("ImportStages_UnknownKeys_NeverPersisted",
+          "[pipeline][stages][import]") {
+  // A misspelt secret is an unknown key: refused, never stored.
+  for (const char *key : {"speckle_token", "Token", "auth"}) {
+    INFO(key);
+    const std::string params =
+        json{{"project", "proj01"}, {"model", "model01"}, {key, "leaked-88"}}
+            .dump();
+    TempPath project("test_import_stages");
+    FakeSpeckle fake;
+    LogCapture log;
+
+    StageContext ctx;
+    ctx.project = project.path;
+    ctx.stage = JobStage::import_speckle;
+    ctx.parameters = params;
+    const StageResult r = run_stage(ctx, fake.options());
+    CHECK(r.invalid_input);
+    CHECK(r.message.find("unknown key") != std::string::npos);
+    CHECK(r.message.find("leaked-88") == std::string::npos);
+    CHECK_FALSE(log.mentions("leaked-88"));
+    {
+      ProjectDB db(project.path, /*readOnly=*/true);
+      CHECK(db.pipeline_log().empty());
+    }
+
+    JobScheduler scheduler;
+    auto queue = scheduler.make_queue("case", project.path);
+    CHECK_THROWS_AS(queue->submit(JobStage::import_speckle, params),
+                    std::runtime_error);
+    CHECK_THROWS_AS(
+        queue->submit(JobStage::import_ifc,
+                      json{{"path", "a.ifc"}, {key, "leaked-88"}}.dump()),
+        std::runtime_error);
+    CHECK(queue->jobs().empty());
+  }
+}
+
+TEST_CASE("ImportStages_Submit_StoresTheReSerialisedTableParameters",
+          "[pipeline][stages][import][job]") {
+  TempPath project("test_import_stages");
+  JobScheduler scheduler;
+  // An executor that does nothing: only the stored record matters here.
+  auto queue =
+      scheduler.make_queue("case", project.path, [](const StageContext &) {
+        return StageResult::success("noop");
+      });
+  const std::string id = queue->submit(JobStage::import_speckle,
+                                       R"({"project":"p1","model":"m1"})");
+  queue->wait_idle();
+  const auto job = queue->job(id);
+  REQUIRE(job);
+  const auto stored = json::parse(job->parameters);
+  for (const auto &d : stage_parameters(JobStage::import_speckle)) {
+    INFO(d.key);
+    // every table key with a value, nothing else
+    if (d.key == "version" || d.key == "elevation_offset")
+      CHECK_FALSE(stored.contains(d.key));
+    else
+      CHECK(stored.contains(d.key));
+  }
+  CHECK(stored.size() == stage_parameters(JobStage::import_speckle).size() - 2);
+  // Missing required keys are refused at submit, not in the worker.
+  CHECK_THROWS_AS(queue->submit(JobStage::import_speckle, R"({"model":"m"})"),
+                  std::runtime_error);
 }
 
 TEST_CASE("ImportSpeckleStage_JobQueue_RunsAsAnOrdinaryJob",
@@ -429,7 +588,10 @@ TEST_CASE("ImportIfcStage_Fixture_ImportsThroughTheExecutor",
   ctx.parameters = json{{"path", ifc_fixture().string()}}.dump();
   ctx.job_id = "job-ifc-1";
 
-  const StageResult r = default_stage_executor()(ctx);
+  // The fixture lies outside the project's directory.
+  StageExecutorOptions options;
+  options.allow_paths_outside_project = true;
+  const StageResult r = default_stage_executor(options)(ctx);
   INFO(r.message);
   REQUIRE(r.ok);
   CHECK(has_output(r, "table", "storeys"));
@@ -447,33 +609,70 @@ TEST_CASE("ImportIfcStage_Fixture_ImportsThroughTheExecutor",
   CHECK(json::parse(runs.front().parameters).at("job_id") == "job-ifc-1");
 }
 
-TEST_CASE("ImportIfcStage_RelativePath_IsReadAgainstTheProjectDirectory",
+TEST_CASE("ImportIfcStage_Path_ConfinedToTheProjectDirectory",
           "[pipeline][stages][import][ifc]") {
   if (!io::ifc::has_ifc_support())
     SKIP("built without web-ifc");
   TempDir dir("test_import_stages_case");
+  TempDir elsewhere("test_import_stages_other");
   std::filesystem::create_directories(dir.path / "uploads");
   std::filesystem::copy_file(ifc_fixture(), dir.path / "uploads" / "model.ifc");
+  std::filesystem::copy_file(ifc_fixture(), elsewhere.path / "other.ifc");
+  std::filesystem::create_symlink(elsewhere.path / "other.ifc",
+                                  dir.path / "uploads" / "link.ifc");
 
   StageContext ctx;
   ctx.project = dir.path / "case.rux";
   ctx.stage = JobStage::import_ifc;
+  const auto run = [&](const std::string &path,
+                       const StageExecutorOptions &options = {}) {
+    ctx.parameters = json{{"path", path}, {"meshes", false}}.dump();
+    return run_stage(ctx, options);
+  };
+  const std::string refusal = "is not a file in the project's directory";
 
-  SECTION("inside: imported") {
-    ctx.parameters = R"({"path":"uploads/model.ifc","meshes":false})";
-    const StageResult r = run_stage(ctx);
+  SECTION("relative inside: imported") {
+    const StageResult r = run("uploads/model.ifc");
     INFO(r.message);
     CHECK(r.ok);
-    // meshes = false: no mesh output.
     CHECK_FALSE(std::any_of(r.outputs.begin(), r.outputs.end(),
                             [](const auto &a) { return a.kind == "mesh"; }));
   }
-  SECTION("escaping the project directory: refused") {
-    ctx.parameters = R"({"path":"../uploads/model.ifc"})";
-    const StageResult r = run_stage(ctx);
+  SECTION("absolute inside: imported") {
+    CHECK(run((dir.path / "uploads" / "model.ifc").string()).ok);
+  }
+  SECTION("relative escaping with ..: refused") {
+    const StageResult r =
+        run("../" + elsewhere.path.filename().string() + "/other.ifc");
     CHECK(r.invalid_input);
-    CHECK(r.message.find("leaves the project's directory") !=
-          std::string::npos);
+    CHECK(r.message.find(refusal) != std::string::npos);
+  }
+  SECTION("absolute outside: refused") {
+    const StageResult r = run((elsewhere.path / "other.ifc").string());
+    CHECK(r.invalid_input);
+    CHECK(r.message.find(refusal) != std::string::npos);
+  }
+  SECTION("a symlink out of the directory: refused") {
+    const StageResult r = run("uploads/link.ifc");
+    CHECK(r.invalid_input);
+    CHECK(r.message.find(refusal) != std::string::npos);
+  }
+  SECTION("missing and outside read the same") {
+    const StageResult missing = run("uploads/none.ifc");
+    const StageResult outside = run("/nonexistent/model.ifc");
+    CHECK(missing.invalid_input);
+    CHECK(outside.invalid_input);
+    CHECK(missing.message.find(refusal) != std::string::npos);
+    CHECK(outside.message.find(refusal) != std::string::npos);
+  }
+  SECTION("allow_paths_outside_project: outside and symlinks allowed") {
+    StageExecutorOptions options;
+    options.allow_paths_outside_project = true;
+    CHECK(run((elsewhere.path / "other.ifc").string(), options).ok);
+    CHECK(run("uploads/link.ifc", options).ok);
+    const StageResult missing = run("/nonexistent/model.ifc", options);
+    CHECK(missing.invalid_input);
+    CHECK(missing.message.find("not an existing file") != std::string::npos);
   }
 }
 
@@ -494,8 +693,6 @@ TEST_CASE("ImportIfcStage_InvalidParameters_Refused",
     return r.message;
   };
   CHECK(refused("{}").find("'path'") != std::string::npos);
-  CHECK(refused(R"({"path":"/nonexistent/model.ifc"})")
-            .find("not an existing file") != std::string::npos);
   CHECK(
       refused(
           json{{"path", ifc_fixture().string()}, {"min_wall_fill", 2.0}}.dump())
@@ -508,6 +705,6 @@ TEST_CASE("ImportStages_Names_AndPipelineLogNames",
   CHECK(parse_job_stage("import_ifc") == JobStage::import_ifc);
   CHECK(pipeline_log_name(JobStage::import_speckle) == "import_speckle");
   CHECK(pipeline_log_name(JobStage::import_ifc) == "import_ifc");
-  CHECK_FALSE(stage_supports_cancellation(JobStage::import_speckle));
+  CHECK(stage_supports_cancellation(JobStage::import_speckle));
   CHECK_FALSE(stage_supports_cancellation(JobStage::import_ifc));
 }

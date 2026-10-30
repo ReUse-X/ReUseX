@@ -7,6 +7,7 @@
 #include "reusex/core/guid.hpp"
 #include "reusex/core/logging.hpp"
 #include "reusex/core/processing_observer.hpp"
+#include "reusex/pipeline/import_parameters.hpp"
 
 #include <nlohmann/json.hpp>
 
@@ -571,6 +572,16 @@ std::string JobQueue::submit(JobStage stage, std::string parameters,
       throw std::runtime_error(
           "job parameters must not carry a credential: 'token' is refused "
           "(the Speckle token comes from the executor's token provider)");
+  }
+  // An import stage's record holds its table's keys only, re-serialised:
+  // an unknown key (a misspelt secret such as "speckle_token") is refused
+  // here, before the record is stored anywhere.
+  if (is_import_stage(stage)) {
+    try {
+      parameters = normalize_import_parameters(stage, parameters);
+    } catch (const std::invalid_argument &e) {
+      throw std::runtime_error(e.what());
+    }
   }
 
   JobRecord record;

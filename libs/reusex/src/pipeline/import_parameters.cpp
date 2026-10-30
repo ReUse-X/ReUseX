@@ -9,7 +9,10 @@
 #include <fmt/format.h>
 #include <nlohmann/json.hpp>
 
+#include <algorithm>
+#include <cctype>
 #include <cmath>
+#include <cstdio>
 #include <limits>
 #include <stdexcept>
 #include <string>
@@ -101,6 +104,19 @@ O options_from(std::string_view stage,
         "Speckle token comes from the executor's token provider, "
         "SPECKLE_TOKEN by default)",
         stage, kSecretParameterKey));
+  // Strict: a key the table does not know is refused rather than ignored,
+  // so a misspelt or smuggled secret ("speckle_token", "Token") can never
+  // be persisted with the job (normalize_import_parameters()).
+  for (const auto &item : params.items()) {
+    const bool known =
+        std::any_of(table.begin(), table.end(),
+                    [&](const auto &p) { return p.key == item.key(); });
+    if (!known)
+      throw std::invalid_argument(fmt::format(
+          "{} parameters: unknown key '{}' (only the stage's own parameters "
+          "are accepted)",
+          stage, item.key().substr(0, 64)));
+  }
 
   O o{};
   for (const auto &p : table) {
@@ -242,16 +258,20 @@ speckle_options_from_parameters(std::string_view parameters) {
       options_from("import_speckle", speckle_parameter_table(), parameters);
   // Checked before anything is sent anywhere (SpeckleReader checks again).
   if (!io::speckle::detail::is_allowed_server_url(o.import.server_url))
-    throw std::invalid_argument(fmt::format(
-        "import_speckle parameter 'server': '{}' is not an https:// URL (or "
-        "http:// to localhost)",
-        o.import.server_url));
-  for (const auto *id : {&o.import.project, &o.import.model, &o.import.version})
+    throw std::invalid_argument(
+        "import_speckle parameter 'server' is not an https:// URL (or "
+        "http:// to localhost)");
+  // Values are not echoed: a misplaced secret must not reach a message.
+  const std::pair<const char *, const std::string *> ids[] = {
+      {"project", &o.import.project},
+      {"model", &o.import.model},
+      {"version", &o.import.version}};
+  for (const auto &[key, id] : ids)
     if (!id->empty() && !io::speckle::is_valid_speckle_id(*id))
       throw std::invalid_argument(
-          fmt::format("import_speckle: '{}' is not a Speckle id (1-128 "
-                      "letters and digits)",
-                      *id));
+          fmt::format("import_speckle parameter '{}' is not a Speckle id "
+                      "(1-128 letters and digits)",
+                      key));
   o.import.token.clear(); // never from parameters
   return o;
 }
@@ -317,28 +337,120 @@ std::string ifc_parameters_json(const IfcStageOptions &options) {
   return json_of(ifc_parameter_table(), options);
 }
 
+std::string normalize_import_parameters(JobStage stage,
+                                        std::string_view parameters) {
+  switch (stage) {
+  case JobStage::import_speckle:
+    return speckle_parameters_json(speckle_options_from_parameters(parameters));
+  case JobStage::import_ifc:
+    return ifc_parameters_json(ifc_options_from_parameters(parameters));
+  default:
+    return std::string(parameters);
+  }
+}
+
+bool is_import_stage(JobStage stage) {
+  return stage == JobStage::import_speckle || stage == JobStage::import_ifc;
+}
+
+bool default_speckle_server_allowed(const std::string &url,
+                                    bool allow_insecure_localhost) {
+  std::string lower(url);
+  std::transform(lower.begin(), lower.end(), lower.begin(),
+                 [](unsigned char c) { return std::tolower(c); });
+  const bool https = lower.rfind("https://", 0) == 0;
+  const bool http = lower.rfind("http://", 0) == 0;
+  if (!https && !http)
+    return false;
+  std::string_view rest = std::string_view(lower).substr(https ? 8 : 7);
+  const auto end = rest.find_first_of("/?#");
+  const std::string_view authority = rest.substr(0, end);
+  if (authority.find('@') != std::string_view::npos)
+    return false; // no userinfo
+  std::string_view host = authority;
+  if (!host.empty() && host.front() == '[') {
+    const auto close = host.find(']');
+    if (close == std::string_view::npos)
+      return false;
+    host = host.substr(0, close + 1);
+  } else {
+    host = host.substr(0, host.find(':'));
+  }
+  if (host.empty())
+    return false;
+  const bool loopback =
+      host == "localhost" || host == "[::1]" || host.rfind("127.", 0) == 0 ||
+      (host.size() > 10 && host.substr(host.size() - 10) == ".localhost");
+  if (http)
+    return allow_insecure_localhost && loopback &&
+           io::speckle::detail::is_allowed_server_url(url);
+  if (loopback)
+    return allow_insecure_localhost;
+  // https: a public host. Refuse literal private / link-local / unspecified
+  // addresses (a name is not resolved here; the front end's hook can).
+  if (host.front() == '[')
+    return !(host.rfind("[fc", 0) == 0 || host.rfind("[fd", 0) == 0 ||
+             host.rfind("[fe80", 0) == 0 || host == "[::]");
+  const bool ipv4 =
+      host.find_first_not_of("0123456789.") == std::string_view::npos;
+  if (ipv4) {
+    unsigned a = 0, b = 0;
+    if (std::sscanf(std::string(host).c_str(), "%u.%u", &a, &b) != 2)
+      return false;
+    if (a == 0 || a == 10 || (a == 169 && b == 254) ||
+        (a == 172 && b >= 16 && b <= 31) || (a == 192 && b == 168) ||
+        (a == 100 && b >= 64 && b <= 127))
+      return false;
+  }
+  return true;
+}
+
+namespace {
+/// True when @p inner lies strictly inside @p base (both canonical).
+bool is_within(const std::filesystem::path &base,
+               const std::filesystem::path &inner) {
+  auto b = base.begin();
+  auto i = inner.begin();
+  for (; b != base.end(); ++b, ++i)
+    if (i == inner.end() || *b != *i)
+      return false;
+  return i != inner.end();
+}
+} // namespace
+
 std::filesystem::path resolve_ifc_path(const std::filesystem::path &project,
-                                       const std::string &path) {
+                                       const std::string &path,
+                                       bool allow_outside_project) {
   namespace fs = std::filesystem;
   if (path.empty())
     throw std::invalid_argument("import_ifc parameter 'path' is required");
-  fs::path file(path);
-  if (file.is_relative()) {
-    const fs::path rel = file.lexically_normal();
-    if (rel.empty() || *rel.begin() == "..")
-      throw std::invalid_argument(fmt::format(
-          "import_ifc: relative path '{}' leaves the project's directory",
-          path));
-    fs::path base = project.parent_path();
-    if (base.empty())
-      base = fs::current_path();
-    file = base / rel;
-  }
   std::error_code ec;
-  if (!fs::is_regular_file(file, ec))
+  fs::path base = project.parent_path();
+  if (base.empty())
+    base = fs::current_path();
+  base = fs::weakly_canonical(base, ec);
+  if (ec)
+    base = fs::absolute(project.parent_path()).lexically_normal();
+
+  const fs::path given(path);
+  const fs::path candidate = given.is_relative() ? base / given : given;
+  // canonical(): symlinks resolved, so a link inside the directory that
+  // points out of it is outside.
+  const fs::path real = fs::canonical(candidate, ec);
+  const bool is_file = !ec && fs::is_regular_file(real, ec) && !ec;
+
+  if (!allow_outside_project) {
+    // One message for "outside" and "missing": no existence oracle for
+    // paths a front end's user may not see.
+    if (!is_file || !is_within(base, real))
+      throw std::invalid_argument(fmt::format(
+          "import_ifc: '{}' is not a file in the project's directory", path));
+    return real;
+  }
+  if (!is_file)
     throw std::invalid_argument(
         fmt::format("import_ifc: '{}' is not an existing file", path));
-  return file;
+  return real;
 }
 
 } // namespace reusex::pipeline

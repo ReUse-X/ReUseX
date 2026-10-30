@@ -167,17 +167,42 @@ inline constexpr std::string_view kSecretParameterKey = "token";
 /// any stage's parameters is refused (JobQueue::submit, run_logged_stage).
 struct StageExecutorOptions {
   /// The Speckle access token for one `import_speckle` run against
-  /// @p server_url (already validated: https://, or http:// to localhost).
-  /// nullopt / empty = none configured: the stage is then refused with "no
-  /// Speckle token configured" and nothing is fetched. A multi-user front
-  /// end (ruxd) sets this and picks the submitting user's token
-  /// (StageContext::submitted_by) for that server — it must NOT fall back to
-  /// a process-wide token, or one user could send it to a server of their
-  /// choosing. Unset (the default) reads `SPECKLE_TOKEN` from the
-  /// environment, as `rux import speckle` always has.
+  /// @p server_url (already allowed by the server policy below). nullopt /
+  /// empty = none: the stage is refused with "no Speckle token configured"
+  /// and nothing is fetched. UNSET = no provider = every import_speckle run
+  /// is refused: a token is only ever used when the front end says where it
+  /// comes from. A multi-user front end (ruxd) picks the submitting user's
+  /// token (StageContext::submitted_by) for that server and must NOT fall
+  /// back to a process-wide one; a single-user local front end passes
+  /// env_speckle_token (local_user()).
   std::function<std::optional<std::string>(const StageContext &ctx,
                                            const std::string &server_url)>
       speckle_token;
+
+  /// `SPECKLE_TOKEN` from the environment: the provider of the rux CLI and
+  /// the Qt client.
+  static std::optional<std::string>
+  env_speckle_token(const StageContext &ctx, const std::string &server_url);
+
+  /// Which Speckle servers import_speckle may contact, consulted before the
+  /// token is asked for and before any request. Unset =
+  /// pipeline::default_speckle_server_allowed(url, allow_insecure_localhost)
+  /// (pipeline/import_parameters.hpp): https to a public host. Set, it is the
+  /// whole policy (it may call the default itself).
+  std::function<bool(const std::string &server_url)> allowed_speckle_server;
+  /// Default policy only: also allow http:// / https:// to localhost.
+  bool allow_insecure_localhost = false;
+
+  /// Overall time limit for each Speckle request, the object download
+  /// included [s]; 0 = none (the download is then bounded by a low-speed
+  /// abort only).
+  long speckle_timeout_s = 0;
+
+  /// import_ifc may read a file outside the project's directory. Off (the
+  /// default), the path must resolve -- symlinks followed -- inside the
+  /// directory holding the `.rux` (a ruxd case directory), and "outside" and
+  /// "missing" are refused with the same message.
+  bool allow_paths_outside_project = false;
 
   /// What the import_speckle stage hands speckle_download.
   struct SpeckleDownloadRequest {
@@ -192,6 +217,11 @@ struct StageExecutorOptions {
   /// (io::speckle::ObjectTree::resolve_root()), as JSON text. Unset = read
   /// it from the server with io::speckle::SpeckleReader.
   std::function<std::string(const SpeckleDownloadRequest &)> speckle_download;
+
+  /// The options of a single-user local front end (the rux CLI, the Qt
+  /// client): the token from `SPECKLE_TOKEN`, localhost Speckle servers and
+  /// IFC files anywhere allowed -- the user is the one at the keyboard.
+  static StageExecutorOptions local_user();
 };
 
 /// Run a stage against an already-open, writable ProjectDB.
@@ -202,8 +232,8 @@ struct StageExecutorOptions {
 StageResult run_stage(ProjectDB &db, const StageContext &ctx,
                       const StageExecutorOptions &options);
 
-/// run_stage() with default StageExecutorOptions (SPECKLE_TOKEN from the
-/// environment).
+/// run_stage() with default StageExecutorOptions (no Speckle token provider:
+/// import_speckle is refused; IFC files only inside the project directory).
 StageResult run_stage(ProjectDB &db, const StageContext &ctx);
 
 /// Run `body` wrapped in the same `pipeline_log` open/close protocol

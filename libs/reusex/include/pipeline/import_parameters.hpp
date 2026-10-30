@@ -65,11 +65,12 @@ const std::vector<SpeckleParameter> &speckle_parameter_table();
 /// stage_parameters(JobStage::import_speckle).
 const std::vector<ParameterDescriptor> &speckle_stage_parameters();
 
-/// Read the import_speckle stage's JSON parameters ("" = defaults). Unknown
-/// keys are ignored.
-/// @throws std::invalid_argument for a non-object JSON, a `token` key, a
-///         value of the wrong type or outside its bounds, or a missing
-///         required key (project, model).
+/// Read the import_speckle stage's JSON parameters ("" = defaults).
+/// @throws std::invalid_argument for a non-object JSON, a `token` key or
+///         any key not in the table, a value of the wrong type or outside
+///         its bounds, a missing required key (project, model), a server URL
+///         that is neither https:// nor http:// to localhost, or a malformed
+///         Speckle id.
 SpeckleStageOptions
 speckle_options_from_parameters(std::string_view parameters);
 
@@ -81,9 +82,10 @@ std::string speckle_parameters_json(const SpeckleStageOptions &options);
 
 /// Everything the import_ifc stage is tuned by.
 struct IfcStageOptions {
-  /// The IFC file. Absolute, or relative to the directory holding the
-  /// project (`.rux`) — the case directory ruxd uploads into; a relative path
-  /// may not leave that directory (resolve_ifc_path()).
+  /// The IFC file: absolute, or relative to the directory holding the
+  /// project (`.rux`) — the case directory ruxd uploads into. It must lie in
+  /// that directory unless the executor allows otherwise
+  /// (StageExecutorOptions::allow_paths_outside_project, resolve_ifc_path()).
   std::string path;
   io::ifc::IfcImportOptions import;
 };
@@ -96,8 +98,7 @@ const std::vector<IfcParameter> &ifc_parameter_table();
 /// stage_parameters(JobStage::import_ifc).
 const std::vector<ParameterDescriptor> &ifc_stage_parameters();
 
-/// Read the import_ifc stage's JSON parameters ("" = defaults). Unknown keys
-/// are ignored.
+/// Read the import_ifc stage's JSON parameters ("" = defaults).
 /// @throws std::invalid_argument as speckle_options_from_parameters()
 ///         (required: path).
 IfcStageOptions ifc_options_from_parameters(std::string_view parameters);
@@ -105,12 +106,39 @@ IfcStageOptions ifc_options_from_parameters(std::string_view parameters);
 /// The JSON parameters for @p options (path only when set).
 std::string ifc_parameters_json(const IfcStageOptions &options);
 
+/// True for import_speckle / import_ifc.
+bool is_import_stage(JobStage stage);
+
+/// An import stage's parameters re-serialised from its table: validated
+/// (types, bounds, required keys), unknown keys and `token` refused, every
+/// table key written out. What JobQueue::submit() stores and run_stage()
+/// logs for an import stage, so nothing but the table's keys is ever
+/// persisted. Other stages: @p parameters unchanged.
+/// @throws std::invalid_argument as speckle_options_from_parameters() /
+///         ifc_options_from_parameters() (the message never echoes a string
+///         value).
+std::string normalize_import_parameters(JobStage stage,
+                                        std::string_view parameters);
+
+/// The library's default Speckle server policy
+/// (StageExecutorOptions::allowed_speckle_server unset): `https://` to a
+/// public host -- not localhost, not a literal loopback / private /
+/// link-local / CGNAT address, no userinfo; `http://` (and https) to
+/// localhost / 127.x / [::1] only when @p allow_insecure_localhost. Host
+/// names are not resolved (a front end that must also stop names resolving
+/// to private addresses sets its own hook).
+bool default_speckle_server_allowed(const std::string &url,
+                                    bool allow_insecure_localhost);
+
 /// The file @p path names for a project at @p project: an absolute path as
-/// is, a relative one against the project's directory.
-/// @throws std::invalid_argument for an empty path, a relative path that
-///         leaves the project's directory (`..`), or one that is not an
-///         existing regular file.
+/// is, a relative one against the project's directory; symlinks resolved.
+/// Unless @p allow_outside_project, the file must lie inside the project's
+/// directory (StageExecutorOptions::allow_paths_outside_project).
+/// @throws std::invalid_argument for an empty path, or one that is not an
+///         existing regular file (inside the project's directory, unless
+///         allowed). "Outside" and "missing" give the same message.
 std::filesystem::path resolve_ifc_path(const std::filesystem::path &project,
-                                       const std::string &path);
+                                       const std::string &path,
+                                       bool allow_outside_project = false);
 
 } // namespace reusex::pipeline

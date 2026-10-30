@@ -148,9 +148,12 @@ constexpr std::array<StageName, 16> kStages{{
     // no in-project prerequisite, so a fresh project is fine. The log names
     // are the ones io::speckle::import_revit_into / io::ifc::import_ifc_file
     // write when called directly, so a CLI and a job import share one name.
-    // Not cancellable: one download (or one file parse) and one transaction.
+    // import_speckle is cancellable: the cancel token aborts the Speckle
+    // requests (curl progress callback) and is checked again after the
+    // download, before anything is stored. import_ifc is one file parse and
+    // one transaction.
     {JobStage::import_speckle, "import_speckle", "import_speckle",
-     core::PipelineStage::import, false},
+     core::PipelineStage::import, true},
     {JobStage::import_ifc, "import_ifc", "import_ifc",
      core::PipelineStage::import, false},
 }};
@@ -1781,17 +1784,6 @@ std::string import_summary(const io::SolidModelStoreResult &stored,
   return text;
 }
 
-/// The Speckle token for this run: the executor's provider, else
-/// SPECKLE_TOKEN. Empty = none.
-std::string speckle_token_for(const StageContext &ctx,
-                              const StageExecutorOptions &options,
-                              const std::string &server_url) {
-  if (options.speckle_token)
-    return options.speckle_token(ctx, server_url).value_or(std::string{});
-  const char *env = std::getenv("SPECKLE_TOKEN");
-  return env ? std::string(env) : std::string{};
-}
-
 StageResult run_import_speckle(ProjectDB &db, const StageContext &ctx,
                                const StageExecutorOptions &options,
                                int log_id) {
@@ -1802,19 +1794,47 @@ StageResult run_import_speckle(ProjectDB &db, const StageContext &ctx,
     return StageResult::invalid(e.what());
   }
   auto &imp = o.import;
-  imp.token = speckle_token_for(ctx, options, imp.server_url);
+  // The server policy comes first: a token is never even looked up for a
+  // server the front end does not allow.
+  const bool allowed =
+      options.allowed_speckle_server
+          ? options.allowed_speckle_server(imp.server_url)
+          : default_speckle_server_allowed(imp.server_url,
+                                           options.allow_insecure_localhost);
+  if (!allowed)
+    return StageResult::invalid(
+        fmt::format("Speckle server '{}' is not allowed by this front end",
+                    imp.server_url));
+  if (!options.speckle_token)
+    return StageResult::invalid(
+        "no Speckle token configured (this front end supplies no Speckle "
+        "token provider)");
+  imp.token =
+      options.speckle_token(ctx, imp.server_url).value_or(std::string{});
   if (imp.token.empty())
-    return StageResult::invalid(fmt::format(
-        "no Speckle token configured for {} ({})", imp.server_url,
-        options.speckle_token ? "the front end has none for this user"
-                              : "set SPECKLE_TOKEN"));
+    return StageResult::invalid(
+        fmt::format("no Speckle token configured for {}", imp.server_url));
+  imp.cancel_token = ctx.cancel_token;
+  imp.timeout_s = options.speckle_timeout_s;
+
+  const auto skipped = [](const io::speckle::RevitImportStats &s) {
+    info("import_speckle: {} levels ({} reference levels, no storey); "
+         "openings sized from Revit parameters: {}, from geometry: {}",
+         s.levels, s.reference_levels, s.openings_extent_params,
+         s.openings_extent_geometry);
+    return fmt::format("skipped {} thin walls, {} non-straight walls, {} "
+                       "unhosted doors/windows, {} unplaced rooms",
+                       s.walls_thin, s.walls_not_straight, s.openings_unhosted,
+                       s.rooms_unplaced);
+  };
 
   if (!options.speckle_download) {
     const auto r = io::speckle::import_speckle_revit(db, imp, log_id);
     return StageResult::success(
-        fmt::format("Speckle version {} ({} elements): {}", r.version.id,
+        fmt::format("Speckle version {} ({} elements): {}; {}", r.version.id,
                     r.stats.elements,
-                    import_summary(r.stored, r.meshes_saved, r.meshes_removed)),
+                    import_summary(r.stored, r.meshes_saved, r.meshes_removed),
+                    skipped(r.stats)),
         import_outputs(r.stored, r.mesh_names));
   }
 
@@ -1830,6 +1850,9 @@ StageResult run_import_speckle(ProjectDB &db, const StageContext &ctx,
   auto fetch = [&]() {
     json root = json::parse(options.speckle_download(request), nullptr,
                             /*allow_exceptions=*/false);
+    // As the real download: a cancel during it stores nothing.
+    if (ctx.is_cancelled())
+      throw std::runtime_error("import_speckle: cancelled after the download");
     if (root.is_discarded())
       throw std::runtime_error("the Speckle download is not JSON");
     return root;
@@ -1837,13 +1860,15 @@ StageResult run_import_speckle(ProjectDB &db, const StageContext &ctx,
   const auto r =
       io::speckle::import_revit_into(db, fetch, imp.mapping, source, log_id);
   return StageResult::success(
-      fmt::format("Speckle model {} ({} elements): {}", imp.model,
+      fmt::format("Speckle model {} ({} elements): {}; {}", imp.model,
                   r.stats.elements,
-                  import_summary(r.stored, r.meshes_saved, r.meshes_removed)),
+                  import_summary(r.stored, r.meshes_saved, r.meshes_removed),
+                  skipped(r.stats)),
       import_outputs(r.stored, r.mesh_names));
 }
 
-StageResult run_import_ifc(ProjectDB &db, const StageContext &ctx, int log_id) {
+StageResult run_import_ifc(ProjectDB &db, const StageContext &ctx,
+                           const StageExecutorOptions &options, int log_id) {
   if (!io::ifc::has_ifc_support())
     return StageResult::invalid(
         "import_ifc: this build has no IFC support (web-ifc not found at "
@@ -1852,15 +1877,25 @@ StageResult run_import_ifc(ProjectDB &db, const StageContext &ctx, int log_id) {
   std::filesystem::path file;
   try {
     o = ifc_options_from_parameters(ctx.parameters);
-    file = resolve_ifc_path(ctx.project, o.path);
+    file = resolve_ifc_path(ctx.project, o.path,
+                            options.allow_paths_outside_project);
   } catch (const std::invalid_argument &e) {
     return StageResult::invalid(e.what());
   }
   const auto r = io::ifc::import_ifc_file(db, file, o.import, log_id);
+  const auto &s = r.stats;
+  info("import_ifc: spaces from a FootPrint: {}; openings sized from the "
+       "void / Overall* attributes: {}, from geometry: {}",
+       s.spaces_from_footprint, s.openings_extent_params,
+       s.openings_extent_geometry);
   return StageResult::success(
-      fmt::format("{} ({}, {} products): {}", file.filename().string(),
-                  r.stats.schema, r.stats.products,
-                  import_summary(r.stored, r.meshes_saved, r.meshes_removed)),
+      fmt::format("{} ({}, {} products): {}; skipped {} thin walls, {} "
+                  "non-straight walls, {} unhosted doors/windows, {} spaces "
+                  "without geometry",
+                  file.filename().string(), s.schema, s.products,
+                  import_summary(r.stored, r.meshes_saved, r.meshes_removed),
+                  s.walls_thin, s.walls_not_straight, s.openings_unhosted,
+                  s.spaces_no_geometry + s.spaces_bad_outline),
       import_outputs(r.stored, r.mesh_names));
 }
 
@@ -1914,7 +1949,7 @@ StageResult dispatch(ProjectDB &db, const StageContext &ctx, const json &params,
   case JobStage::import_speckle:
     return run_import_speckle(db, ctx, options, log_id);
   case JobStage::import_ifc:
-    return run_import_ifc(db, ctx, log_id);
+    return run_import_ifc(db, ctx, options, log_id);
   }
   return StageResult::failure("unknown stage");
 }
@@ -2289,9 +2324,22 @@ StageResult run_stage(ProjectDB &db, const StageContext &ctx) {
   return run_stage(db, ctx, StageExecutorOptions{});
 }
 
-StageResult run_stage(ProjectDB &db, const StageContext &ctx,
+StageResult run_stage(ProjectDB &db, const StageContext &ctx_in,
                       const StageExecutorOptions &options) {
-  const auto &desc = descriptor(ctx.stage);
+  const auto &desc = descriptor(ctx_in.stage);
+  // An import stage logs its table's keys only, re-serialised: nothing the
+  // caller added (a misspelt or smuggled secret) reaches pipeline_log. A
+  // blob that does not read is refused before the row is opened, and the
+  // message never echoes a string value.
+  StageContext ctx = ctx_in;
+  if (is_import_stage(ctx.stage)) {
+    try {
+      ctx.parameters = normalize_import_parameters(ctx.stage, ctx.parameters);
+    } catch (const std::exception &e) {
+      error("stage '{}' refused: {}", desc.name, e.what());
+      return StageResult::invalid(e.what());
+    }
+  }
   return run_logged_stage(
       db, ctx, desc.name, desc.log_name, [&](int log_id) -> StageResult {
         // body() only runs once run_logged_stage has already parsed
@@ -2318,6 +2366,23 @@ StageResult run_stage(const StageContext &ctx,
     return StageResult::failure(fmt::format("could not open project '{}': {}",
                                             ctx.project.string(), e.what()));
   }
+}
+
+std::optional<std::string>
+StageExecutorOptions::env_speckle_token(const StageContext & /*ctx*/,
+                                        const std::string & /*server_url*/) {
+  const char *env = std::getenv("SPECKLE_TOKEN");
+  if (!env || !*env)
+    return std::nullopt;
+  return std::string(env);
+}
+
+StageExecutorOptions StageExecutorOptions::local_user() {
+  StageExecutorOptions o;
+  o.speckle_token = &StageExecutorOptions::env_speckle_token;
+  o.allow_insecure_localhost = true;
+  o.allow_paths_outside_project = true;
+  return o;
 }
 
 StageExecutor default_stage_executor(StageExecutorOptions options) {

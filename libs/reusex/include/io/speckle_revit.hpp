@@ -12,6 +12,7 @@
 #include <nlohmann/json.hpp>
 
 #include <array>
+#include <atomic>
 #include <cstddef>
 #include <cstdint>
 #include <functional>
@@ -186,6 +187,13 @@ struct SpeckleRevitImportOptions {
   std::string version;        ///< empty = the latest version (any age)
   std::string token;          ///< empty = SPECKLE_TOKEN
   RevitImportOptions mapping; ///< guid_namespace is set from the project
+  /// Abort the server reads once set (SpeckleReader::set_cancel_token);
+  /// checked again after the download, before anything is stored. The
+  /// import then throws and stores nothing. nullptr = never.
+  const std::atomic_bool *cancel_token = nullptr;
+  /// Overall limit per request, the object download included [s]; 0 = none
+  /// (SpeckleReader::set_timeout_seconds).
+  long timeout_s = 0;
 };
 
 struct SpeckleRevitImportResult {

@@ -65,6 +65,14 @@ EXAMPLES:
     spdlog::trace("calling run_subcommand_import_ifc");
     if (rux::capture_stage_params("import_ifc", ifc_stage_parameters(*opt)))
       return;
+    // Usage errors before any project is opened (or created) and before a
+    // pipeline_log row exists: the exit codes CLI11's ->required() and
+    // CLI::ExistingFile gave.
+    if (opt->stage.path.empty())
+      throw CLI::RequiredError("file");
+    if (!std::filesystem::is_regular_file(opt->stage.path))
+      throw CLI::ValidationError("file",
+                                 "File does not exist: " + opt->stage.path);
     rux::finish(run_subcommand_import_ifc(*opt, *global_opt));
   });
 }
@@ -81,13 +89,27 @@ std::string ifc_stage_parameters(SubcommandImportIfcOptions const &opt) {
 
 int run_subcommand_import_ifc(SubcommandImportIfcOptions const &opt,
                               const RuxOptions &global_opt) {
+  if (!reusex::io::ifc::has_ifc_support()) {
+    spdlog::error("import ifc: this rux was built without IFC support "
+                  "(web-ifc not found at configure time)");
+    return RuxError::GENERIC;
+  }
+  try {
+    (void)reusex::pipeline::ifc_options_from_parameters(
+        ifc_stage_parameters(opt));
+  } catch (const std::invalid_argument &e) {
+    spdlog::error("import ifc: {}", e.what());
+    return RuxError::INVALID_ARGUMENT;
+  }
   try {
     reusex::ProjectDB db(global_opt.project_db);
     reusex::pipeline::StageContext ctx;
     ctx.project = global_opt.project_db;
     ctx.stage = reusex::pipeline::JobStage::import_ifc;
     ctx.parameters = ifc_stage_parameters(opt);
-    const auto result = reusex::pipeline::run_stage(db, ctx);
+    // A local user: the file may lie anywhere.
+    const auto result = reusex::pipeline::run_stage(
+        db, ctx, reusex::pipeline::StageExecutorOptions::local_user());
     if (result.ok)
       spdlog::info("Imported {}", result.message);
     return rux::exit_code_for(result);
