@@ -3,12 +3,16 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
 #include "import/ifc.hpp"
+#include "create/stage_bridge.hpp"
 #include "exit_status.hpp"
+#include "import/stage_flags.hpp"
 
 #include <reusex/core/ProjectDB.hpp>
+#include <reusex/pipeline/stages.hpp>
 #include <spdlog/spdlog.h>
 
 #include <exception>
+#include <filesystem>
 
 void setup_subcommand_import_ifc(CLI::App &app,
                                  std::shared_ptr<RuxOptions> global_opt) {
@@ -41,6 +45,9 @@ NOTES:
   - Door / window extents come from the IfcOpeningElement they fill (else
     OverallWidth / OverallHeight, else the geometry).
   - --no-meshes writes no mesh and deletes none.
+  - The same import runs as the `import_ifc` job stage (ruxd), with the
+    same parameters; there a relative path is read against the project's
+    directory.
 
 EXAMPLES:
   rux -p house.rux import ifc house.ifc
@@ -48,64 +55,44 @@ EXAMPLES:
   rux -p house.rux import ifc house.ifc --no-meshes
 )");
 
-  const reusex::io::ifc::IfcImportOptions defaults;
-  sub->add_option("file", opt->file, "IFC file (.ifc)")
-      ->required()
-      ->check(CLI::ExistingFile);
-  sub->add_flag("--no-meshes", opt->no_meshes,
-                "Store only the solid-model records; existing imported "
-                "meshes are left as they are");
-  sub->add_option("--storey-height", opt->import.default_storey_height_m,
-                  "Height of the top storey [m]")
-      ->default_val(defaults.default_storey_height_m);
-  sub->add_option("--min-wall-thickness", opt->import.min_wall_thickness_m,
-                  "Thinner walls (finish layers) get no wall record [m]")
-      ->default_val(defaults.min_wall_thickness_m);
-  sub->add_option("--recenter-threshold", opt->import.recenter_threshold_m,
-                  "Recentre a model farther than this from the origin [m]")
-      ->default_val(defaults.recenter_threshold_m);
+  // `path` is also the positional FILE, as before.
+  sub->get_formatter()->column_width(40);
+  rux::add_import_stage_flags(*sub, opt->stage,
+                              reusex::pipeline::ifc_parameter_table(), "path",
+                              "file");
 
   sub->callback([opt, global_opt]() {
     spdlog::trace("calling run_subcommand_import_ifc");
+    if (rux::capture_stage_params("import_ifc", ifc_stage_parameters(*opt)))
+      return;
     rux::finish(run_subcommand_import_ifc(*opt, *global_opt));
   });
 }
 
+std::string ifc_stage_parameters(SubcommandImportIfcOptions const &opt) {
+  auto stage = opt.stage;
+  // On the command line a relative FILE means the working directory; the
+  // stage reads a relative path against the project's directory.
+  if (!stage.path.empty())
+    stage.path =
+        std::filesystem::absolute(stage.path).lexically_normal().string();
+  return reusex::pipeline::ifc_parameters_json(stage);
+}
+
 int run_subcommand_import_ifc(SubcommandImportIfcOptions const &opt,
                               const RuxOptions &global_opt) {
-  if (!reusex::io::ifc::has_ifc_support()) {
-    spdlog::error("import ifc: this rux was built without IFC support "
-                  "(web-ifc not found at configure time)");
-    return RuxError::GENERIC;
-  }
-  auto import = opt.import;
-  import.meshes = !opt.no_meshes;
   try {
     reusex::ProjectDB db(global_opt.project_db);
-    const auto r = reusex::io::ifc::import_ifc_file(db, opt.file, import);
-    const auto &s = r.stats;
-    spdlog::info("Imported {} ({} products): {} storeys, {} walls, "
-                 "{} openings, {} spaces, {} meshes",
-                 opt.file.filename().string(), s.products, r.stored.storeys,
-                 r.stored.walls, r.stored.openings, r.stored.spaces,
-                 r.meshes_saved);
-    spdlog::info("Skipped: {} thin walls, {} non-straight walls, {} unhosted "
-                 "doors/windows, {} spaces without geometry; replaced {} "
-                 "earlier imported rows",
-                 s.walls_thin, s.walls_not_straight, s.openings_unhosted,
-                 s.spaces_no_geometry + s.spaces_bad_outline,
-                 r.stored.replaced_imported);
-    spdlog::info("Spaces from a FootPrint: {}; openings sized from the void "
-                 "/ Overall* attributes: {}, from geometry: {}",
-                 s.spaces_from_footprint, s.openings_extent_params,
-                 s.openings_extent_geometry);
-    if (r.stored.skipped_locked > 0)
-      spdlog::warn("{} records were not written: a locked detected / manual "
-                   "row holds their guid or storey idx",
-                   r.stored.skipped_locked);
+    reusex::pipeline::StageContext ctx;
+    ctx.project = global_opt.project_db;
+    ctx.stage = reusex::pipeline::JobStage::import_ifc;
+    ctx.parameters = ifc_stage_parameters(opt);
+    const auto result = reusex::pipeline::run_stage(db, ctx);
+    if (result.ok)
+      spdlog::info("Imported {}", result.message);
+    return rux::exit_code_for(result);
   } catch (const std::exception &e) {
     spdlog::error("import ifc: {}", e.what());
     return RuxError::GENERIC;
   }
-  return RuxError::SUCCESS;
 }

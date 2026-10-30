@@ -1172,9 +1172,13 @@ IfcImport import_ifc(const std::filesystem::path &file,
 
 IfcFileImportResult import_ifc_file(ProjectDB &db,
                                     const std::filesystem::path &file,
-                                    const IfcImportOptions &opt) {
+                                    const IfcImportOptions &opt,
+                                    int caller_log_id) {
   const json source = {{"source", "ifc"}, {"file", file.filename().string()}};
-  const int log_id = db.log_pipeline_start("import_ifc", source.dump());
+  // A caller-owned row (the job stage) is neither opened nor closed here.
+  const bool own_row = caller_log_id < 0;
+  const int log_id =
+      own_row ? db.log_pipeline_start("import_ifc", source.dump()) : -1;
   IfcFileImportResult res;
   try {
     IfcImportOptions mapping = opt;
@@ -1194,15 +1198,18 @@ IfcFileImportResult import_ifc_file(ProjectDB &db,
           bim::write_meshes(db, imported.meshes, "import_ifc", params);
       res.meshes_saved = w.saved;
       res.meshes_removed = w.removed;
+      res.mesh_names = w.saved_names;
     }
     tx.commit();
     if (res.meshes_removed > 0)
       core::info("import_ifc: removed {} meshes of an earlier import that "
                  "this file no longer has",
                  res.meshes_removed);
-    db.log_pipeline_end(log_id, true);
+    if (own_row)
+      db.log_pipeline_end(log_id, true);
   } catch (const std::exception &e) {
-    db.log_pipeline_end(log_id, false, e.what());
+    if (own_row)
+      db.log_pipeline_end(log_id, false, e.what());
     throw;
   }
   return res;

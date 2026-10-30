@@ -450,7 +450,11 @@ scene builder, `visualize::populate_scene()` (`visualize/scene.hpp`); its
 Pipeline workspace runs stages in-process through `pipeline::JobRunner` with
 `pipeline::stage_executor_with_optimize()` (which runs `optimize` and
 `graph_discover`; handed over in `GuiLaunch`; `ruxd`
-injects the same executor for the web GUI, from its own repo), and "Kopiér som
+injects the same executor for the web GUI, from its own repo, passing
+`StageExecutorOptions` whose `speckle_token(ctx, server)` supplies the
+submitting user's token to `import_speckle` — a credential is never a job
+parameter, and a `token` key is refused for every stage; the Qt Pipeline
+list hides `annotate`, `import_speckle` and `import_ifc`), and "Kopiér som
 rux-kommando" (`rux_qt/cli_command.hpp`) is round-trip tested against the real
 CLI (`tests/unit/rux_app/test_cli_command_roundtrip.cpp`, via
 `rux::set_stage_params_sink`). `RUX_QT_PAGE=oversigt|3d|rediger|pipeline|log`
@@ -804,14 +808,18 @@ External-format adapters only — project state itself lives in `core/ProjectDB`
   version lookup, the whole object tree in one GET (`ObjectTree`), and
   `ObjectTree::resolve` (references, `@`-detached keys, DataChunk joins)
 - `speckle_revit.hpp`: Revit model (Speckle v3 Revit connector) -> solid
-  model + per-category meshes (`import_revit`, pure), and `rux import
-  speckle`'s entry point `import_speckle_revit` (fetch, map, store as
-  imported). Revit internal frame in metres, one shared level frame;
+  model + per-category meshes (`import_revit`, pure), and the entry point
+  `import_speckle_revit` (fetch, map, store as imported) of the job stage
+  `JobStage::import_speckle` (`rux import speckle`, ruxd jobs; the Speckle
+  token comes from `StageExecutorOptions::speckle_token`, default
+  `SPECKLE_TOKEN`, never from parameters). Revit internal frame in metres, one shared level frame;
   mapping rules in `docs/CONTRACTS.md` ("Import write: Revit model via
   Speckle")
 - `ifc.hpp`: IFC file -> solid model + per-class meshes through web-ifc
-  (`import_ifc`, pure apart from reading the file) and `rux import ifc`'s
-  entry point `import_ifc_file`. Same rules as the Revit import; the
+  (`import_ifc`, pure apart from reading the file) and the entry point
+  `import_ifc_file` of the job stage `JobStage::import_ifc` (`rux import
+  ifc`, ruxd jobs). Both stages' parameters (keys, CLI flags, bounds) come
+  from one table each, `pipeline/import_parameters.hpp`. Same rules as the Revit import; the
   geometric readings both share (wall axis from the footprint rectangle,
   room outline from bottom faces, opening hosting, GUID scheme, recentring,
   mesh merge / write) live in the private `src/io/bim_mapping.{hpp,cpp}`.

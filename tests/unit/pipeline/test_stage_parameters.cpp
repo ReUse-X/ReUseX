@@ -366,13 +366,22 @@ TEST_CASE("StageParameters_FloatDefault_RoundTripsShortestDecimal",
   CHECK(number_default(JobStage::planes, "plane_dist_threshold") == 0.07);
 }
 
-TEST_CASE("StageParameters_OnlyAnnotatePromptsAreRequired",
+TEST_CASE("StageParameters_OnlyAnnotatePromptsAndImportSourcesAreRequired",
           "[pipeline][params]") {
-  // `required` means "no job without it": so far only annotate's prompts.
+  // `required` means "no job without it": annotate's prompts, and what the
+  // BIM imports read from (a Speckle project + model, an IFC file).
+  const auto required = [](JobStage stage, const std::string &key) {
+    return (stage == JobStage::annotate && key == "prompts") ||
+           (stage == JobStage::import_speckle &&
+            (key == "project" || key == "model")) ||
+           (stage == JobStage::import_ifc && key == "path");
+  };
   for (const auto &name : job_stage_names()) {
     const auto stage = parse_job_stage(name);
     REQUIRE(stage);
-    for (const auto &d : stage_parameters(*stage))
-      CHECK(d.required == (*stage == JobStage::annotate && d.key == "prompts"));
+    for (const auto &d : stage_parameters(*stage)) {
+      INFO(name << "." << d.key);
+      CHECK(d.required == required(*stage, d.key));
+    }
   }
 }

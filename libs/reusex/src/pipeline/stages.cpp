@@ -4,6 +4,7 @@
 
 #include "reusex/pipeline/stages.hpp"
 #include "reusex/core/label_encoding.hpp"
+#include "reusex/pipeline/import_parameters.hpp"
 #include "reusex/pipeline/mesh_parameters.hpp"
 #include "reusex/pipeline/opening_parameters.hpp"
 #include "reusex/pipeline/solid_parameters.hpp"
@@ -27,8 +28,10 @@
 #include "reusex/core/wall_identity.hpp"
 #include "reusex/geometry/level_frame.hpp"
 #include "reusex/geometry/transform_utils.hpp"
+#include "reusex/io/ifc.hpp"
 #include "reusex/io/reusex.hpp"
 #include "reusex/io/solid_model_json.hpp"
+#include "reusex/io/speckle_revit.hpp"
 #include "reusex/reconstruction/mesh.hpp"
 #include "reusex/reconstruction/openings.hpp"
 #include "reusex/reconstruction/solids.hpp"
@@ -58,6 +61,7 @@
 #include <array>
 #include <cctype>
 #include <cmath>
+#include <cstdlib>
 #include <exception>
 #include <map>
 #include <set>
@@ -83,7 +87,7 @@ struct StageName {
 // used in `ruxd`'s HTTP contract (docs/gui/openapi.yaml, in its own repo) and
 // `contract` selects the input check run before the stage executes
 // (docs/CONTRACTS.md).
-constexpr std::array<StageName, 14> kStages{{
+constexpr std::array<StageName, 16> kStages{{
     {JobStage::clouds, "clouds", "cloud_reconstruction",
      core::PipelineStage::clouds, false},
     {JobStage::planes, "planes", "segment_planes", core::PipelineStage::planes,
@@ -140,6 +144,15 @@ constexpr std::array<StageName, 14> kStages{{
     // Not cancellable: one box and a corefinement per opening per wall, a
     // polygon union per storey; about a second on NewOffice.
     {JobStage::solids, "solids", "solids", core::PipelineStage::solids, false},
+    // BIM imports (reusex-3iy8.13). Contract `import`: an external source,
+    // no in-project prerequisite, so a fresh project is fine. The log names
+    // are the ones io::speckle::import_revit_into / io::ifc::import_ifc_file
+    // write when called directly, so a CLI and a job import share one name.
+    // Not cancellable: one download (or one file parse) and one transaction.
+    {JobStage::import_speckle, "import_speckle", "import_speckle",
+     core::PipelineStage::import, false},
+    {JobStage::import_ifc, "import_ifc", "import_ifc",
+     core::PipelineStage::import, false},
 }};
 
 const StageName &descriptor(JobStage stage) {
@@ -1729,8 +1742,130 @@ StageResult run_solids(ProjectDB &db, const json &params) {
       std::move(outputs));
 }
 
+// --- BIM imports (reusex-3iy8.13) -------------------------------------------
+// One body each for `rux import speckle|ifc` and the GUI/daemon jobs: the io
+// entry points run under the pipeline_log row run_logged_stage() opened
+// (their `log_id` argument), so a run leaves exactly one row, with the job's
+// parameters and job_id — never a credential (StageExecutorOptions).
+
+/// The four solid-model tables and each saved mesh, as a client refreshes
+/// them.
+std::vector<StageArtifact>
+import_outputs(const io::SolidModelStoreResult &stored,
+               const std::vector<std::string> &meshes) {
+  std::vector<StageArtifact> out = {
+      {"table", "storeys", static_cast<int64_t>(stored.storeys)},
+      {"table", "walls", static_cast<int64_t>(stored.walls)},
+      {"table", "openings", static_cast<int64_t>(stored.openings)},
+      {"table", "spaces", static_cast<int64_t>(stored.spaces)}};
+  for (const auto &m : meshes)
+    out.push_back({"mesh", m, -1});
+  return out;
+}
+
+std::string import_summary(const io::SolidModelStoreResult &stored,
+                           std::size_t meshes_saved,
+                           std::size_t meshes_removed) {
+  std::string text = fmt::format(
+      "{} storeys, {} walls, {} openings, {} spaces, {} meshes ({} stale "
+      "removed); replaced {} earlier imported rows",
+      stored.storeys, stored.walls, stored.openings, stored.spaces,
+      meshes_saved, meshes_removed, stored.replaced_imported);
+  if (stored.skipped_locked > 0) {
+    warn("{} imported records were not written: a locked detected / manual "
+         "row holds their guid or storey idx",
+         stored.skipped_locked);
+    text += fmt::format("; {} records held back by locked rows",
+                        stored.skipped_locked);
+  }
+  return text;
+}
+
+/// The Speckle token for this run: the executor's provider, else
+/// SPECKLE_TOKEN. Empty = none.
+std::string speckle_token_for(const StageContext &ctx,
+                              const StageExecutorOptions &options,
+                              const std::string &server_url) {
+  if (options.speckle_token)
+    return options.speckle_token(ctx, server_url).value_or(std::string{});
+  const char *env = std::getenv("SPECKLE_TOKEN");
+  return env ? std::string(env) : std::string{};
+}
+
+StageResult run_import_speckle(ProjectDB &db, const StageContext &ctx,
+                               const StageExecutorOptions &options,
+                               int log_id) {
+  SpeckleStageOptions o;
+  try {
+    o = speckle_options_from_parameters(ctx.parameters);
+  } catch (const std::invalid_argument &e) {
+    return StageResult::invalid(e.what());
+  }
+  auto &imp = o.import;
+  imp.token = speckle_token_for(ctx, options, imp.server_url);
+  if (imp.token.empty())
+    return StageResult::invalid(fmt::format(
+        "no Speckle token configured for {} ({})", imp.server_url,
+        options.speckle_token ? "the front end has none for this user"
+                              : "set SPECKLE_TOKEN"));
+
+  if (!options.speckle_download) {
+    const auto r = io::speckle::import_speckle_revit(db, imp, log_id);
+    return StageResult::success(
+        fmt::format("Speckle version {} ({} elements): {}", r.version.id,
+                    r.stats.elements,
+                    import_summary(r.stored, r.meshes_saved, r.meshes_removed)),
+        import_outputs(r.stored, r.mesh_names));
+  }
+
+  // The front end's own download (tests, a cache). The source stamped on the
+  // meshes is what was asked for; the token is not in it.
+  StageExecutorOptions::SpeckleDownloadRequest request{
+      imp.server_url, imp.project, imp.model, imp.version, imp.token};
+  const json source = {{"source", "speckle"},
+                       {"server", imp.server_url},
+                       {"project", imp.project},
+                       {"model", imp.model},
+                       {"version", imp.version}};
+  auto fetch = [&]() {
+    json root = json::parse(options.speckle_download(request), nullptr,
+                            /*allow_exceptions=*/false);
+    if (root.is_discarded())
+      throw std::runtime_error("the Speckle download is not JSON");
+    return root;
+  };
+  const auto r =
+      io::speckle::import_revit_into(db, fetch, imp.mapping, source, log_id);
+  return StageResult::success(
+      fmt::format("Speckle model {} ({} elements): {}", imp.model,
+                  r.stats.elements,
+                  import_summary(r.stored, r.meshes_saved, r.meshes_removed)),
+      import_outputs(r.stored, r.mesh_names));
+}
+
+StageResult run_import_ifc(ProjectDB &db, const StageContext &ctx, int log_id) {
+  if (!io::ifc::has_ifc_support())
+    return StageResult::invalid(
+        "import_ifc: this build has no IFC support (web-ifc not found at "
+        "configure time)");
+  IfcStageOptions o;
+  std::filesystem::path file;
+  try {
+    o = ifc_options_from_parameters(ctx.parameters);
+    file = resolve_ifc_path(ctx.project, o.path);
+  } catch (const std::invalid_argument &e) {
+    return StageResult::invalid(e.what());
+  }
+  const auto r = io::ifc::import_ifc_file(db, file, o.import, log_id);
+  return StageResult::success(
+      fmt::format("{} ({}, {} products): {}", file.filename().string(),
+                  r.stats.schema, r.stats.products,
+                  import_summary(r.stored, r.meshes_saved, r.meshes_removed)),
+      import_outputs(r.stored, r.mesh_names));
+}
+
 StageResult dispatch(ProjectDB &db, const StageContext &ctx, const json &params,
-                     int log_id) {
+                     const StageExecutorOptions &options, int log_id) {
   switch (ctx.stage) {
   case JobStage::clouds:
     return run_clouds(db, ctx, params);
@@ -1776,6 +1911,10 @@ StageResult dispatch(ProjectDB &db, const StageContext &ctx, const json &params,
     return run_spaces(db, ctx, params, log_id);
   case JobStage::solids:
     return run_solids(db, params);
+  case JobStage::import_speckle:
+    return run_import_speckle(db, ctx, options, log_id);
+  case JobStage::import_ifc:
+    return run_import_ifc(db, ctx, log_id);
   }
   return StageResult::failure("unknown stage");
 }
@@ -2070,6 +2209,17 @@ StageResult run_logged_stage(ProjectDB &db, const StageContext &ctx,
         fmt::format("invalid parameters: {}", e.what()));
   }
 
+  // A credential never reaches pipeline_log (StageExecutorOptions): refused
+  // before the row below is opened, without echoing the value.
+  if (params.contains(std::string(kSecretParameterKey))) {
+    const std::string why = fmt::format(
+        "parameters must not carry a credential: '{}' is refused (the "
+        "Speckle token comes from the executor's token provider)",
+        kSecretParameterKey);
+    error("stage '{}' refused: {}", name, why);
+    return StageResult::invalid(why);
+  }
+
   try {
     // Open the log row BEFORE running `body`, so a run that is refused (for
     // an unsatisfied contract, bad parameters the stage itself rejects, or
@@ -2136,6 +2286,11 @@ StageResult run_logged_stage(ProjectDB &db, const StageContext &ctx,
 }
 
 StageResult run_stage(ProjectDB &db, const StageContext &ctx) {
+  return run_stage(db, ctx, StageExecutorOptions{});
+}
+
+StageResult run_stage(ProjectDB &db, const StageContext &ctx,
+                      const StageExecutorOptions &options) {
   const auto &desc = descriptor(ctx.stage);
   return run_logged_stage(
       db, ctx, desc.name, desc.log_name, [&](int log_id) -> StageResult {
@@ -2149,14 +2304,15 @@ StageResult run_stage(ProjectDB &db, const StageContext &ctx) {
         if (auto problem = check_inputs(db, desc.contract,
                                         contract_overrides(ctx.stage, params)))
           return StageResult::invalid(*problem);
-        return dispatch(db, ctx, params, log_id);
+        return dispatch(db, ctx, params, options, log_id);
       });
 }
 
-StageResult run_stage(const StageContext &ctx) {
+StageResult run_stage(const StageContext &ctx,
+                      const StageExecutorOptions &options) {
   try {
     ProjectDB db(ctx.project, /*readOnly=*/false);
-    return run_stage(db, ctx);
+    return run_stage(db, ctx, options);
   } catch (const std::exception &e) {
     error("could not open project '{}': {}", ctx.project.string(), e.what());
     return StageResult::failure(fmt::format("could not open project '{}': {}",
@@ -2164,8 +2320,10 @@ StageResult run_stage(const StageContext &ctx) {
   }
 }
 
-StageExecutor default_stage_executor() {
-  return [](const StageContext &ctx) { return run_stage(ctx); };
+StageExecutor default_stage_executor(StageExecutorOptions options) {
+  return [options = std::move(options)](const StageContext &ctx) {
+    return run_stage(ctx, options);
+  };
 }
 
 } // namespace reusex::pipeline

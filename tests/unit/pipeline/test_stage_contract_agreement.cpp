@@ -85,6 +85,9 @@ core::PipelineStage contract_of(pipeline::JobStage stage) {
     return core::PipelineStage::spaces;
   case pipeline::JobStage::solids:
     return core::PipelineStage::solids;
+  case pipeline::JobStage::import_speckle:
+  case pipeline::JobStage::import_ifc:
+    return core::PipelineStage::import;
   }
   FAIL("JobStage has no contract mapping");
   return core::PipelineStage::clouds;
