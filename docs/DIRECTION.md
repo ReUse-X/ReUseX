@@ -114,7 +114,7 @@ a `workstream: *` label so alignment can be queried with
 | Gaussian splatting | `workstream: gsplat` | #240 | Native C++/CUDA 3DGS trained from `ProjectDB` — point-cloud-seeded Gaussians, sensor frames and sliced 360 panoramas as views, Apache-licensed gsplat kernels under a GPL trainer |
 | 360 integration | `workstream: 360-integration` | #236 | Turn panoramas into wide-baseline pose-graph constraints; a panorama that sees many temporally-distant frames supplies exactly the loop closures the plane-landmark back-end cannot. Mechanism landed and tested (`rux graph discover --use-panoramas`); **blocked on matcher quality** — cross-camera ORB resections are too weak to help, see [`research/panorama-loop-closure.md`](research/panorama-loop-closure.md) |
 | Agent-driven modeling | `workstream: agent-modeling` | #267 | Evaluate an agent + MCP gateway + Blender path to a simplified, tagged building model as a complement to the geometric pipeline; requires headless rendering so the agent has eyes |
-| Solid model / scan-to-BIM | `workstream: solid-model` | beads `reusex-z1v` | Replace the one-envelope MIP mesh with a typed building model — storeys, walls with measured thickness, spaces with polygons, openings — stored in `ProjectDB` with evidence, deterministic GUIDs and re-run-safe manual edits; exported as IFC4, DXF, Rhino, Speckle; feeding the survey with measured quantities. Design: beads `reusex-z1v` (migrated into the graph 2026-10-14); research: [`research/solid-model-scan-to-bim.md`](research/solid-model-scan-to-bim.md). The MIP stays as an optional refinement |
+| Solid model / scan-to-BIM | `workstream: solid-model` | beads `reusex-z1v` | Replace the one-envelope MIP mesh with a typed building model — storeys, walls with measured thickness, spaces with polygons, openings — stored in `ProjectDB` with evidence, deterministic GUIDs and re-run-safe manual edits; exported as IFC4, DXF, Rhino, Speckle; feeding the survey with measured quantities. Design: beads `reusex-z1v` (migrated into the graph 2026-10-14); research: [`research/solid-model-scan-to-bim.md`](research/solid-model-scan-to-bim.md). Since 2026-10-30 the same tables can also be filled from an existing BIM model — Revit via Speckle (`rux import speckle`, read-only) and IFC via web-ifc (`rux import ifc`) — as `source = imported`, locked rows. The MIP stays as an optional refinement |
 | Infrastructure & test health | `workstream: infra` | #268 | Keep the build, test and coverage loop fast and trustworthy so agents can iterate — includes #262 (parallel-ctest flakiness) and hosted CI (#202) |
 
 Work that fits none of these rows is either a bugfix, a standing maintenance
@@ -201,6 +201,21 @@ changelog — that history is the point of keeping it in the repo.
 ---
 
 ## Direction changelog
+
+- **2026-10-30** — **Imported BIM models are a supported solid-model input**
+  (epic `reusex-3iy8`). `rux import speckle` reads a Revit model from Speckle
+  (read-only: GraphQL queries and object GETs only, token from
+  `SPECKLE_TOKEN`) and `rux import ifc` reads an IFC2X3/IFC4 file through the
+  web-ifc C++ core (MPL-2.0, `pkgs/web-ifc`). Both map onto the solid-model
+  tables — Levels / IfcBuildingStorey → storeys, walls, doors/windows →
+  openings on their host walls, rooms / IfcSpace → spaces — through
+  `io::store_solid_model` as `source = imported`, locked rows (a re-import
+  replaces only imported rows), plus one reference mesh per category
+  (`imported/revit/*`, `imported/ifc/*`). Scan-detected and imported models
+  can live in one project; aligning an imported model to a scan is not done
+  yet. This backs the web plan view (360 panoramas on an imported floor plan,
+  `ruxd-fk8` / `frontend-ayw`): `which_storey()` and a manual panorama pose
+  path (`pose_source = manual`, kept by `rux align 360`) landed alongside.
 
 - **2026-10-16** — **Solid model WP3 landed: walls with a measured
   thickness** (`reusex-z1v.5`). `rux create walls` stores a bounded wall
