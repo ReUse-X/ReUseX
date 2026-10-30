@@ -869,7 +869,8 @@ RevitStoreResult import_revit_into(ProjectDB &db,
     mark_imported(imported.model);
 
     ProjectDB::Transaction tx(db);
-    res.stored = store_solid_model(db, imported.model);
+    res.stored =
+        store_solid_model(db, imported.model, own_row ? log_id : caller_log_id);
 
     // --no-meshes writes no mesh and deletes none.
     if (mapping.meshes) {

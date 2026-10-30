@@ -46,8 +46,12 @@ DESCRIPTION:
   and openings (each kind the plan provides) and leaves detected and manual
   rows alone, except that an imported element takes over an unlocked row
   with its guid (a storey: its guid or idx) and gives way to a locked one;
-  both are logged. Plane classes and scene relations in a plan are not
-  stored. Use --dry-run to validate a plan and write it back normalised
+  both are logged. Each import is recorded in the pipeline log (stage
+  import_plan, see rux log) with what it wrote, or why the project refused
+  it; a plan that does not parse never reaches the project. Plane classes
+  and scene relations in a plan are not stored. Elements without a guid
+  get one from where they stand and how big they are (not from their
+  position in the plan), so reordering a plan keeps every guid. Use --dry-run to validate a plan and write it back normalised
   without touching the project; the authoring loop that uses it is
   docs/guides/solid-model-reference-authoring.md.
 
@@ -116,7 +120,9 @@ int run_subcommand_edit_plan(SubcommandEditPlanOptions const &opt,
       reusex::ProjectDB db(global_opt.project_db);
       io::SolidModelStoreResult stored;
       try {
-        stored = io::store_solid_model(db, model);
+        // One pipeline_log row, stage "import_plan": success with the
+        // counts, or failed with the reason the project refused the plan.
+        stored = io::import_plan(db, model, opt.import_path);
       } catch (const std::invalid_argument &e) {
         spdlog::error("edit plan: the project refused plan '{}': {}",
                       opt.import_path.string(), e.what());
@@ -131,10 +137,7 @@ int run_subcommand_edit_plan(SubcommandEditPlanOptions const &opt,
                      "no storey, wall, space or opening the project could "
                      "take ({} held back by locked rows)",
                      global_opt.project_db.string(), stored.skipped_locked);
-      spdlog::info("edit plan: imported {} storeys, {} walls, {} spaces, {} "
-                   "openings (replaced {} earlier imported row(s))",
-                   stored.storeys, stored.walls, stored.spaces, stored.openings,
-                   stored.replaced_imported);
+      spdlog::info("edit plan: {}", io::store_summary(stored));
     }
 
     if (!opt.export_path.empty()) {

@@ -10,6 +10,7 @@
 #include "yaml_json.hpp"
 
 #include <fmt/format.h>
+#include <fmt/ranges.h>
 #include <nlohmann/json.hpp>
 
 #include <CGAL/Boolean_set_operations_2.h>
@@ -17,6 +18,7 @@
 #include <CGAL/Gps_segment_traits_2.h>
 
 #include <algorithm>
+#include <array>
 #include <cctype>
 #include <charconv>
 #include <cmath>
@@ -29,6 +31,7 @@
 #include <sstream>
 #include <stdexcept>
 #include <string>
+#include <tuple>
 #include <unordered_set>
 
 namespace reusex::io {
@@ -859,14 +862,183 @@ void mark_imported(core::SolidModel &model) {
   mark(model.openings);
 }
 
-SolidModelStoreResult store_solid_model(ProjectDB &db,
-                                        const core::SolidModel &model) {
+namespace {
+
+// ── Natural keys for guid-less imported elements (reusex-3iy8.12) ────────
+//
+// A minted guid must not depend on where the element sits in the document
+// (STANDARDS §3, §6): it is uuid5(project guid, <natural key>), the key
+// built from what the element IS -- where it stands, how big it is -- on a
+// fixed grid so a re-export / re-import round trip (or a float printed with
+// fewer digits) lands on the same key.
+
+constexpr double kPlanGridM = 0.01;       ///< endpoints, centroid, s-range
+constexpr double kThicknessGridM = 0.001; ///< wall thickness
+constexpr double kAreaBucketM2 = 0.1;     ///< space area
+
+/// @p v on a grid of @p step, as an integer count of steps. Non-finite
+/// values (refused by the document reader anyway) map to 0; magnitudes
+/// beyond what a long long holds are clamped, never UB.
+long long snap(double v, double step) {
+  if (!std::isfinite(v))
+    return 0;
+  constexpr double kLimit = 9.0e15;
+  return std::llround(std::clamp(v / step, -kLimit, kLimit));
+}
+
+std::string wall_key(const core::WallRecord &w) {
+  std::array<long long, 2> a{snap(w.x0, kPlanGridM), snap(w.y0, kPlanGridM)};
+  std::array<long long, 2> b{snap(w.x1, kPlanGridM), snap(w.y1, kPlanGridM)};
+  if (b < a) // order-independent: a reversed axis is the same wall
+    std::swap(a, b);
+  return fmt::format("imported/wall/{}/{},{};{},{}/t{}", w.storey, a[0], a[1],
+                     b[0], b[1], snap(w.thickness, kThicknessGridM));
+}
+
+/// Shoelace area (signed) and area-weighted centroid of an open ring.
+struct RingMoments {
+  double area = 0.0, cx = 0.0, cy = 0.0; ///< cx, cy: sum of x*cross / 6 ...
+};
+RingMoments ring_moments(const std::vector<core::PlanPoint> &ring) {
+  RingMoments m;
+  const std::size_t n = ring.size();
+  for (std::size_t i = 0; i < n; ++i) {
+    const auto &p = ring[i];
+    const auto &q = ring[(i + 1) % n];
+    const double cross = p[0] * q[1] - q[0] * p[1];
+    m.area += cross;
+    m.cx += (p[0] + q[0]) * cross;
+    m.cy += (p[1] + q[1]) * cross;
+  }
+  m.area *= 0.5;
+  m.cx /= 6.0; // first moments; divide by the area for the centroid
+  m.cy /= 6.0;
+  return m;
+}
+
+std::string space_key(const core::SpaceRecord &s) {
+  // Net footprint: outer minus holes, each ring's moments taken with the
+  // sign that makes its area positive, so neither winding nor the start
+  // vertex matters.
+  const auto outer = ring_moments(s.polygon.outer);
+  const double so = outer.area < 0 ? -1.0 : 1.0;
+  double area = so * outer.area, mx = so * outer.cx, my = so * outer.cy;
+  for (const auto &hole : s.polygon.holes) {
+    const auto h = ring_moments(hole);
+    const double sh = h.area < 0 ? -1.0 : 1.0;
+    area -= sh * h.area;
+    mx -= sh * h.cx;
+    my -= sh * h.cy;
+  }
+  double cx = 0.0, cy = 0.0;
+  if (area > 1e-12) {
+    cx = mx / area;
+    cy = my / area;
+  } else if (!s.polygon.outer.empty()) { // degenerate: the vertex mean
+    for (const auto &p : s.polygon.outer) {
+      cx += p[0];
+      cy += p[1];
+    }
+    cx /= static_cast<double>(s.polygon.outer.size());
+    cy /= static_cast<double>(s.polygon.outer.size());
+  }
+  return fmt::format("imported/space/{}/{},{}/a{}", s.storey,
+                     snap(cx, kPlanGridM), snap(cy, kPlanGridM),
+                     snap(std::max(area, 0.0), kAreaBucketM2));
+}
+
+std::string opening_key(const core::OpeningRecord &o) {
+  long long s0 = snap(o.s_start, kPlanGridM), s1 = snap(o.s_end, kPlanGridM);
+  if (s1 < s0)
+    std::swap(s0, s1);
+  return fmt::format("imported/opening/{}/{},{}/{}", o.wall, s0, s1, o.kind);
+}
+
+// Every other field, at full precision: the tie-break between elements
+// that share a natural key. Two records equal here are interchangeable, so
+// which one gets which guid does not matter.
+std::string full_fields(const core::WallRecord &w) {
+  return fmt::format(
+      "{:.17g} {:.17g} {:.17g} {:.17g} {:.17g} {:.17g} {:.17g} {:.17g} "
+      "{:.17g} {:.17g} {} {} {:.17g} {} {} {:.17g} {} {} {} {:.17g} {}",
+      w.x0, w.y0, w.x1, w.y1, w.z_base, w.height, w.thickness,
+      w.thickness_ci_lo, w.thickness_ci_hi, w.lean_deg, w.is_external,
+      w.assumed, w.seen_share, w.face_a_points, w.face_b_points,
+      w.co_visibility, w.axis_family, w.source, w.locked, w.confidence,
+      w.metadata);
+}
+std::string full_fields(const core::SpaceRecord &s) {
+  std::string out = fmt::format(
+      "{}|{}|{:.17g} {:.17g} {:.17g} {:.17g} {:.17g} {:.17g} {} {} {} "
+      "{:.17g} {}|",
+      s.name, s.kind, s.z_floor, s.z_ceiling, s.area, s.perimeter, s.volume,
+      s.compactness, s.room_label, s.source, s.locked, s.confidence,
+      s.metadata);
+  const auto ring = [&out](const std::vector<core::PlanPoint> &r) {
+    for (const auto &p : r)
+      out += fmt::format("{:.17g},{:.17g};", p[0], p[1]);
+    out += '|';
+  };
+  ring(s.polygon.outer);
+  for (const auto &h : s.polygon.holes)
+    ring(h);
+  return out;
+}
+std::string full_fields(const core::OpeningRecord &o) {
+  return fmt::format(
+      "{:.17g} {:.17g} {:.17g} {:.17g} {}|{} {}|{}|{} {:.17g} {}", o.s_start,
+      o.s_end, o.z_sill, o.z_head, o.state, o.is_external,
+      o.source_instance_guid, o.source, o.locked, o.confidence, o.metadata);
+}
+
+/// Mint a guid for every record of @p records that has none, from its
+/// natural key; records sharing a key are sorted by full_fields() and the
+/// second, third, ... get "#2", "#3", ... appended. Returns how many were
+/// minted.
+template <class Record, class KeyFn>
+std::size_t mint_by_natural_key(std::vector<Record> &records,
+                                const std::string &ns, KeyFn key_of) {
+  struct Item {
+    std::string key, full;
+    std::size_t index;
+  };
+  std::vector<Item> items;
+  for (std::size_t i = 0; i < records.size(); ++i)
+    if (records[i].guid.empty())
+      items.push_back({key_of(records[i]), full_fields(records[i]), i});
+  std::sort(items.begin(), items.end(), [](const Item &a, const Item &b) {
+    return std::tie(a.key, a.full) < std::tie(b.key, b.full);
+  });
+  std::size_t duplicates = 0;
+  for (std::size_t i = 0; i < items.size();) {
+    std::size_t j = i;
+    for (; j < items.size() && items[j].key == items[i].key; ++j) {
+      const std::size_t n = j - i;
+      const std::string name =
+          n == 0 ? items[j].key : fmt::format("{}#{}", items[j].key, n + 1);
+      records[items[j].index].guid = core::deterministic_guid(ns, name);
+    }
+    duplicates += j - i - 1;
+    i = j;
+  }
+  if (duplicates > 0)
+    core::info("store_solid_model: {} guid-less element(s) share a natural "
+               "key with another (same place and size); told apart by their "
+               "other fields",
+               duplicates);
+  return items.size();
+}
+
+} // namespace
+
+SolidModelStoreResult
+store_solid_model(ProjectDB &db, const core::SolidModel &model, int run_id) {
   // The tables key every row by guid, the document does not require one
   // (an authored reference often leaves it out where nothing refers to the
-  // element). Mint the missing ones deterministically, so a re-import of
-  // the same document gives the same rows: uuid5(project guid,
-  // "imported/storeys/<idx>"), and "imported/<kind>/<position in the
-  // model>" for the rest.
+  // element). Mint the missing ones deterministically from each element's
+  // natural key -- never its position in the document -- so a re-import
+  // writes the same rows and editing one element leaves the others' guids
+  // alone (see the header for the keys).
   const core::SolidModel *to_store = &model;
   core::SolidModel minted;
   const auto missing = [](const auto &records) {
@@ -884,17 +1056,15 @@ SolidModelStoreResult store_solid_model(ProjectDB &db,
             ns, fmt::format("imported/storeys/{}", s.idx));
         ++n;
       }
-    const auto mint = [&](auto &records, std::string_view kind) {
-      for (std::size_t i = 0; i < records.size(); ++i)
-        if (records[i].guid.empty()) {
-          records[i].guid = core::deterministic_guid(
-              ns, fmt::format("imported/{}/{}", kind, i));
-          ++n;
-        }
-    };
-    mint(minted.walls, "walls");
-    mint(minted.spaces, "spaces");
-    mint(minted.openings, "openings");
+    n += mint_by_natural_key(minted.walls, ns, [](const core::WallRecord &w) {
+      return wall_key(w);
+    });
+    n += mint_by_natural_key(minted.spaces, ns, [](const core::SpaceRecord &s) {
+      return space_key(s);
+    });
+    n += mint_by_natural_key(
+        minted.openings, ns,
+        [](const core::OpeningRecord &o) { return opening_key(o); });
     core::info("store_solid_model: minted a guid for {} element(s) the model "
                "gives none",
                n);
@@ -904,7 +1074,7 @@ SolidModelStoreResult store_solid_model(ProjectDB &db,
   // One SAVEPOINT in ProjectDB: the project's imported rows of each kind
   // the model provides are replaced, detected / manual rows stay (see
   // ProjectDB::replace_imported_solid_model for the guid / idx rules).
-  const auto imported = db.replace_imported_solid_model(*to_store);
+  const auto imported = db.replace_imported_solid_model(*to_store, run_id);
   SolidModelStoreResult r;
   r.storeys = imported.storeys;
   r.walls = imported.walls;
@@ -922,6 +1092,54 @@ SolidModelStoreResult store_solid_model(ProjectDB &db,
   if (!model.scene_relations.empty())
     r.not_stored.emplace_back("scene_relations");
   return r;
+}
+
+std::string store_summary(const SolidModelStoreResult &r) {
+  std::string out = fmt::format(
+      "imported {} storeys, {} walls, {} spaces, {} openings; replaced {} "
+      "earlier imported row(s)",
+      r.storeys, r.walls, r.spaces, r.openings, r.replaced_imported);
+  if (r.taken_over > 0)
+    out += fmt::format("; took over {} unlocked row(s)", r.taken_over);
+  if (r.skipped_locked > 0)
+    out += fmt::format("; {} held back by locked row(s)", r.skipped_locked);
+  if (r.dropped_relations > 0)
+    out += fmt::format("; dropped {} join(s) / boundary(ies)",
+                       r.dropped_relations);
+  if (r.skipped_joins > 0)
+    out += fmt::format("; {} join(s) not written", r.skipped_joins);
+  if (!r.not_stored.empty())
+    out += fmt::format("; not stored: {}", fmt::join(r.not_stored, ", "));
+  return out;
+}
+
+SolidModelStoreResult import_plan(ProjectDB &db, const core::SolidModel &model,
+                                  const std::filesystem::path &source_file,
+                                  int caller_log_id) {
+  // A caller-owned row is neither opened nor closed here (as
+  // io::ifc::import_ifc_file).
+  const bool own_row = caller_log_id < 0;
+  const nlohmann::json params = {{"source", "plan"},
+                                 {"file", source_file.filename().string()}};
+  const int log_id = own_row
+                         ? db.log_pipeline_start("import_plan", params.dump())
+                         : caller_log_id;
+  try {
+    SolidModelStoreResult r = store_solid_model(db, model, log_id);
+    if (own_row)
+      db.log_pipeline_end(log_id, true, store_summary(r));
+    return r;
+  } catch (const std::exception &e) {
+    if (own_row) {
+      try {
+        db.log_pipeline_end(log_id, false, e.what());
+      } catch (const std::exception &nested) {
+        core::error("import_plan: could not close pipeline_log row {}: {}",
+                    log_id, nested.what());
+      }
+    }
+    throw;
+  }
 }
 
 } // namespace reusex::io

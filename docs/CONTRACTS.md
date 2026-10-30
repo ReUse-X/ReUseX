@@ -918,11 +918,32 @@ An imported wall join must touch at least one wall of the same import (joins
 carry no source and go only with their walls, so that is what lets a
 re-import replace them); a join between two stored walls is refused.
 
-An element without a GUID gets `uuid5(project_guid, "imported/storeys/<idx>")`
-or `uuid5(project_guid, "imported/<kind>/<index in the document>")`, so
-importing the same document twice writes the same rows. The index is the
-element's position in the document, so reordering elements without a GUID
-changes theirs; give elements a GUID when their identity must survive edits. The whole import is
+An element without a GUID gets `uuid5(project_guid, <natural key>)`, the key
+built from what the element is, never from its position in the document
+(STANDARDS §3, §6), so importing the same document twice writes the same
+rows and reordering, inserting or deleting other elements keeps every GUID:
+
+| Element | Natural key |
+|---|---|
+| storey | `imported/storeys/<idx>` |
+| wall | storey + axis endpoints on a 1 cm grid, sorted (a reversed axis is the same wall) + thickness in mm |
+| space | storey + footprint area centroid (holes subtracted) on a 1 cm grid + area in 0.1 m² buckets |
+| opening | host wall GUID + extent along the host axis on a 1 cm grid + kind |
+
+Moving, resizing, re-hosting or retyping an element gives it a new GUID and
+touches no other. Elements sharing a key are ordered by all their other
+fields at full precision; the first keeps the key, the next get `#2`, `#3`, …
+Give elements a GUID when their identity must survive an edit that moves
+them.
+
+`rux edit plan --import` (`io::import_plan()`) records each import as one
+`pipeline_log` row, stage `import_plan`, parameters `{"source": "plan",
+"file": <file name>}`: `success` with the counts written
+(`io::store_solid_model` summary) as its message, or `failed` with the reason
+the project refused the plan. Every written row's `run_id` is that row's id
+(the Revit and IFC imports pass their own `import_speckle` / `import_ifc`
+row). A document that does not parse never reaches the project and logs
+nothing. The whole import is
 one SAVEPOINT: a refused element leaves every table as it was. Plane classes
 and scene relations in a document are not stored (reported as not stored).
 `rux edit plan --export` reads the tables back (`io::load_solid_model()`);

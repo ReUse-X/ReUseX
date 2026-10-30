@@ -130,16 +130,25 @@ struct SolidModelStoreResult {
 /// the model does not provide are left alone.
 ///
 /// A storey, wall, space or opening with no guid (the document allows that
-/// where nothing refers to the element) gets a deterministic one, so a
-/// re-import of the same document writes the same rows:
-/// `core::deterministic_guid(project_guid, "imported/storeys/<idx>")`, and
-/// `"imported/<walls|spaces|openings>/<index in the model>"` for the rest.
-/// Caveat: that index is the element's position in the document, so
-/// reordering, inserting or deleting elements before it gives the element a
-/// different guid on the next import (its row is replaced as a new one, and
-/// anything keyed by the old guid -- a survey part's element_guid, a
-/// quantity -- no longer finds it). Give elements a guid when they must
-/// keep their identity across edits of the document. All
+/// where nothing refers to the element) gets a deterministic one,
+/// `core::deterministic_guid(project_guid, <natural key>)`, so a re-import
+/// of the same document writes the same rows and reordering, inserting or
+/// deleting other elements does not change it (STANDARDS §3, §6):
+///  - storey: `imported/storeys/<idx>`;
+///  - wall: `imported/wall/<storey>/<ax>,<ay>;<bx>,<by>/t<thickness>`, the
+///    axis endpoints on a 1 cm grid in either direction (sorted, so a
+///    reversed axis is the same wall), the thickness in mm;
+///  - space: `imported/space/<storey>/<cx>,<cy>/a<area>`, the footprint's
+///    area centroid (holes subtracted) on a 1 cm grid and its area in
+///    0.1 m^2 buckets;
+///  - opening: `imported/opening/<host wall guid>/<s0>,<s1>/<kind>`, the
+///    extent along the host axis on a 1 cm grid.
+/// Moving, resizing or re-hosting an element changes its guid (it is a
+/// different element by these keys); nothing else does. Elements that share
+/// a key are told apart by every other field they carry (full precision),
+/// in that sorted order: the first keeps the key, the next get `#2`, `#3`,
+/// ... -- never by their position in the document. Give elements a guid
+/// when they must keep their identity across edits that move them. All
 /// in one SAVEPOINT; the rules, and what throws, are
 /// ProjectDB::replace_imported_solid_model's.
 ///
@@ -153,8 +162,35 @@ struct SolidModelStoreResult {
 /// @throws std::invalid_argument for a record the tables refuse, or an
 ///         opening / space boundary naming a wall the project does not
 ///         hold; std::runtime_error on a read-only project.
+///
+/// @p run_id is the pipeline_log row the import belongs to, stored on every
+/// written row (-1 = none); import_plan() and the model importers pass
+/// theirs.
 SolidModelStoreResult store_solid_model(ProjectDB &db,
-                                        const core::SolidModel &model);
+                                        const core::SolidModel &model,
+                                        int run_id = -1);
+
+/// One line naming what store_solid_model() wrote, for a log line and the
+/// import's pipeline_log row: "imported S storeys, W walls, P spaces, O
+/// openings; replaced R earlier imported row(s)", plus the rows taken over,
+/// held back by locked rows and the parts not stored, when there are any.
+std::string store_summary(const SolidModelStoreResult &r);
+
+/// `rux edit plan --import`: store_solid_model() under its own pipeline_log
+/// row, stage "import_plan", parameters `{"source": "plan", "file":
+/// <file name of @p source_file>}`. The row closes `success` with
+/// store_summary() as its message, or `failed` with the exception's message
+/// when the project refuses the model (nothing is stored then, see
+/// store_solid_model()). Call mark_imported() on @p model first.
+///
+/// @p log_id >= 0 is a pipeline_log row the CALLER has already opened and
+/// will close (as io::ifc::import_ifc_file): no row is opened or closed
+/// here and the stored rows carry @p log_id.
+///
+/// @throws what store_solid_model() throws, after closing the row.
+SolidModelStoreResult import_plan(ProjectDB &db, const core::SolidModel &model,
+                                  const std::filesystem::path &source_file,
+                                  int log_id = -1);
 
 /// The typed building model stored in a project: storeys, plane classes
 /// (of the "planes" cloud), walls and joins, openings, spaces and space
