@@ -10,6 +10,7 @@
 #include <fmt/format.h>
 
 #include <algorithm>
+#include <atomic>
 #include <cctype>
 #include <cstdlib>
 #include <memory>
@@ -288,7 +289,15 @@ struct HttpRequest {
   const std::string *post_json = nullptr; ///< GraphQL query body, or GET
   bool long_transfer = false; ///< no total timeout, low-speed abort instead
   std::size_t max_bytes = 0;
+  const std::atomic_bool *cancel = nullptr; ///< abort when set
+  long timeout_s = 0;                       ///< overall limit; 0 = default
 };
+
+int cancel_progress(void *clientp, curl_off_t, curl_off_t, curl_off_t,
+                    curl_off_t) {
+  const auto *cancel = static_cast<const std::atomic_bool *>(clientp);
+  return cancel && cancel->load(std::memory_order_acquire) ? 1 : 0;
+}
 
 std::string http_perform(const HttpRequest &req) {
   ensure_curl_global_init();
@@ -318,11 +327,21 @@ std::string http_perform(const HttpRequest &req) {
   curl_easy_setopt(c, CURLOPT_NOSIGNAL, 1L);
   curl_easy_setopt(c, CURLOPT_CONNECTTIMEOUT, 10L);
   if (req.long_transfer) {
-    // A full object tree can be hundreds of MB: bound stalls, not time.
+    // A full object tree can be hundreds of MB: bound stalls, not time
+    // (unless the caller set an overall limit).
     curl_easy_setopt(c, CURLOPT_LOW_SPEED_LIMIT, 1024L);
     curl_easy_setopt(c, CURLOPT_LOW_SPEED_TIME, 60L);
+    if (req.timeout_s > 0)
+      curl_easy_setopt(c, CURLOPT_TIMEOUT, req.timeout_s);
   } else {
-    curl_easy_setopt(c, CURLOPT_TIMEOUT, 60L);
+    curl_easy_setopt(c, CURLOPT_TIMEOUT,
+                     req.timeout_s > 0 ? std::min(req.timeout_s, 60L) : 60L);
+  }
+  if (req.cancel) {
+    curl_easy_setopt(c, CURLOPT_NOPROGRESS, 0L);
+    curl_easy_setopt(c, CURLOPT_XFERINFOFUNCTION, cancel_progress);
+    curl_easy_setopt(c, CURLOPT_XFERINFODATA,
+                     const_cast<std::atomic_bool *>(req.cancel));
   }
   curl_easy_setopt(c, CURLOPT_URL, req.url.c_str());
   curl_easy_setopt(c, CURLOPT_ACCEPT_ENCODING, ""); // gzip/deflate/br
@@ -346,6 +365,8 @@ std::string http_perform(const HttpRequest &req) {
         "Speckle {}: response exceeds the download limit of {} MiB ({}); "
         "raise SpeckleReader::set_max_download_bytes if this is expected",
         req.what, req.max_bytes >> 20, req.url));
+  if (res == CURLE_ABORTED_BY_CALLBACK)
+    throw std::runtime_error(fmt::format("Speckle {}: cancelled", req.what));
   if (res != CURLE_OK)
     throw std::runtime_error(fmt::format("Speckle {}: curl error: {} ({})",
                                          req.what, curl_easy_strerror(res),
@@ -847,6 +868,8 @@ json SpeckleReader::graphql_query(const std::string &query,
   req.project = project;
   req.post_json = &body;
   req.max_bytes = max_download_bytes_;
+  req.cancel = cancel_;
+  req.timeout_s = timeout_s_;
   const std::string response = http_perform(req);
 
   json parsed;
@@ -959,6 +982,8 @@ SpeckleReader::fetch_object_tree(const std::string &project,
   req.project = project;
   req.long_transfer = true;
   req.max_bytes = max_download_bytes_;
+  req.cancel = cancel_;
+  req.timeout_s = timeout_s_;
   core::debug("Speckle: downloading object tree {} from project {}", object_id,
               project);
   stopwatch sw;
@@ -982,6 +1007,8 @@ json SpeckleReader::fetch_object(const std::string &project,
   req.what = "object fetch";
   req.project = project;
   req.max_bytes = max_download_bytes_;
+  req.cancel = cancel_;
+  req.timeout_s = timeout_s_;
   std::string body = http_perform(req);
   try {
     return json::parse(body);

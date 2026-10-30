@@ -470,6 +470,13 @@ void PipelineWorkspace::rebuild_stages() {
     // than show a stage that cannot work (final-review.md finding 4).
     if (s == pl::JobStage::annotate)
       continue;
+    // The BIM imports need what this list has no field for: a Speckle token
+    // (StageExecutorOptions::speckle_token; ruxd resolves it per user) or an
+    // IFC file to pick. They run from `rux import speckle|ifc` and as ruxd
+    // jobs; their history rows still map back here (stage_from_log_name), so
+    // "Kopiér som rux-kommando" works for them in the Log.
+    if (s == pl::JobStage::import_speckle || s == pl::JobStage::import_ifc)
+      continue;
     // A row is a button holding labels (qt-client.md: give it a minimum
     // height from its layout).
     auto *row = new QPushButton;

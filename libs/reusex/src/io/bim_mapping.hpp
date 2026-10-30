@@ -176,6 +176,7 @@ class MeshMerger {
 struct MeshWriteResult {
   std::size_t saved = 0;
   std::size_t removed = 0; ///< stale meshes of the same stage deleted
+  std::vector<std::string> saved_names; ///< in write order
 };
 
 /// Save @p meshes (stage @p stage, parameters = @p params plus category,

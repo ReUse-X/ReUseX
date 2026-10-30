@@ -56,6 +56,13 @@ enum class JobStage {
   spaces,         ///< band rooms as polygons -> "spaces" / "space_boundaries"
   solids,         ///< typed solids -> "solid_walls" / "solid_slabs" /
                   ///< "solid_spaces" meshes
+  /// Revit model from Speckle -> imported storeys / walls / openings /
+  /// spaces + `imported/revit/<category>` meshes. Needs a Speckle token
+  /// from StageExecutorOptions::speckle_token (never a parameter).
+  import_speckle,
+  /// IFC file -> imported storeys / walls / openings / spaces +
+  /// `imported/ifc/<class>` meshes (needs web-ifc, REUSEX_HAVE_WEB_IFC).
+  import_ifc,
 };
 
 /// Canonical lower-case stage name (the token used on the wire and the CLI).
@@ -136,9 +143,85 @@ struct StageContext {
   /// Recorded into the stage's `pipeline_log.parameters` under `"job_id"` so
   /// the durable history can be joined back to the job that caused it (#265).
   std::string job_id;
+  /// Who submitted the job (JobRecord::submitted_by; ruxd: the user id), or
+  /// empty. Not recorded anywhere by the stage; it is there so a front end's
+  /// StageExecutorOptions::speckle_token can pick that user's credential.
+  std::string submitted_by;
 
   /// True when a cancel token is present and set.
   bool is_cancelled() const noexcept;
+};
+
+/// The parameter key a credential would travel under. Refused for every
+/// stage: by JobQueue::submit() (so it never reaches the job store) and by
+/// run_logged_stage() before the pipeline_log row is opened.
+inline constexpr std::string_view kSecretParameterKey = "token";
+
+/// What a stage needs from its front end beyond the project and its
+/// parameters: credentials, and the network seam of the import stages.
+///
+/// SECRETS never travel in StageContext::parameters — those are persisted in
+/// the job history and in `pipeline_log.parameters`. A credential is resolved
+/// per run through a provider set here, and no stage writes it to the log, to
+/// pipeline_log, to the StageResult or to any stored row. A `token` key in
+/// any stage's parameters is refused (JobQueue::submit, run_logged_stage).
+struct StageExecutorOptions {
+  /// The Speckle access token for one `import_speckle` run against
+  /// @p server_url (already allowed by the server policy below). nullopt /
+  /// empty = none: the stage is refused with "no Speckle token configured"
+  /// and nothing is fetched. UNSET = no provider = every import_speckle run
+  /// is refused: a token is only ever used when the front end says where it
+  /// comes from. A multi-user front end (ruxd) picks the submitting user's
+  /// token (StageContext::submitted_by) for that server and must NOT fall
+  /// back to a process-wide one; a single-user local front end passes
+  /// env_speckle_token (local_user()).
+  std::function<std::optional<std::string>(const StageContext &ctx,
+                                           const std::string &server_url)>
+      speckle_token;
+
+  /// `SPECKLE_TOKEN` from the environment: the provider of the rux CLI and
+  /// the Qt client.
+  static std::optional<std::string>
+  env_speckle_token(const StageContext &ctx, const std::string &server_url);
+
+  /// Which Speckle servers import_speckle may contact, consulted before the
+  /// token is asked for and before any request. Unset =
+  /// pipeline::default_speckle_server_allowed(url, allow_insecure_localhost)
+  /// (pipeline/import_parameters.hpp): https to a public host. Set, it is the
+  /// whole policy (it may call the default itself).
+  std::function<bool(const std::string &server_url)> allowed_speckle_server;
+  /// Default policy only: also allow http:// / https:// to localhost.
+  bool allow_insecure_localhost = false;
+
+  /// Overall time limit for each Speckle request, the object download
+  /// included [s]; 0 = none (the download is then bounded by a low-speed
+  /// abort only).
+  long speckle_timeout_s = 0;
+
+  /// import_ifc may read a file outside the project's directory. Off (the
+  /// default), the path must resolve -- symlinks followed -- inside the
+  /// directory holding the `.rux` (a ruxd case directory), and "outside" and
+  /// "missing" are refused with the same message.
+  bool allow_paths_outside_project = false;
+
+  /// What the import_speckle stage hands speckle_download.
+  struct SpeckleDownloadRequest {
+    std::string server_url;
+    std::string project;
+    std::string model;
+    std::string version; ///< empty = the latest
+    std::string token;   ///< resolved by speckle_token
+  };
+  /// Replaces the stage's network read (tests; a front end with its own
+  /// cache): returns the version's object tree, already resolved
+  /// (io::speckle::ObjectTree::resolve_root()), as JSON text. Unset = read
+  /// it from the server with io::speckle::SpeckleReader.
+  std::function<std::string(const SpeckleDownloadRequest &)> speckle_download;
+
+  /// The options of a single-user local front end (the rux CLI, the Qt
+  /// client): the token from `SPECKLE_TOKEN`, localhost Speckle servers and
+  /// IFC files anywhere allowed -- the user is the one at the keyboard.
+  static StageExecutorOptions local_user();
 };
 
 /// Run a stage against an already-open, writable ProjectDB.
@@ -146,6 +229,11 @@ struct StageContext {
 /// Never throws: algorithm/IO failures are converted into a failed StageResult
 /// and, when a pipeline_log row was opened, closed out with the error message
 /// (STANDARDS §5 — no silent failure).
+StageResult run_stage(ProjectDB &db, const StageContext &ctx,
+                      const StageExecutorOptions &options);
+
+/// run_stage() with default StageExecutorOptions (no Speckle token provider:
+/// import_speckle is refused; IFC files only inside the project directory).
 StageResult run_stage(ProjectDB &db, const StageContext &ctx);
 
 /// Run `body` wrapped in the same `pipeline_log` open/close protocol
@@ -175,13 +263,15 @@ run_logged_stage(ProjectDB &db, const StageContext &ctx, std::string_view name,
                  const std::function<StageResult(int log_id)> &body);
 
 /// Open `ctx.project` read-write and run the stage against it.
-StageResult run_stage(const StageContext &ctx);
+StageResult run_stage(const StageContext &ctx,
+                      const StageExecutorOptions &options = {});
 
 /// Stage execution strategy. Exists so JobRunner's state machine can be tested
 /// against a fake executor without touching real scan data.
 using StageExecutor = std::function<StageResult(const StageContext &)>;
 
-/// The executor that actually runs the pipeline (a thin wrap of run_stage).
-StageExecutor default_stage_executor();
+/// The executor that actually runs the pipeline (a thin wrap of run_stage),
+/// with @p options for every run (StageExecutorOptions).
+StageExecutor default_stage_executor(StageExecutorOptions options = {});
 
 } // namespace reusex::pipeline

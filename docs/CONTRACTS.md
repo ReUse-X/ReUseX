@@ -927,13 +927,50 @@ Fetch one version of a Speckle model published by the Revit connector
 (Speckle v3; `io::speckle::SpeckleReader`, GraphQL queries and HTTP GETs
 only -- nothing is written to the server), map it with
 `io::speckle::import_revit()` and store it with the solid-model import write
-above (`io::speckle::import_speckle_revit()`). One `pipeline_log` row,
-stage `import_speckle` (parameters: server, project, model, version, root
-object; never the token, which comes from `SPECKLE_TOKEN`).
+above (`io::speckle::import_speckle_revit()`). The CLI and ruxd run it as
+the job stage `import_speckle` (`pipeline::JobStage::import_speckle`,
+reusex-3iy8.13): one `pipeline_log` row, stage `import_speckle`, whose
+parameters are the stage's (`pipeline/import_parameters.hpp`: `server`,
+`project`, `model`, `version`, `meshes`, `storey_height`,
+`min_wall_thickness`, `min_wall_fill`, `opening_host_tolerance`,
+`elevation_offset`, `recenter`, `recenter_threshold`) plus `job_id` for a
+job. The meshes' parameters carry the resolved source (server, project,
+model, version, root object). The run's `StageResult::outputs` (both import
+stages) are `{table, storeys|walls|openings|spaces, rows written}` and
+`{mesh, <name>}` for every mesh saved, so a client refreshes what changed.
+
+**The token is never a parameter.** Job parameters are persisted (job
+history, `pipeline_log.parameters`), so the Speckle token is resolved per run
+by `StageExecutorOptions::speckle_token(ctx, server_url)`, which a multi-user
+front end (ruxd) sets to the submitting user's token
+(`StageContext::submitted_by`). With no provider set, or one that returns
+none, the stage is refused ("no Speckle token configured") before anything
+is fetched; the environment is read only through the explicit
+`StageExecutorOptions::env_speckle_token`, which the `rux` CLI and the Qt
+client pass (`StageExecutorOptions::local_user()`). A `token` key is refused
+for every stage, by `JobQueue::submit()` and before the `pipeline_log` row
+is opened. For both import stages the parameters are **strict**: a key not
+in the table (`speckle_token`, `Token`, ...) is refused, and what
+`JobQueue::submit()` stores and `pipeline_log` records is the table's keys
+re-serialised (`normalize_import_parameters()`), never the submitted blob.
+The token appears in no log line, row, result or mesh parameter.
+
+**Server policy.** Before the token is asked for, the server must pass
+`StageExecutorOptions::allowed_speckle_server` (a hook that is the whole
+policy when set) or, by default, `default_speckle_server_allowed()`:
+`https://` to a public host (not localhost, not a literal loopback /
+private / link-local / CGNAT address, no userinfo); `http://` / `https://`
+to localhost only with `allow_insecure_localhost` (set by `local_user()`).
+
+**Cancellation and timeout.** `import_speckle` is cancellable: the job's
+cancel token aborts the Speckle requests (curl progress callback) and is
+checked again after the download, so a cancelled run stores nothing and its
+`pipeline_log` row ends `cancelled`. `StageExecutorOptions::speckle_timeout_s`
+bounds each request, the object download included (0 = none).
 
 | | |
 |---|---|
-| Consumes | a Speckle server, project, model and version (default the latest) |
+| Consumes | a Speckle server, project, model and version (default the latest); a token from the executor (no in-project prerequisite: a fresh project is fine) |
 | Produces | `storeys`, `walls`, `openings`, `spaces` rows (`source = imported`, locked, as above); meshes `imported/revit/<category slug>` (stage `import_speckle`) |
 | Checks   | the root carries `levelProxies` (a Revit model), else it throws and writes nothing |
 
@@ -996,8 +1033,20 @@ Mapping (`libs/reusex/include/io/speckle_revit.hpp`):
 
 Read an IFC file (IFC2X3 / IFC4 / IFC4X3, STEP) with the native C++ core of
 web-ifc, map it with `io::ifc::import_ifc()` and store it with the
-solid-model import write above (`io::ifc::import_ifc_file()`). One
-`pipeline_log` row, stage `import_ifc` (parameters: source, file name).
+solid-model import write above (`io::ifc::import_ifc_file()`). The CLI and
+ruxd run it as the job stage `import_ifc` (`pipeline::JobStage::import_ifc`):
+one `pipeline_log` row, stage `import_ifc`, parameters `path`, `meshes`,
+`storey_height`, `min_wall_thickness`, `min_wall_fill`,
+`opening_host_tolerance`, `recenter`, `recenter_threshold` (+ `job_id`).
+`path` is absolute, or relative to the directory holding the `.rux` (the
+case directory ruxd uploads into). By default it must resolve -- symlinks
+followed (`canonical`) -- to an existing regular file **inside** that
+directory; an absolute path elsewhere, a `..` escape or a symlink out are
+refused with the same message as a missing file ("is not a file in the
+project's directory"), so the refusal is no existence oracle.
+`StageExecutorOptions::allow_paths_outside_project` (set by `local_user()`:
+the CLI and the Qt client) lifts the confinement. `rux import ifc FILE`
+makes a relative FILE absolute against the working directory.
 web-ifc is an optional dependency: a build without it
 (`REUSEX_HAVE_WEB_IFC` off) refuses with a clear message. web-ifc's own log
 messages (it logs through spdlog's default logger) are shown as `[web-ifc]`
@@ -1005,7 +1054,7 @@ at warn and above only, whatever `-v` says.
 
 | | |
 |---|---|
-| Consumes | an IFC file |
+| Consumes | an IFC file (no in-project prerequisite: a fresh project is fine) |
 | Produces | `storeys`, `walls`, `openings`, `spaces` rows (`source = imported`, locked, as above); meshes `imported/ifc/<IFC class slug>` (stage `import_ifc`) |
 | Checks   | the file is a complete STEP file (ISO-10303-21 header, ENDSEC / END-ISO-10303-21 at the end), web-ifc parses it without errors, and it has an IfcProject and at least one IfcBuildingStorey; else it throws, writes no record or mesh, and its `pipeline_log` row ends `failed` with the message |
 

@@ -3,9 +3,12 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
 #include "import/speckle.hpp"
+#include "create/stage_bridge.hpp"
 #include "exit_status.hpp"
+#include "import/stage_flags.hpp"
 
 #include <reusex/core/ProjectDB.hpp>
+#include <reusex/pipeline/stages.hpp>
 #include <spdlog/spdlog.h>
 
 #include <exception>
@@ -33,7 +36,10 @@ DESCRIPTION:
   plan"). Coordinates stay in Revit's internal frame, in metres; aligning
   the model to a scan is not done here.
 
-  The access token is read from SPECKLE_TOKEN.
+  The access token is read from SPECKLE_TOKEN; it is never a parameter and
+  never written to the project (pipeline_log records the flags below). The
+  same import runs as the `import_speckle` job stage (ruxd), with the same
+  parameters.
 
 EXAMPLES:
   SPECKLE_TOKEN=... rux -p house.rux import speckle \
@@ -49,73 +55,59 @@ NOTES:
   - Door / window extents come from the Revit rough opening (else nominal
     width / height, else the geometry).
   - --no-meshes writes no mesh and deletes none.
+  - --project and --model are required; without them the stage refuses.
 )");
 
-  const reusex::io::speckle::SpeckleRevitImportOptions defaults;
-  sub->add_option("--server", opt->import.server_url, "Speckle server URL")
-      ->default_val(defaults.server_url);
-  sub->add_option("--project", opt->import.project, "Speckle project id")
-      ->required();
-  sub->add_option("--model", opt->import.model, "Speckle model id")->required();
-  sub->add_option("--version", opt->import.version,
-                  "Model version id (default: the latest)");
-  sub->add_flag("--no-meshes", opt->no_meshes,
-                "Store only the solid-model records, no category meshes");
-  sub->add_option("--storey-height",
-                  opt->import.mapping.default_storey_height_m,
-                  "Height of the top storey [m]")
-      ->default_val(defaults.mapping.default_storey_height_m);
-  sub->add_option("--min-wall-thickness",
-                  opt->import.mapping.min_wall_thickness_m,
-                  "Thinner walls (finish layers) get no wall record [m]")
-      ->default_val(defaults.mapping.min_wall_thickness_m);
+  sub->get_formatter()->column_width(40);
+  rux::add_import_stage_flags(*sub, opt->stage,
+                              reusex::pipeline::speckle_parameter_table());
 
-  auto *eo = sub->add_option(
-      "--elevation-offset", opt->elevation_offset_m,
-      "Revit internal z minus level elevation [m] (default: measured from "
-      "the walls)");
-  sub->add_option("--recenter-threshold",
-                  opt->import.mapping.recenter_threshold_m,
-                  "Recentre a model farther than this from the origin [m]")
-      ->default_val(defaults.mapping.recenter_threshold_m);
-
-  sub->callback([opt, global_opt, eo]() {
-    opt->elevation_offset_set = eo->count() > 0;
+  sub->callback([opt, global_opt]() {
     spdlog::trace("calling run_subcommand_import_speckle");
+    if (rux::capture_stage_params("import_speckle",
+                                  speckle_stage_parameters(*opt)))
+      return;
+    // Usage errors before any project is opened (or created) and before a
+    // pipeline_log row exists: the exit code CLI11's ->required() gave.
+    if (opt->stage.import.project.empty())
+      throw CLI::RequiredError("--project");
+    if (opt->stage.import.model.empty())
+      throw CLI::RequiredError("--model");
     rux::finish(run_subcommand_import_speckle(*opt, *global_opt));
   });
 }
 
+std::string
+speckle_stage_parameters(SubcommandImportSpeckleOptions const &opt) {
+  return reusex::pipeline::speckle_parameters_json(opt.stage);
+}
+
 int run_subcommand_import_speckle(SubcommandImportSpeckleOptions const &opt,
                                   const RuxOptions &global_opt) {
-  auto import = opt.import;
-  import.mapping.meshes = !opt.no_meshes;
-  if (opt.elevation_offset_set)
-    import.mapping.elevation_offset_m = opt.elevation_offset_m;
+  // Bad values (ids, bounds, server) are refused before the project is
+  // opened, so a usage error neither creates a .rux nor logs a run.
+  try {
+    (void)reusex::pipeline::speckle_options_from_parameters(
+        speckle_stage_parameters(opt));
+  } catch (const std::invalid_argument &e) {
+    spdlog::error("import speckle: {}", e.what());
+    return RuxError::INVALID_ARGUMENT;
+  }
   try {
     reusex::ProjectDB db(global_opt.project_db);
-    const auto r = reusex::io::speckle::import_speckle_revit(db, import);
-    const auto &s = r.stats;
-    spdlog::info("Imported version {} ({} elements): {} storeys, {} walls, "
-                 "{} openings, {} spaces, {} meshes",
-                 r.version.id, s.elements, r.stored.storeys, r.stored.walls,
-                 r.stored.openings, r.stored.spaces, r.meshes_saved);
-    spdlog::info("Skipped: {} thin walls, {} non-straight walls, {} unhosted "
-                 "doors/windows, {} unplaced rooms; replaced {} earlier "
-                 "imported rows",
-                 s.walls_thin, s.walls_not_straight, s.openings_unhosted,
-                 s.rooms_unplaced, r.stored.replaced_imported);
-    spdlog::info("Levels: {} ({} reference levels, no storey); openings "
-                 "sized from Revit parameters: {}, from geometry: {}",
-                 s.levels, s.reference_levels, s.openings_extent_params,
-                 s.openings_extent_geometry);
-    if (r.stored.skipped_locked > 0)
-      spdlog::warn("{} records were not written: a locked detected / manual "
-                   "row holds their guid or storey idx",
-                   r.stored.skipped_locked);
+    reusex::pipeline::StageContext ctx;
+    ctx.project = global_opt.project_db;
+    ctx.stage = reusex::pipeline::JobStage::import_speckle;
+    ctx.parameters = speckle_stage_parameters(opt);
+    // A local user: the token comes from SPECKLE_TOKEN, a localhost Speckle
+    // server is allowed.
+    const auto result = reusex::pipeline::run_stage(
+        db, ctx, reusex::pipeline::StageExecutorOptions::local_user());
+    if (result.ok)
+      spdlog::info("Imported {}", result.message);
+    return rux::exit_code_for(result);
   } catch (const std::exception &e) {
     spdlog::error("import speckle: {}", e.what());
     return RuxError::GENERIC;
   }
-  return RuxError::SUCCESS;
 }

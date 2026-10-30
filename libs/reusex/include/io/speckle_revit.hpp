@@ -12,6 +12,7 @@
 #include <nlohmann/json.hpp>
 
 #include <array>
+#include <atomic>
 #include <cstddef>
 #include <cstdint>
 #include <functional>
@@ -153,7 +154,8 @@ struct RevitStoreResult {
   RevitImportStats stats;
   SolidModelStoreResult stored;
   std::size_t meshes_saved = 0;
-  std::size_t meshes_removed = 0; ///< stale imported meshes deleted
+  std::size_t meshes_removed = 0;      ///< stale imported meshes deleted
+  std::vector<std::string> mesh_names; ///< the meshes saved, sorted
 };
 
 /// Map a resolved Revit tree and store it in @p db: one pipeline_log row
@@ -165,11 +167,18 @@ struct RevitStoreResult {
 /// deleted; with `options.meshes == false` no mesh is written or deleted.
 /// Records and meshes go in one transaction. @p resolved_root is called once,
 /// after the log row is opened, so a failed download is logged too.
+///
+/// @p log_id >= 0 is a pipeline_log row the CALLER has already opened and
+/// will close (pipeline::run_logged_stage, the `import_speckle` job stage):
+/// no row is opened or closed here then, and the caller's row is the one
+/// record of the run. -1 (the default) opens and closes an own row.
 /// @throws whatever @p resolved_root or import_revit() throws (the log row
 ///         then ends failed and nothing is stored).
-RevitStoreResult import_revit_into(
-    ProjectDB &db, const std::function<nlohmann::json()> &resolved_root,
-    const RevitImportOptions &options, const nlohmann::json &source);
+RevitStoreResult
+import_revit_into(ProjectDB &db,
+                  const std::function<nlohmann::json()> &resolved_root,
+                  const RevitImportOptions &options,
+                  const nlohmann::json &source, int log_id = -1);
 
 struct SpeckleRevitImportOptions {
   std::string server_url = "https://app.speckle.systems";
@@ -178,6 +187,13 @@ struct SpeckleRevitImportOptions {
   std::string version;        ///< empty = the latest version (any age)
   std::string token;          ///< empty = SPECKLE_TOKEN
   RevitImportOptions mapping; ///< guid_namespace is set from the project
+  /// Abort the server reads once set (SpeckleReader::set_cancel_token);
+  /// checked again after the download, before anything is stored. The
+  /// import then throws and stores nothing. nullptr = never.
+  const std::atomic_bool *cancel_token = nullptr;
+  /// Overall limit per request, the object download included [s]; 0 = none
+  /// (SpeckleReader::set_timeout_seconds).
+  long timeout_s = 0;
 };
 
 struct SpeckleRevitImportResult {
@@ -185,15 +201,19 @@ struct SpeckleRevitImportResult {
   RevitImportStats stats;
   SolidModelStoreResult stored;
   std::size_t meshes_saved = 0;
-  std::size_t meshes_removed = 0; ///< stale imported meshes deleted
+  std::size_t meshes_removed = 0;      ///< stale imported meshes deleted
+  std::vector<std::string> mesh_names; ///< the meshes saved, sorted
 };
 
-/// `rux import speckle`: look the version up (SpeckleReader::query_version
-/// by id, else latest_version), then import_revit_into() with a fetch that
-/// downloads and resolves its object tree (read only).
+/// The `import_speckle` stage: look the version up
+/// (SpeckleReader::query_version by id, else latest_version), then
+/// import_revit_into() with a fetch that downloads and resolves its object
+/// tree (read only). @p log_id: as import_revit_into() (-1 = an own
+/// pipeline_log row).
 /// @throws std::runtime_error on a network / server error, a version that
 ///         does not exist, or a tree that is not a Revit model.
 SpeckleRevitImportResult
-import_speckle_revit(ProjectDB &db, const SpeckleRevitImportOptions &options);
+import_speckle_revit(ProjectDB &db, const SpeckleRevitImportOptions &options,
+                     int log_id = -1);
 
 } // namespace reusex::io::speckle

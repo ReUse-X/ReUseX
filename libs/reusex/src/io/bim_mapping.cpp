@@ -530,6 +530,7 @@ MeshWriteResult write_meshes(ProjectDB &db,
     p["units"] = "m";
     db.save_mesh(m.name, mesh, stage, p.dump());
     written.insert(m.name);
+    res.saved_names.push_back(m.name);
     ++res.saved;
   }
   for (const auto &name : db.list_meshes()) {

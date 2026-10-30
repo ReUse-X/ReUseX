@@ -138,20 +138,27 @@ struct IfcFileImportResult {
   IfcImportStats stats;
   SolidModelStoreResult stored;
   std::size_t meshes_saved = 0;
-  std::size_t meshes_removed = 0; ///< stale imported meshes deleted
+  std::size_t meshes_removed = 0;      ///< stale imported meshes deleted
+  std::vector<std::string> mesh_names; ///< the meshes saved, sorted
 };
 
-/// `rux import ifc`: map @p file with import_ifc() (guid_namespace = the
-/// project GUID), store the records as imported (io::mark_imported +
+/// The `import_ifc` stage: map @p file with import_ifc() (guid_namespace =
+/// the project GUID), store the records as imported (io::mark_imported +
 /// io::store_solid_model) and the class meshes as `imported/ifc/<slug>` (stage
 /// "import_ifc"; earlier meshes of that stage this import no longer has are
 /// deleted; with options.meshes false no mesh is written or deleted). One
 /// transaction, one pipeline_log row ("import_ifc").
+///
+/// @p log_id >= 0 is a pipeline_log row the CALLER has already opened and
+/// will close (pipeline::run_logged_stage, the `import_ifc` job stage): no
+/// row is opened or closed here then. -1 (the default) opens and closes an
+/// own row.
 /// @throws std::runtime_error as import_ifc(); no record or mesh is
 ///         written then, and the pipeline_log row ends failed with the
 ///         message.
 IfcFileImportResult import_ifc_file(ProjectDB &db,
                                     const std::filesystem::path &file,
-                                    const IfcImportOptions &options = {});
+                                    const IfcImportOptions &options = {},
+                                    int log_id = -1);
 
 } // namespace reusex::io::ifc

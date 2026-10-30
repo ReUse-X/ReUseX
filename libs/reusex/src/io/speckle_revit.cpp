@@ -854,9 +854,12 @@ RevitImport import_revit(const json &root, const RevitImportOptions &opt) {
 RevitStoreResult import_revit_into(ProjectDB &db,
                                    const std::function<json()> &resolved_root,
                                    const RevitImportOptions &options,
-                                   const json &source) {
+                                   const json &source, int caller_log_id) {
   RevitStoreResult res;
-  const int log_id = db.log_pipeline_start("import_speckle", source.dump());
+  // A caller-owned row (the job stage) is neither opened nor closed here.
+  const bool own_row = caller_log_id < 0;
+  const int log_id =
+      own_row ? db.log_pipeline_start("import_speckle", source.dump()) : -1;
   try {
     const json root = resolved_root();
     RevitImportOptions mapping = options;
@@ -877,26 +880,37 @@ RevitStoreResult import_revit_into(ProjectDB &db,
           bim::write_meshes(db, imported.meshes, "import_speckle", params);
       res.meshes_saved = w.saved;
       res.meshes_removed = w.removed;
+      res.mesh_names = w.saved_names;
     }
     tx.commit();
     if (res.meshes_removed > 0)
       core::info("import_speckle_revit: removed {} meshes of an earlier "
                  "import that this version no longer has",
                  res.meshes_removed);
-    db.log_pipeline_end(log_id, true);
+    if (own_row)
+      db.log_pipeline_end(log_id, true);
   } catch (const std::exception &e) {
-    db.log_pipeline_end(log_id, false, e.what());
+    if (own_row)
+      db.log_pipeline_end(log_id, false, e.what());
     throw;
   }
   return res;
 }
 
 SpeckleRevitImportResult
-import_speckle_revit(ProjectDB &db, const SpeckleRevitImportOptions &opt) {
+import_speckle_revit(ProjectDB &db, const SpeckleRevitImportOptions &opt,
+                     int log_id) {
   if (opt.project.empty() || opt.model.empty())
     throw std::invalid_argument(
         "import_speckle_revit: a project and a model id are required");
   SpeckleReader reader(opt.server_url, opt.token);
+  reader.set_cancel_token(opt.cancel_token);
+  reader.set_timeout_seconds(opt.timeout_s);
+  const auto throw_if_cancelled = [&](const char *where) {
+    if (opt.cancel_token && opt.cancel_token->load(std::memory_order_acquire))
+      throw std::runtime_error(
+          fmt::format("import_speckle_revit: cancelled {}", where));
+  };
   SpeckleRevitImportResult res;
   res.version = opt.version.empty()
                     ? reader.latest_version(opt.project, opt.model)
@@ -913,19 +927,23 @@ import_speckle_revit(ProjectDB &db, const SpeckleRevitImportOptions &opt) {
                        {"root_object", res.version.referenced_object},
                        {"source_application", res.version.source_application}};
   auto fetch = [&]() {
+    throw_if_cancelled("before the download");
     const ObjectTree tree =
         reader.fetch_object_tree(opt.project, res.version.referenced_object);
+    throw_if_cancelled("after the download");
     ResolveReport report;
     json root = tree.resolve_root(&report);
     core::info("import_speckle_revit: {} objects, {} references resolved",
                tree.size(), report.references_resolved);
     return root;
   };
-  RevitStoreResult stored = import_revit_into(db, fetch, opt.mapping, source);
+  RevitStoreResult stored =
+      import_revit_into(db, fetch, opt.mapping, source, log_id);
   res.stats = std::move(stored.stats);
   res.stored = stored.stored;
   res.meshes_saved = stored.meshes_saved;
   res.meshes_removed = stored.meshes_removed;
+  res.mesh_names = std::move(stored.mesh_names);
   return res;
 }
 
