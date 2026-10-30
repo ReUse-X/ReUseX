@@ -26,6 +26,8 @@
 #include <pcl/point_types.h>
 
 #include <algorithm>
+#include <fstream>
+#include <iterator>
 #include <string>
 
 using Catch::Approx;
@@ -140,7 +142,9 @@ TEST_CASE("import_ifc maps a small IFC4 building", "[io][ifc]") {
   CHECK(o.z_head == Approx(2.1));
   CHECK(o.is_external);
   CHECK(st.openings_by_relation == 1);
-  CHECK(nlohmann::json::parse(o.metadata)["host"] == "IfcRelFillsElement");
+  const auto omd = nlohmann::json::parse(o.metadata);
+  CHECK(omd["host"] == "IfcRelFillsElement");
+  CHECK(omd["extent_source"]["s"] == "IfcOpeningElement");
 
   // The space: footprint of its body, LongName as the name.
   REQUIRE(r.model.spaces.size() == 1);
@@ -184,20 +188,43 @@ TEST_CASE("import_ifc GUIDs are deterministic per namespace", "[io][ifc]") {
   CHECK(c.model.walls[0].guid != a.model.walls[0].guid);
 }
 
-TEST_CASE("import_ifc recentres in xy on request", "[io][ifc]") {
-  IfcImportOptions opt;
-  opt.recenter = true;
-  const auto r = import_ifc(fixture(), opt);
-  // Plan bounds x -0.1..6.0, y -0.1..4.0 -> centre (3, 2) after rounding.
-  CHECK(r.stats.offset_m[0] == Approx(-3.0));
-  CHECK(r.stats.offset_m[1] == Approx(-2.0));
-  CHECK(r.stats.offset_m[2] == Approx(0.0).margin(1e-12));
+TEST_CASE("import_ifc recentres a georeferenced model", "[io][ifc]") {
+  // The fixture with its site placed 600 km east, 6200 km north (mm).
+  std::ifstream in(fixture());
+  std::string text((std::istreambuf_iterator<char>(in)),
+                   std::istreambuf_iterator<char>());
+  const std::string site = "#31=IFCLOCALPLACEMENT($,#21);";
+  const auto at = text.find(site);
+  REQUIRE(at != std::string::npos);
+  text.replace(at, site.size(),
+               "#31=IFCLOCALPLACEMENT($,#900);\n"
+               "#900=IFCAXIS2PLACEMENT3D(#901,$,$);\n"
+               "#901=IFCCARTESIANPOINT((600000000.,6200000000.,0.));");
+  reusex::test_support::TempPath tmp("test_ifc_import_far", ".ifc");
+  std::ofstream(tmp.path) << text;
+
+  const auto r = import_ifc(tmp.path);
+  // Plan centre (600002.95, 6200001.95) -> whole-km offset.
+  CHECK(r.stats.world_offset_m[0] == Approx(600000.0));
+  CHECK(r.stats.world_offset_m[1] == Approx(6200000.0));
+  CHECK(r.stats.world_offset_m[2] == Approx(0.0).margin(1e-12));
   REQUIRE(r.model.walls.size() == 2);
-  CHECK(r.model.walls[0].x0 == Approx(-3.0));
-  CHECK(r.model.walls[0].y0 == Approx(-2.0));
+  CHECK(r.model.walls[0].x0 == Approx(0.0).margin(1e-6));
+  CHECK(r.model.walls[0].x1 == Approx(6.0));
+  CHECK(r.model.walls[0].y0 == Approx(0.0).margin(1e-6));
   CHECK(r.model.storeys[1].z_floor == Approx(3.0)); // z is kept
   REQUIRE(r.model.openings.size() == 1);
   CHECK(r.model.openings[0].s_start == Approx(1.0));
+  REQUIRE(r.model.spaces.size() == 1);
+  CHECK(r.model.spaces[0].polygon.outer[0][0] < 10.0);
+  const auto md = nlohmann::json::parse(r.model.storeys[0].metadata);
+  CHECK(md["world_offset_m"][0] == Approx(600000.0));
+
+  IfcImportOptions keep;
+  keep.recenter = false;
+  const auto k = import_ifc(tmp.path, keep);
+  CHECK(k.stats.world_offset_m[0] == 0.0);
+  CHECK(k.model.walls[0].x0 == Approx(600000.0));
 }
 
 TEST_CASE("import_ifc refuses a missing file", "[io][ifc]") {

@@ -821,8 +821,8 @@ skips rejected types and creates a new one when only a rejected type matches.
 <!-- No backticks in this heading: test_stage_contract parses backticked
      `### ` headings as pipeline stages, and this is not one. -->
 
-Store an imported building model -- an authored reference plan, later a
-Revit (via Speckle) or IFC model -- in the solid-model tables
+Store an imported building model -- an authored reference plan, a Revit
+(via Speckle) or an IFC model -- in the solid-model tables
 (`io::store_solid_model()` over `ProjectDB::replace_imported_solid_model()`).
 Not a pipeline stage: no `Stage`, no `rux validate --stage` entry.
 
@@ -934,6 +934,66 @@ Mapping (`libs/reusex/include/io/speckle_revit.hpp`):
   "imported/revit/<kind>/<Revit applicationId>")`, so a re-import of the
   same model keeps them; each record's `metadata` holds the Revit identity
   (applicationId, elementId, category, family, type, level, IfcGUID, ...).
+
+### Import write: IFC model (rux import ifc)
+
+<!-- No backticks in this heading: not a pipeline stage (see above). -->
+
+Read an IFC file (IFC2X3 / IFC4 / IFC4X3, STEP) with the native C++ core of
+web-ifc, map it with `io::ifc::import_ifc()` and store it with the
+solid-model import write above (`io::ifc::import_ifc_file()`). One
+`pipeline_log` row, stage `import_ifc` (parameters: source, file name).
+web-ifc is an optional dependency: a build without it
+(`REUSEX_HAVE_WEB_IFC` off) refuses with a clear message.
+
+| | |
+|---|---|
+| Consumes | an IFC file |
+| Produces | `storeys`, `walls`, `openings`, `spaces` rows (`source = imported`, locked, as above); meshes `imported/<IFC class slug>` (stage `import_ifc`) |
+| Checks   | the file parses and has at least one IfcBuildingStorey, else it throws and writes nothing |
+
+Mapping (`libs/reusex/include/io/ifc.hpp`; the geometric readings are the
+Revit import's, shared in `libs/reusex/src/io/bim_mapping.hpp`):
+
+- **Frame.** World is the file's world coordinate system (z up), in metres
+  (the project's length unit, `IfcSIUnit` or `IfcConversionBasedUnit`, is
+  converted; web-ifc's Y-up output is turned back). Nothing is aligned to a
+  scan. A model whose plan centre lies more than `--recenter-threshold`
+  (10 km) from the origin -- a georeferenced file -- is recentred by a
+  whole-km x / y offset, as the Revit import (`world_offset_m` in every
+  storey's metadata and every mesh's parameters; world = file - offset).
+  Storeys are the IfcBuildingStoreys, at the world z of their placement
+  (`Elevation` when there is none), sorted, in one shared level frame: the
+  lowest storey's floor at z = 0, `z_ceiling` the next storey's (the top
+  one: + `--storey-height`). Elements find their storey through
+  IfcRelContainedInSpatialStructure / IfcRelAggregates (walking up), else
+  by height (counted at warn).
+- **Walls**: IfcWall / IfcWallStandardCase / IfcWallElementedCase with a
+  straight footprint, as Revit walls: centreline of the footprint's
+  minimum-area rectangle, measured thickness, z range, `is_external` from
+  `Pset_WallCommon.IsExternal`. The IFC 'Axis' representation is not used:
+  it often runs along a layer edge (IfcMaterialLayerSetUsage offset), while
+  the solid-model axis is the centreline. Thin and non-straight walls, and
+  walls with no body left (e.g. fully voided), are mesh-only, counted at
+  warn.
+- **Openings**: IfcDoor / IfcWindow hosted through IfcRelFillsElement ->
+  IfcOpeningElement -> IfcRelVoidsElement -> an imported wall, else
+  geometrically (as Revit). Extent: the IfcOpeningElement they fill (the
+  hole), else `OverallWidth` / `OverallHeight`, else the geometry;
+  `metadata.extent_source` says which. Unhosted ones are mesh-only.
+- **Spaces**: IfcSpace; the polygon is the outline of its body's bottom
+  faces (as Revit rooms), else its 'FootPrint' curve with z from its 'Box'
+  (else its storey's floor to ceiling) -- common in ArchiCAD exports. Name =
+  `LongName`, else `Name`; kind `room`.
+- **Meshes**: every product's body (openings voided by web-ifc) merged per
+  IFC class, StandardCase / ElementedCase folded into the base class
+  (`imported/wall`, `imported/slab`, `imported/door`, ...); spatial
+  elements, opening elements, annotations and grids are left out. A
+  re-import deletes earlier `import_ifc` meshes the file no longer has;
+  `--no-meshes` writes and deletes none.
+- **Identity**: GUIDs are `uuid5(project_guid,
+  "imported/ifc/<kind>/<GlobalId>")`; each record's `metadata` holds the IFC
+  identity (GlobalId, class, Name, ObjectType, Tag, express id).
 
 ### `attributes` (`rux create attributes`)
 

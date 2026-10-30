@@ -41,6 +41,9 @@ using P2 = Eigen::Vector2d;
 struct Soup {
   std::vector<Eigen::Vector3d> v;
   std::vector<std::array<std::uint32_t, 3>> t;
+  /// A mesh of it had an invalid face list (negative / out-of-range index,
+  /// non-integer entry): the whole element is skipped.
+  bool bad = false;
 
   [[nodiscard]] bool empty() const { return t.empty(); }
   void append(const Soup &o);
@@ -71,18 +74,34 @@ struct WallFit {
 };
 WallFit fit_wall(const Soup &soup);
 
+/// What room_outline() had to leave out.
+struct OutlineDrops {
+  std::size_t pieces = 0;  ///< rings outside the largest one
+  std::size_t islands = 0; ///< rings inside a hole
+};
+
 /// Footprint of a space / room volume: the outline of its bottom faces
 /// (faces within 2 cm of @p zmin facing up or down). The largest ring is
-/// the outer boundary; rings inside it are holes, rings outside it (a
-/// second, disjoint piece) are dropped and counted in @p dropped_pieces.
-std::optional<core::SpacePolygon>
-room_outline(const Soup &soup, double zmin,
-             std::size_t *dropped_pieces = nullptr);
+/// the outer boundary and rings inside it are holes; a second, disjoint
+/// piece and an island inside a hole are not representable and are counted
+/// in @p drops.
+std::optional<core::SpacePolygon> room_outline(const Soup &soup, double zmin,
+                                               OutlineDrops &drops);
 
 /// Area, perimeter, volume (the soup's when it is plausible, else the
 /// prism), compactness of a space whose polygon, z_floor and z_ceiling are
 /// set; @p soup is its volume in world z (only its volume is read).
 void fill_space_metrics(core::SpaceRecord &s, const Soup &soup);
+
+/// The x/y offset (whole km) that recentres a model whose plan bounds are
+/// @p lo..@p hi when its plan centre lies farther than @p threshold_m from
+/// the origin and @p recenter is on, else zero; world = source - offset.
+/// Logs at warn, prefixed @p who, when it recentres and when coordinates
+/// (after the offset) still reach beyond the threshold: the stored meshes
+/// are single precision, ~1 mm only within ~1e4 m (STANDARDS §4).
+Eigen::Vector3d far_offset(const Eigen::Vector3d &lo, const Eigen::Vector3d &hi,
+                           bool recenter, double threshold_m,
+                           const std::string &who);
 
 /// The level frame every imported storey shares: world -> level is a
 /// translation by -z0 (the lowest storey's floor at z = 0).
@@ -111,7 +130,7 @@ std::optional<std::size_t> find_host(const std::vector<HostWall> &walls,
                                      const P2 &centre, double z_lo, double z_hi,
                                      double tolerance);
 
-/// The opening's extent along its host's axis, clamped to the wall's run.
+/// The opening's extent along its host's axis (not clamped to its run).
 std::pair<double, double> span_on(const HostWall &host, const Soup &soup);
 
 // ------------------------------------------------------------- identity ---
@@ -137,6 +156,10 @@ class MeshMerger {
   /// @p slug empty = mesh_slug(category).
   void add(const std::string &category, const Soup &soup,
            const std::string &slug = {});
+  /// Grow @p lo / @p hi by every merged vertex.
+  void extend(Eigen::Vector3d &lo, Eigen::Vector3d &hi) const;
+  /// Subtract @p offset from every merged vertex.
+  void shift(const Eigen::Vector3d &offset);
   /// The merged meshes, sorted by name ("imported/<slug>").
   std::vector<ImportedMesh> take();
 

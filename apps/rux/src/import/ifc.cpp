@@ -30,12 +30,21 @@ DESCRIPTION:
                            imported/wall, imported/slab, imported/door)
   Records are stored as source = imported, locked; a re-import replaces the
   earlier imported rows (docs/CONTRACTS.md, "Import write: IFC model").
-  Coordinates stay in the file's world frame, in metres, unless --recenter
-  moves the model's plan centre to the origin (georeferenced files).
+  Coordinates stay in the file's world frame, in metres; a model whose plan
+  centre lies beyond --recenter-threshold (georeferenced files) is moved by
+  a whole-km x/y offset, kept as world_offset_m in every storey's metadata
+  and mesh's parameters (world = file - offset).
+
+NOTES:
+  - Spaces without a body take their outline from the 'FootPrint'
+    representation and their height from the 'Box'.
+  - Door / window extents come from the IfcOpeningElement they fill (else
+    OverallWidth / OverallHeight, else the geometry).
+  - --no-meshes writes no mesh and deletes none.
 
 EXAMPLES:
   rux -p house.rux import ifc house.ifc
-  rux -p house.rux import ifc site.ifc --recenter
+  rux -p house.rux import ifc site.ifc --recenter-threshold 1000
   rux -p house.rux import ifc house.ifc --no-meshes
 )");
 
@@ -46,15 +55,15 @@ EXAMPLES:
   sub->add_flag("--no-meshes", opt->no_meshes,
                 "Store only the solid-model records; existing imported "
                 "meshes are left as they are");
-  sub->add_flag("--recenter", opt->import.recenter,
-                "Translate the model's plan centre (rounded to 1 m) to the "
-                "origin; the offset is kept in the metadata");
   sub->add_option("--storey-height", opt->import.default_storey_height_m,
                   "Height of the top storey [m]")
       ->default_val(defaults.default_storey_height_m);
   sub->add_option("--min-wall-thickness", opt->import.min_wall_thickness_m,
                   "Thinner walls (finish layers) get no wall record [m]")
       ->default_val(defaults.min_wall_thickness_m);
+  sub->add_option("--recenter-threshold", opt->import.recenter_threshold_m,
+                  "Recentre a model farther than this from the origin [m]")
+      ->default_val(defaults.recenter_threshold_m);
 
   sub->callback([opt, global_opt]() {
     spdlog::trace("calling run_subcommand_import_ifc");
@@ -86,6 +95,10 @@ int run_subcommand_import_ifc(SubcommandImportIfcOptions const &opt,
                  s.walls_thin, s.walls_not_straight, s.openings_unhosted,
                  s.spaces_no_geometry + s.spaces_bad_outline,
                  r.stored.replaced_imported);
+    spdlog::info("Spaces from a FootPrint: {}; openings sized from the void "
+                 "/ Overall* attributes: {}, from geometry: {}",
+                 s.spaces_from_footprint, s.openings_extent_params,
+                 s.openings_extent_geometry);
     if (r.stored.skipped_locked > 0)
       spdlog::warn("{} records were not written: a locked detected / manual "
                    "row holds their guid or storey idx",

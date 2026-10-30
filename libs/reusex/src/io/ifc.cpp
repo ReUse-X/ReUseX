@@ -102,8 +102,6 @@ constexpr const char *kDefaultGuidNamespace =
     "6f1e2d3c-4b5a-4987-8a6b-5c4d3e2f1a09";
 /// An opening narrower / lower than this is not an opening [m].
 constexpr double kMinOpeningM = 0.05;
-/// Coordinates beyond this warrant a warning without recenter [m].
-constexpr double kFarFromOriginM = 1e4;
 /// Depth limit of the spatial tree walk.
 constexpr int kMaxSpatialDepth = 32;
 
@@ -633,39 +631,33 @@ IfcImport import_ifc(const std::filesystem::path &file,
                "no geometry",
                failed);
 
-  // ---- world offset (recenter) and the far-from-origin check
+  // ---- precision: recentre a model far from the origin (STANDARDS §4),
+  // as the Revit import does. Records are computed in double; the stored
+  // meshes are float.
   {
-    double lo_x = std::numeric_limits<double>::infinity(), hi_x = -lo_x,
-           lo_y = lo_x, hi_y = -lo_x;
+    Eigen::Vector3d lo = Eigen::Vector3d::Constant(
+                        std::numeric_limits<double>::infinity()),
+                    hi = -lo;
     for (const auto *group : {&walls, &openings, &spaces, &others})
-      for (const auto &p : *group)
-        for (const auto &v : p.geom.v) {
-          lo_x = std::min(lo_x, v.x());
-          hi_x = std::max(hi_x, v.x());
-          lo_y = std::min(lo_y, v.y());
-          hi_y = std::max(hi_y, v.y());
-        }
-    if (std::isfinite(lo_x)) {
-      const double cx = std::round(0.5 * (lo_x + hi_x));
-      const double cy = std::round(0.5 * (lo_y + hi_y));
-      const double far = std::max(
-          {std::abs(lo_x), std::abs(hi_x), std::abs(lo_y), std::abs(hi_y)});
-      if (opt.recenter && (cx != 0.0 || cy != 0.0)) {
-        st.offset_m = {-cx, -cy, 0.0};
-        const Eigen::Vector3d d(-cx, -cy, 0.0);
-        for (auto *group : {&walls, &openings, &spaces, &others})
-          for (auto &p : *group)
-            for (auto &v : p.geom.v)
-              v += d;
-        core::info("import_ifc: recentred by ({:+.0f}, {:+.0f}) m", -cx, -cy);
-      } else if (!opt.recenter && far > kFarFromOriginM) {
-        core::warn("import_ifc: coordinates reach {:.0f} m from the origin "
-                   "(georeferenced?); the stored meshes are single precision "
-                   "there -- consider recentring (--recenter)",
-                   far);
+      for (const auto &p : *group) {
+        if (p.geom.empty())
+          continue;
+        const auto [plo, phi] = p.geom.bounds();
+        lo = lo.cwiseMin(plo);
+        hi = hi.cwiseMax(phi);
       }
+    const Eigen::Vector3d off = bim::far_offset(
+        lo, hi, opt.recenter, opt.recenter_threshold_m, "import_ifc");
+    if (!off.isZero()) {
+      for (auto *group : {&walls, &openings, &spaces, &others})
+        for (auto &p : *group)
+          for (auto &v : p.geom.v)
+            v -= off;
+      st.world_offset_m = {off.x(), off.y(), off.z()};
     }
   }
+  const Eigen::Vector3d world_offset(st.world_offset_m[0], st.world_offset_m[1],
+                                     st.world_offset_m[2]);
 
   // ---- storey records: one shared level frame, the lowest floor at z = 0
   const double z0 = storeys.front().z;
@@ -687,7 +679,7 @@ IfcImport import_ifc(const std::filesystem::path &file,
     json md = {{"ifc", identity(s.p)},
                {"z_world_m", s.z},
                {"z_source", s.z_source},
-               {"offset_m", st.offset_m}};
+               {"world_offset_m", st.world_offset_m}};
     if (!s.long_name.empty())
       md["ifc"]["LongName"] = s.long_name;
     if (s.elevation_m)
@@ -769,12 +761,14 @@ IfcImport import_ifc(const std::filesystem::path &file,
     core::warn("import_ifc: {} walls have no geometry; skipped",
                st.walls_no_geometry);
 
-  // ---- openings (doors, windows)
+  // ---- openings (doors, windows). Extent: the IfcOpeningElement the
+  // element fills (the hole in the wall, as Revit's rough opening), else
+  // the element's OverallWidth / OverallHeight (width centred on its extent
+  // along the host, height from its bottom), else its geometry (which
+  // includes frames and linings).
   std::unordered_map<uint32_t, Soup> void_geom;
   for (std::size_t oi = 0; oi < openings.size(); ++oi) {
     const auto &p = openings[oi];
-    // The void it fills is the hole itself; the door / window body may
-    // carry a lining or sill beyond it.
     const Soup *span = &p.geom;
     std::optional<std::size_t> host;
     bool by_relation = false;
@@ -783,7 +777,7 @@ IfcImport import_ifc(const std::filesystem::path &file,
       if (fresh) {
         it->second = soup_of(o->second, nullptr);
         for (auto &v : it->second.v)
-          v += Eigen::Vector3d(st.offset_m[0], st.offset_m[1], 0.0);
+          v -= world_offset;
       }
       if (!it->second.empty())
         span = &it->second;
@@ -806,8 +800,33 @@ IfcImport import_ifc(const std::filesystem::path &file,
       ++st.openings_unhosted;
       continue;
     }
-    const auto [s_lo, s_hi] = bim::span_on(hosts[*host], *span);
-    if (s_hi - s_lo < kMinOpeningM || hi.z() - lo.z() < kMinOpeningM) {
+    const auto &g = hosts[*host];
+    auto [s_lo, s_hi] = bim::span_on(g, *span);
+    double z_lo = lo.z(), z_hi = hi.z();
+    std::string s_source = "geometry", z_source = "geometry";
+    if (span != &p.geom) {
+      s_source = z_source = "IfcOpeningElement";
+    } else {
+      // IfcDoor / IfcWindow: OverallHeight (8), OverallWidth (9).
+      const auto height = r.real(p.id, 8);
+      const auto width = r.real(p.id, 9);
+      if (width && *width > 0) {
+        const double sc = 0.5 * (s_lo + s_hi);
+        s_lo = sc - 0.5 * *width * unit;
+        s_hi = sc + 0.5 * *width * unit;
+        s_source = "OverallWidth";
+      }
+      if (height && *height > 0) {
+        z_hi = z_lo + *height * unit;
+        z_source = "OverallHeight";
+      }
+    }
+    s_lo = std::clamp(s_lo, 0.0, g.length);
+    s_hi = std::clamp(s_hi, 0.0, g.length);
+    (s_source == "geometry" && z_source == "geometry"
+         ? st.openings_extent_geometry
+         : st.openings_extent_params)++;
+    if (s_hi - s_lo < kMinOpeningM || z_hi - z_lo < kMinOpeningM) {
       ++st.openings_unhosted;
       continue;
     }
@@ -818,12 +837,12 @@ IfcImport import_ifc(const std::filesystem::path &file,
     rec.kind = is_door(type_of[p.id]) ? "door" : "window";
     rec.s_start = s_lo;
     rec.s_end = s_hi;
-    rec.z_sill = lo.z() - z0;
-    rec.z_head = hi.z() - z0;
+    rec.z_sill = z_lo - z0;
+    rec.z_head = z_hi - z0;
     rec.is_external = wall.is_external;
     json md = {{"ifc", identity(p)},
                {"host", by_relation ? "IfcRelFillsElement" : "geometry"},
-               {"extent", span == &p.geom ? "element" : "opening"}};
+               {"extent_source", {{"s", s_source}, {"z", z_source}}}};
     rec.metadata = md.dump();
     (by_relation ? st.openings_by_relation : st.openings_by_geometry)++;
     out.model.openings.push_back(std::move(rec));
@@ -845,7 +864,10 @@ IfcImport import_ifc(const std::filesystem::path &file,
     int storey = -1;
     if (!p.geom.empty()) {
       const auto [zlo, zhi] = p.geom.z_range();
-      auto poly = bim::room_outline(p.geom, zlo, &st.space_pieces_dropped);
+      bim::OutlineDrops drops;
+      auto poly = bim::room_outline(p.geom, zlo, drops);
+      st.space_pieces_dropped += drops.pieces;
+      st.space_islands_dropped += drops.islands;
       if (!poly) {
         ++st.spaces_bad_outline;
         continue;
@@ -857,7 +879,7 @@ IfcImport import_ifc(const std::filesystem::path &file,
     } else if (auto fp = space_footprint(p.id)) {
       for (const auto &q : fp->ring)
         s.polygon.outer.push_back(
-            {q.x() + st.offset_m[0], q.y() + st.offset_m[1]});
+            {q.x() - world_offset.x(), q.y() - world_offset.y()});
       if (fp->z) {
         s.z_floor = fp->z->first - z0;
         s.z_ceiling = fp->z->second - z0;
@@ -897,10 +919,11 @@ IfcImport import_ifc(const std::filesystem::path &file,
     core::warn("import_ifc: {} IfcSpaces have a body without a closed bottom "
                "outline; skipped",
                st.spaces_bad_outline);
-  if (st.space_pieces_dropped > 0)
-    core::warn("import_ifc: {} disjoint footprint pieces of IfcSpaces were "
-               "dropped (each space keeps its largest piece)",
-               st.space_pieces_dropped);
+  if (st.space_pieces_dropped + st.space_islands_dropped > 0)
+    core::warn("import_ifc: space outlines left out {} disjoint pieces (only "
+               "the largest piece of a space is kept) and {} islands inside "
+               "holes",
+               st.space_pieces_dropped, st.space_islands_dropped);
   if (st.elements_no_storey > 0)
     core::warn("import_ifc: {} elements are in no IfcBuildingStorey; placed "
                "on the storey their bottom stands in",
@@ -927,9 +950,7 @@ IfcImport import_ifc(const std::filesystem::path &file,
 IfcFileImportResult import_ifc_file(ProjectDB &db,
                                     const std::filesystem::path &file,
                                     const IfcImportOptions &opt) {
-  const json source = {{"source", "ifc"},
-                       {"file", file.filename().string()},
-                       {"recenter", opt.recenter}};
+  const json source = {{"source", "ifc"}, {"file", file.filename().string()}};
   const int log_id = db.log_pipeline_start("import_ifc", source.dump());
   IfcFileImportResult res;
   try {
@@ -944,10 +965,8 @@ IfcFileImportResult import_ifc_file(ProjectDB &db,
     if (opt.meshes) {
       json params = source;
       params["schema"] = res.stats.schema;
-      params["frame"] = res.stats.offset_m == std::array<double, 3>{0, 0, 0}
-                            ? "ifc_world"
-                            : "ifc_world_recentred";
-      params["offset_m"] = res.stats.offset_m;
+      params["frame"] = "ifc_world";
+      params["world_offset_m"] = res.stats.world_offset_m;
       const auto w =
           bim::write_meshes(db, imported.meshes, "import_ifc", params);
       res.meshes_saved = w.saved;

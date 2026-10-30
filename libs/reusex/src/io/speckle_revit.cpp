@@ -4,19 +4,15 @@
 
 #include "io/speckle_revit.hpp"
 
+#include "bim_mapping.hpp"
+
 #include "core/ProjectDB.hpp"
-#include "core/guid.hpp"
 #include "core/logging.hpp"
-#include "core/space_polygon.hpp"
 
 #include <Eigen/Core>
 #include <Eigen/Geometry>
 
 #include <fmt/format.h>
-#include <pcl/PolygonMesh.h>
-#include <pcl/conversions.h>
-#include <pcl/point_cloud.h>
-#include <pcl/point_types.h>
 
 #include <algorithm>
 #include <cctype>
@@ -25,7 +21,6 @@
 #include <limits>
 #include <map>
 #include <optional>
-#include <set>
 #include <stdexcept>
 #include <unordered_map>
 #include <utility>
@@ -42,10 +37,6 @@ constexpr const char *kDefaultGuidNamespace =
     "3d1c7a9e-5b0f-4e2a-9c4d-7f6e2b8a1c35";
 
 constexpr int kMaxInstanceDepth = 8;
-/// Tolerance for "on the bottom of a room volume" [m].
-constexpr double kRoomBottomTolM = 0.02;
-/// Plan-point weld grid for room outlines [m].
-constexpr double kWeldM = 1e-4;
 /// An opening narrower than this along its host is not an opening [m].
 constexpr double kMinOpeningWidthM = 0.05;
 
@@ -169,32 +160,8 @@ std::string property_string(const json &element, const char *key) {
 
 // ------------------------------------------------------------- geometry ---
 
-/// A triangle soup in world metres.
-struct Soup {
-  std::vector<Eigen::Vector3d> v;
-  std::vector<std::array<std::uint32_t, 3>> t;
-  /// A mesh of it had an invalid face list (negative / out-of-range index,
-  /// non-integer entry): the whole element is skipped.
-  bool bad = false;
-
-  [[nodiscard]] bool empty() const { return t.empty(); }
-
-  void append(const Soup &o) {
-    const auto base = static_cast<std::uint32_t>(v.size());
-    v.insert(v.end(), o.v.begin(), o.v.end());
-    for (const auto &tri : o.t)
-      t.push_back({tri[0] + base, tri[1] + base, tri[2] + base});
-  }
-
-  [[nodiscard]] std::pair<double, double> z_range() const {
-    double lo = std::numeric_limits<double>::infinity(), hi = -lo;
-    for (const auto &p : v) {
-      lo = std::min(lo, p.z());
-      hi = std::max(hi, p.z());
-    }
-    return {lo, hi};
-  }
-};
+using bim::P2;
+using bim::Soup;
 
 struct Geometry {
   std::unordered_map<std::string, const json *> by_app_id;
@@ -334,286 +301,6 @@ struct Geometry {
   }
 };
 
-// ----------------------------------------------------------- 2D helpers ---
-
-using P2 = Eigen::Vector2d;
-
-double cross2(const P2 &o, const P2 &a, const P2 &b) {
-  return (a.x() - o.x()) * (b.y() - o.y()) - (a.y() - o.y()) * (b.x() - o.x());
-}
-
-/// Convex hull (Andrew's monotone chain), counter-clockwise, no repeats.
-std::vector<P2> convex_hull(std::vector<P2> pts) {
-  std::sort(pts.begin(), pts.end(), [](const P2 &a, const P2 &b) {
-    return a.x() < b.x() || (a.x() == b.x() && a.y() < b.y());
-  });
-  pts.erase(std::unique(pts.begin(), pts.end(),
-                        [](const P2 &a, const P2 &b) {
-                          return (a - b).squaredNorm() < 1e-14;
-                        }),
-            pts.end());
-  if (pts.size() < 3)
-    return pts;
-  std::vector<P2> h(2 * pts.size());
-  std::size_t k = 0;
-  for (const auto &p : pts) {
-    while (k >= 2 && cross2(h[k - 2], h[k - 1], p) <= 0)
-      --k;
-    h[k++] = p;
-  }
-  for (std::size_t i = pts.size() - 1, t = k + 1; i-- > 0;) {
-    while (k >= t && cross2(h[k - 2], h[k - 1], pts[i]) <= 0)
-      --k;
-    h[k++] = pts[i];
-  }
-  h.resize(k - 1);
-  return h;
-}
-
-double ring_area(const std::vector<P2> &r) { // signed, CCW > 0
-  double a = 0.0;
-  for (std::size_t i = 0; i < r.size(); ++i) {
-    const auto &p = r[i];
-    const auto &q = r[(i + 1) % r.size()];
-    a += p.x() * q.y() - q.x() * p.y();
-  }
-  return 0.5 * a;
-}
-
-double ring_length(const std::vector<P2> &r) {
-  double l = 0.0;
-  for (std::size_t i = 0; i < r.size(); ++i)
-    l += (r[(i + 1) % r.size()] - r[i]).norm();
-  return l;
-}
-
-/// Drop vertices on a straight line between their neighbours.
-std::vector<P2> simplify_ring(std::vector<P2> r) {
-  bool changed = true;
-  while (changed && r.size() > 3) {
-    changed = false;
-    for (std::size_t i = 0; i < r.size() && r.size() > 3; ++i) {
-      const P2 &a = r[(i + r.size() - 1) % r.size()];
-      const P2 &b = r[i];
-      const P2 &c = r[(i + 1) % r.size()];
-      const double len = (c - a).norm();
-      const double dist =
-          len > 0 ? std::abs(cross2(a, b, c)) / len : (b - a).norm();
-      if (dist < 1e-4 || (b - a).norm() < 1e-6) {
-        r.erase(r.begin() + static_cast<std::ptrdiff_t>(i));
-        changed = true;
-        --i;
-      }
-    }
-  }
-  return r;
-}
-
-/// The straight-wall reading of a footprint: the minimum-area rectangle of
-/// its convex hull.
-struct WallFit {
-  bool ok = false;
-  P2 u{1, 0}, v{0, 1};
-  double s_lo = 0, s_hi = 0, t_lo = 0, t_hi = 0;
-  double fill = 0.0; ///< hull area / rectangle area
-};
-
-WallFit fit_wall(const Soup &soup) {
-  std::vector<P2> pts;
-  pts.reserve(soup.v.size());
-  for (const auto &p : soup.v)
-    pts.emplace_back(p.x(), p.y());
-  const auto hull = convex_hull(std::move(pts));
-  WallFit best;
-  if (hull.size() < 3)
-    return best;
-  double best_area = std::numeric_limits<double>::infinity();
-  for (std::size_t i = 0; i < hull.size(); ++i) {
-    P2 e = hull[(i + 1) % hull.size()] - hull[i];
-    if (e.norm() < 1e-9)
-      continue;
-    e.normalize();
-    const P2 n(-e.y(), e.x());
-    double s0 = 1e300, s1 = -1e300, t0 = 1e300, t1 = -1e300;
-    for (const auto &p : hull) {
-      s0 = std::min(s0, p.dot(e));
-      s1 = std::max(s1, p.dot(e));
-      t0 = std::min(t0, p.dot(n));
-      t1 = std::max(t1, p.dot(n));
-    }
-    const double area = (s1 - s0) * (t1 - t0);
-    if (area < best_area - 1e-12) {
-      best_area = area;
-      best.ok = true;
-      best.u = e;
-      best.v = n;
-      best.s_lo = s0;
-      best.s_hi = s1;
-      best.t_lo = t0;
-      best.t_hi = t1;
-    }
-  }
-  if (!best.ok)
-    return best;
-  // The long side is the axis.
-  if (best.t_hi - best.t_lo > best.s_hi - best.s_lo) {
-    const P2 u = best.v, v = -best.u;
-    const double s_lo = best.t_lo, s_hi = best.t_hi;
-    const double t_lo = -best.s_hi, t_hi = -best.s_lo;
-    best.u = u;
-    best.v = v;
-    best.s_lo = s_lo;
-    best.s_hi = s_hi;
-    best.t_lo = t_lo;
-    best.t_hi = t_hi;
-  }
-  // Canonical direction: +x, else +y.
-  if (best.u.x() < -1e-9 || (std::abs(best.u.x()) <= 1e-9 && best.u.y() < 0)) {
-    best.u = -best.u;
-    best.v = -best.v;
-    std::swap(best.s_lo, best.s_hi);
-    best.s_lo = -best.s_lo;
-    best.s_hi = -best.s_hi;
-    std::swap(best.t_lo, best.t_hi);
-    best.t_lo = -best.t_lo;
-    best.t_hi = -best.t_hi;
-  }
-  best.fill = best_area > 0 ? std::abs(ring_area(hull)) / best_area : 0.0;
-  return best;
-}
-
-/// Footprint of a room volume: the outline of its bottom faces.
-/// What room_outline() had to leave out.
-struct OutlineDrops {
-  std::size_t pieces = 0;  ///< rings outside the largest one
-  std::size_t islands = 0; ///< rings inside a hole
-};
-
-std::optional<core::SpacePolygon> room_outline(const Soup &soup, double zmin,
-                                               OutlineDrops &drops) {
-  // Welded plan vertices of the bottom faces.
-  std::map<std::pair<long long, long long>, std::uint32_t> weld;
-  std::vector<P2> pts;
-  auto key_of = [&](const Eigen::Vector3d &p) -> std::uint32_t {
-    const std::pair<long long, long long> k{std::llround(p.x() / kWeldM),
-                                            std::llround(p.y() / kWeldM)};
-    auto [it, fresh] = weld.emplace(k, static_cast<std::uint32_t>(pts.size()));
-    if (fresh)
-      pts.emplace_back(p.x(), p.y());
-    return it->second;
-  };
-  std::map<std::pair<std::uint32_t, std::uint32_t>, int> edges;
-  for (const auto &t : soup.t) {
-    const auto &a = soup.v[t[0]], &b = soup.v[t[1]], &c = soup.v[t[2]];
-    if (a.z() > zmin + kRoomBottomTolM || b.z() > zmin + kRoomBottomTolM ||
-        c.z() > zmin + kRoomBottomTolM)
-      continue;
-    const Eigen::Vector3d n = (b - a).cross(c - a);
-    if (n.norm() < 1e-12 || std::abs(n.normalized().z()) < 0.9)
-      continue;
-    const std::uint32_t ia = key_of(a), ib = key_of(b), ic = key_of(c);
-    if (ia == ib || ib == ic || ia == ic)
-      continue;
-    for (auto [p, q] :
-         {std::pair{ia, ib}, std::pair{ib, ic}, std::pair{ic, ia}})
-      ++edges[{std::min(p, q), std::max(p, q)}];
-  }
-  // Boundary edges (used by one bottom face) form the rings.
-  std::multimap<std::uint32_t, std::uint32_t> adj;
-  for (const auto &[e, n] : edges)
-    if (n == 1) {
-      adj.emplace(e.first, e.second);
-      adj.emplace(e.second, e.first);
-    }
-  std::vector<std::vector<P2>> rings;
-  while (!adj.empty()) {
-    const std::uint32_t start = adj.begin()->first;
-    std::vector<std::uint32_t> ring{start};
-    std::uint32_t cur = start;
-    bool closed = false;
-    for (std::size_t guard = 0; guard <= edges.size(); ++guard) {
-      auto it = adj.find(cur);
-      if (it == adj.end())
-        break;
-      const std::uint32_t next = it->second;
-      adj.erase(it);
-      // Remove the reverse half-edge.
-      for (auto r = adj.lower_bound(next); r != adj.end() && r->first == next;
-           ++r)
-        if (r->second == cur) {
-          adj.erase(r);
-          break;
-        }
-      if (next == start) {
-        closed = true;
-        break;
-      }
-      ring.push_back(next);
-      cur = next;
-    }
-    if (!closed || ring.size() < 3)
-      continue;
-    std::vector<P2> r;
-    r.reserve(ring.size());
-    for (auto i : ring)
-      r.push_back(pts[i]);
-    r = simplify_ring(std::move(r));
-    if (r.size() >= 3 && std::abs(ring_area(r)) > 1e-6)
-      rings.push_back(std::move(r));
-  }
-  if (rings.empty())
-    return std::nullopt;
-  std::sort(rings.begin(), rings.end(), [](const auto &a, const auto &b) {
-    return std::abs(ring_area(a)) > std::abs(ring_area(b));
-  });
-  auto inside = [](const std::vector<P2> &poly, const P2 &p) {
-    bool in = false;
-    for (std::size_t i = 0, j = poly.size() - 1; i < poly.size(); j = i++) {
-      const P2 &a = poly[i], &b = poly[j];
-      if ((a.y() > p.y()) != (b.y() > p.y()) &&
-          p.x() < (b.x() - a.x()) * (p.y() - a.y()) / (b.y() - a.y()) + a.x())
-        in = !in;
-    }
-    return in;
-  };
-  core::SpacePolygon poly;
-  auto outer = rings.front();
-  if (ring_area(outer) < 0)
-    std::reverse(outer.begin(), outer.end());
-  for (const auto &p : outer)
-    poly.outer.push_back({p.x(), p.y()});
-  std::vector<std::vector<P2>> holes;
-  for (std::size_t i = 1; i < rings.size(); ++i) {
-    auto h = rings[i];
-    if (!inside(outer, h.front())) {
-      ++drops.pieces; // a second, disjoint piece
-      continue;
-    }
-    // Rings are sorted by area, so a ring inside an earlier hole is an
-    // island (e.g. a room part enclosed by a column ring): not representable.
-    if (std::any_of(holes.begin(), holes.end(),
-                    [&](const auto &hh) { return inside(hh, h.front()); })) {
-      ++drops.islands;
-      continue;
-    }
-    holes.push_back(h);
-    if (ring_area(h) > 0)
-      std::reverse(h.begin(), h.end());
-    std::vector<core::PlanPoint> hole;
-    for (const auto &p : h)
-      hole.push_back({p.x(), p.y()});
-    poly.holes.push_back(std::move(hole));
-  }
-  return poly;
-}
-
-std::vector<P2> to_p2(const std::vector<core::PlanPoint> &r) {
-  std::vector<P2> out;
-  for (const auto &p : r)
-    out.emplace_back(p[0], p[1]);
-  return out;
-}
-
 // ---------------------------------------------------------------- misc ---
 
 struct Level {
@@ -652,19 +339,7 @@ json revit_identity(const Element &e) {
 } // namespace
 
 std::string category_slug(const std::string &category) {
-  std::string out;
-  bool sep = false;
-  for (unsigned char c : category) {
-    if (std::isalnum(c) && c < 128) {
-      if (sep && !out.empty())
-        out += '_';
-      out += static_cast<char>(std::tolower(c));
-      sep = false;
-    } else {
-      sep = true;
-    }
-  }
-  return out.empty() ? std::string("uncategorized") : out;
+  return mesh_slug(category);
 }
 
 RevitImport import_revit(const json &root, const RevitImportOptions &opt) {
@@ -678,17 +353,7 @@ RevitImport import_revit(const json &root, const RevitImportOptions &opt) {
   auto &st = out.stats;
   const std::string ns =
       opt.guid_namespace.empty() ? kDefaultGuidNamespace : opt.guid_namespace;
-  std::set<std::string> used_guids;
-  auto guid_for = [&](const std::string &kind, const std::string &key,
-                      std::size_t index) {
-    std::string name = key.empty()
-                           ? fmt::format("imported/revit/{}/#{}", kind, index)
-                           : fmt::format("imported/revit/{}/{}", kind, key);
-    std::string g = core::deterministic_guid(ns, name);
-    for (int k = 2; !used_guids.insert(g).second; ++k)
-      g = core::deterministic_guid(ns, fmt::format("{}#{}", name, k));
-    return g;
-  };
+  bim::GuidAllocator guid_for(ns, "imported/revit");
 
   Geometry geo;
   geo.root_scale = units_of(root, 0.0);
@@ -738,8 +403,7 @@ RevitImport import_revit(const json &root, const RevitImportOptions &opt) {
 
   // ---- elements and their geometry
   std::vector<Element> walls, openings, rooms;
-  std::map<std::string, std::pair<std::string, Soup>> by_slug; // meshes
-  std::map<std::string, std::size_t> mesh_elements;
+  bim::MeshMerger merger; // per-category meshes
   std::function<void(const json &, const std::string &)> walk =
       [&](const json &node, const std::string &parent) {
         if (node.is_array()) {
@@ -771,13 +435,8 @@ RevitImport import_revit(const json &root, const RevitImportOptions &opt) {
           }
           if (e.geom.empty())
             ++st.elements_no_geometry;
-          else if (opt.meshes && e.category != "Rooms") {
-            auto &[cat, soup] = by_slug[category_slug(e.category)];
-            if (cat.empty())
-              cat = e.category;
-            soup.append(e.geom);
-            ++mesh_elements[category_slug(e.category)];
-          }
+          else if (opt.meshes && e.category != "Rooms")
+            merger.add(e.category, e.geom);
           if (e.category == "Walls")
             walls.push_back(std::move(e));
           else if (e.category == "Doors" || e.category == "Windows")
@@ -803,47 +462,24 @@ RevitImport import_revit(const json &root, const RevitImportOptions &opt) {
     Eigen::Vector3d lo = Eigen::Vector3d::Constant(
                         std::numeric_limits<double>::infinity()),
                     hi = -lo;
-    auto grow = [&](const Soup &soup) {
-      for (const auto &p : soup.v) {
-        lo = lo.cwiseMin(p);
-        hi = hi.cwiseMax(p);
-      }
-    };
     for (const auto *list : {&walls, &openings, &rooms})
-      for (const auto &e : *list)
-        grow(e.geom);
-    for (const auto &[slug, cs] : by_slug)
-      grow(cs.second);
-    if (lo.x() <= hi.x()) {
-      const Eigen::Vector3d c = 0.5 * (lo + hi);
-      if (opt.recenter && std::hypot(c.x(), c.y()) > opt.recenter_threshold_m) {
-        const Eigen::Vector3d off(std::round(c.x() / 1000.0) * 1000.0,
-                                  std::round(c.y() / 1000.0) * 1000.0, 0.0);
-        auto shift = [&](Soup &soup) {
-          for (auto &p : soup.v)
-            p -= off;
-        };
-        for (auto *list : {&walls, &openings, &rooms})
-          for (auto &e : *list)
-            shift(e.geom);
-        for (auto &[slug, cs] : by_slug)
-          shift(cs.second);
-        st.world_offset_m = {off.x(), off.y(), off.z()};
-        lo -= off;
-        hi -= off;
-        core::warn("import_revit: the model lies {:.0f} m from the origin; "
-                   "recentred by ({:.0f}, {:.0f}) m (world = Revit internal "
-                   "- world_offset_m, kept in every record's metadata and "
-                   "mesh parameters)",
-                   std::hypot(c.x(), c.y()), off.x(), off.y());
+      for (const auto &e : *list) {
+        if (e.geom.empty())
+          continue;
+        const auto [elo, ehi] = e.geom.bounds();
+        lo = lo.cwiseMin(elo);
+        hi = hi.cwiseMax(ehi);
       }
-      const double far =
-          std::max(lo.cwiseAbs().maxCoeff(), hi.cwiseAbs().maxCoeff());
-      if (far > opt.recenter_threshold_m)
-        core::warn("import_revit: coordinates reach {:.0f} m from the "
-                   "origin; stored (float) meshes lose precision beyond "
-                   "{:.0f} m",
-                   far, opt.recenter_threshold_m);
+    merger.extend(lo, hi);
+    const Eigen::Vector3d off = bim::far_offset(
+        lo, hi, opt.recenter, opt.recenter_threshold_m, "import_revit");
+    if (!off.isZero()) {
+      for (auto *list : {&walls, &openings, &rooms})
+        for (auto &e : *list)
+          for (auto &p : e.geom.v)
+            p -= off;
+      merger.shift(off);
+      st.world_offset_m = {off.x(), off.y(), off.z()};
     }
   }
   st.instance_proxies = geo.proxies;
@@ -949,7 +585,7 @@ RevitImport import_revit(const json &root, const RevitImportOptions &opt) {
         i + 1 < storey_levels.size()
             ? storey_levels[i + 1].elevation_m + st.elevation_offset_m - z0
             : s.z_floor + opt.default_storey_height_m;
-    s.level_transform = {1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, -z0, 0, 0, 0, 1};
+    s.level_transform = bim::level_frame(z0);
     s.guid =
         guid_for("storeys", l.app_id.empty() ? "name:" + l.name : l.app_id, i);
     json md = {{"revit",
@@ -982,11 +618,7 @@ RevitImport import_revit(const json &root, const RevitImportOptions &opt) {
   };
 
   // ---- walls
-  struct WallGeom {
-    P2 p0, u, v;
-    double length = 0, half = 0;
-  };
-  std::vector<WallGeom> wall_geom;
+  std::vector<bim::HostWall> wall_geom;
   std::unordered_map<std::string, std::size_t> wall_by_app;
   for (std::size_t wi = 0; wi < walls.size(); ++wi) {
     const auto &e = walls[wi];
@@ -994,7 +626,7 @@ RevitImport import_revit(const json &root, const RevitImportOptions &opt) {
       ++st.walls_no_geometry;
       continue;
     }
-    const WallFit fit = fit_wall(e.geom);
+    const bim::WallFit fit = bim::fit_wall(e.geom);
     const auto width = param_length(*e.obj, "WALL_ATTR_WIDTH_PARAM",
                                     units_of(*e.obj, geo.root_scale));
     const double measured = fit.t_hi - fit.t_lo;
@@ -1008,20 +640,10 @@ RevitImport import_revit(const json &root, const RevitImportOptions &opt) {
       ++st.walls_not_straight;
       continue;
     }
-    const auto [zlo, zhi] = e.geom.z_range();
-    const double tc = 0.5 * (fit.t_lo + fit.t_hi);
-    const P2 a = fit.s_lo * fit.u + tc * fit.v;
-    const P2 b = fit.s_hi * fit.u + tc * fit.v;
     core::WallRecord w;
     w.guid = guid_for("walls", e.app_id, wi);
-    w.storey = storey_for(e, zlo - z0);
-    w.x0 = a.x();
-    w.y0 = a.y();
-    w.x1 = b.x();
-    w.y1 = b.y();
-    w.z_base = zlo - z0;
-    w.height = zhi - zlo;
-    w.thickness = thickness;
+    wall_geom.push_back(bim::wall_axis(fit, e.geom, thickness, z0, w));
+    w.storey = storey_for(e, w.z_base);
     const std::string function = param_string(*e.obj, "FUNCTION_PARAM");
     w.is_external = function == "Exterior";
     json md = {{"revit", revit_identity(e)},
@@ -1031,7 +653,6 @@ RevitImport import_revit(const json &root, const RevitImportOptions &opt) {
       md["revit"]["function"] = function;
     w.metadata = md.dump();
     wall_by_app.emplace(e.app_id, out.model.walls.size());
-    wall_geom.push_back({a, fit.u, fit.v, (b - a).norm(), 0.5 * thickness});
     out.model.walls.push_back(std::move(w));
   }
   out.model.provided.walls = true;
@@ -1057,11 +678,7 @@ RevitImport import_revit(const json &root, const RevitImportOptions &opt) {
       ++st.openings_unhosted;
       continue;
     }
-    Eigen::Vector3d lo = e.geom.v.front(), hi = lo;
-    for (const auto &p : e.geom.v) {
-      lo = lo.cwiseMin(p);
-      hi = hi.cwiseMax(p);
-    }
+    const auto [lo, hi] = e.geom.bounds();
     const P2 c(0.5 * (lo.x() + hi.x()), 0.5 * (lo.y() + hi.y()));
     std::optional<std::size_t> host;
     bool by_parent = false;
@@ -1073,37 +690,15 @@ RevitImport import_revit(const json &root, const RevitImportOptions &opt) {
         host = it->second;
         by_parent = true;
       }
-    if (!host) {
-      double best = std::numeric_limits<double>::infinity();
-      for (std::size_t k = 0; k < wall_geom.size(); ++k) {
-        const auto &g = wall_geom[k];
-        const double s = (c - g.p0).dot(g.u);
-        const double t = std::abs((c - g.p0).dot(g.v));
-        const double zb = out.model.walls[k].z_base + z0;
-        const double zt = zb + out.model.walls[k].height;
-        if (t > g.half + opt.opening_host_tolerance_m ||
-            s < -opt.opening_host_tolerance_m ||
-            s > g.length + opt.opening_host_tolerance_m)
-          continue;
-        if (hi.z() < zb || lo.z() > zt)
-          continue;
-        if (t < best) {
-          best = t;
-          host = k;
-        }
-      }
-    }
+    if (!host)
+      host = bim::find_host(wall_geom, c, lo.z(), hi.z(),
+                            opt.opening_host_tolerance_m);
     if (!host) {
       ++st.openings_unhosted;
       continue;
     }
     const auto &g = wall_geom[*host];
-    double s_lo = std::numeric_limits<double>::infinity(), s_hi = -s_lo;
-    for (const auto &p : e.geom.v) {
-      const double s = (P2(p.x(), p.y()) - g.p0).dot(g.u);
-      s_lo = std::min(s_lo, s);
-      s_hi = std::max(s_hi, s);
-    }
+    auto [s_lo, s_hi] = bim::span_on(g, e.geom);
     // Extents: the Revit rough opening (the hole in the wall) when the
     // family gives one, else its nominal width / height, else the
     // geometry (which includes casings and linings). The width is centred on
@@ -1195,8 +790,8 @@ RevitImport import_revit(const json &root, const RevitImportOptions &opt) {
       continue;
     }
     const auto [zlo, zhi] = e.geom.z_range();
-    OutlineDrops drops;
-    auto poly = room_outline(e.geom, zlo, drops);
+    bim::OutlineDrops drops;
+    auto poly = bim::room_outline(e.geom, zlo, drops);
     st.room_pieces_dropped += drops.pieces;
     st.room_islands_dropped += drops.islands;
     if (!poly) {
@@ -1211,18 +806,7 @@ RevitImport import_revit(const json &root, const RevitImportOptions &opt) {
     s.polygon = std::move(*poly);
     s.z_floor = zlo - z0;
     s.z_ceiling = zhi - z0;
-    s.area = core::space_polygon_area(s.polygon);
-    double perim = ring_length(to_p2(s.polygon.outer));
-    for (const auto &h : s.polygon.holes)
-      perim += ring_length(to_p2(h));
-    s.perimeter = perim;
-    double vol = 0.0;
-    for (const auto &t : e.geom.t)
-      vol += e.geom.v[t[0]].dot(e.geom.v[t[1]].cross(e.geom.v[t[2]])) / 6.0;
-    vol = std::abs(vol);
-    const double prism = s.area * (zhi - zlo);
-    s.volume = (vol > 1e-6 && vol < 1.5 * prism) ? vol : prism;
-    s.compactness = perim > 0 ? 4.0 * M_PI * s.area / (perim * perim) : -1.0;
+    bim::fill_space_metrics(s, e.geom);
     json md = {{"revit", revit_identity(e)}};
     if (auto n = param_string(*e.obj, "ROOM_NUMBER"); !n.empty())
       md["revit"]["number"] = n;
@@ -1258,18 +842,7 @@ RevitImport import_revit(const json &root, const RevitImportOptions &opt) {
                st.elements_no_storey);
 
   // ---- meshes
-  for (auto &[slug, cat_soup] : by_slug) {
-    auto &[cat, soup] = cat_soup;
-    RevitMesh m;
-    m.name = "imported/" + slug;
-    m.category = cat;
-    m.elements = mesh_elements[slug];
-    m.vertices.reserve(soup.v.size());
-    for (const auto &p : soup.v)
-      m.vertices.push_back({p.x(), p.y(), p.z()});
-    m.triangles = std::move(soup.t);
-    out.meshes.push_back(std::move(m));
-  }
+  out.meshes = merger.take();
 
   core::info("import_revit: {} elements -> {} storeys, {} walls, {} openings, "
              "{} spaces, {} meshes ({} instance proxies)",
@@ -1295,45 +868,16 @@ RevitStoreResult import_revit_into(ProjectDB &db,
     ProjectDB::Transaction tx(db);
     res.stored = store_solid_model(db, imported.model);
 
-    std::set<std::string> written;
-    for (const auto &m : imported.meshes) {
-      if (m.triangles.empty())
-        continue;
-      pcl::PointCloud<pcl::PointXYZ> cloud;
-      cloud.reserve(m.vertices.size());
-      for (const auto &v : m.vertices)
-        cloud.push_back(pcl::PointXYZ(static_cast<float>(v[0]),
-                                      static_cast<float>(v[1]),
-                                      static_cast<float>(v[2])));
-      pcl::PolygonMesh mesh;
-      pcl::toPCLPointCloud2(cloud, mesh.cloud);
-      mesh.polygons.reserve(m.triangles.size());
-      for (const auto &t : m.triangles) {
-        pcl::Vertices f;
-        f.vertices = {t[0], t[1], t[2]};
-        mesh.polygons.push_back(std::move(f));
-      }
+    // --no-meshes writes no mesh and deletes none.
+    if (mapping.meshes) {
       json params = source;
-      params["category"] = m.category;
-      params["elements"] = m.elements;
-      params["units"] = "m";
       params["frame"] = "revit_internal";
       params["world_offset_m"] = res.stats.world_offset_m;
-      db.save_mesh(m.name, mesh, "import_speckle", params.dump());
-      written.insert(m.name);
-      ++res.meshes_saved;
+      const auto w =
+          bim::write_meshes(db, imported.meshes, "import_speckle", params);
+      res.meshes_saved = w.saved;
+      res.meshes_removed = w.removed;
     }
-    // Earlier imported meshes this version no longer has -- only when this
-    // import writes meshes at all: --no-meshes leaves them alone.
-    if (mapping.meshes)
-      for (const auto &name : db.list_meshes()) {
-        if (name.rfind("imported/", 0) != 0 || written.count(name))
-          continue;
-        if (db.mesh_metadata(name).stage != "import_speckle")
-          continue;
-        db.delete_mesh(name);
-        ++res.meshes_removed;
-      }
     tx.commit();
     if (res.meshes_removed > 0)
       core::info("import_speckle_revit: removed {} meshes of an earlier "

@@ -5,6 +5,7 @@
 #pragma once
 
 #include "reusex/core/solid_model.hpp"
+#include "reusex/io/imported_mesh.hpp"
 #include "reusex/io/solid_model_json.hpp"
 #include "reusex/io/speckle_reader.hpp"
 
@@ -86,13 +87,7 @@ struct RevitImportOptions {
 };
 
 /// One merged triangle mesh (world frame, metres).
-struct RevitMesh {
-  std::string name;     ///< "imported/<category slug>"
-  std::string category; ///< Revit category, as received
-  std::vector<std::array<double, 3>> vertices;
-  std::vector<std::array<std::uint32_t, 3>> triangles;
-  std::size_t elements = 0; ///< elements that contributed geometry
-};
+using RevitMesh = ImportedMesh;
 
 struct RevitImportStats {
   std::size_t elements = 0; ///< RevitObjects seen

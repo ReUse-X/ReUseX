@@ -34,10 +34,11 @@
 /// import_ifc() and import_ifc_file() throw.
 ///
 /// Frame. World is the IFC file's own world coordinate system (z up), in
-/// metres (the project's length unit is converted). By default nothing is
-/// moved, as with the Revit import; IfcImportOptions::recenter translates
-/// the model in xy (see there). All storeys share one level frame: a
-/// translation putting the lowest storey's floor at z = 0.
+/// metres (the project's length unit is converted); nothing is aligned to a
+/// scan. A model far from the origin (georeferenced) is recentred by a
+/// whole-km x/y offset (IfcImportOptions::recenter), as the Revit import
+/// does. All storeys share one level frame: a translation putting the
+/// lowest storey's floor at z = 0.
 
 namespace reusex {
 class ProjectDB;
@@ -60,13 +61,14 @@ struct IfcImportOptions {
   /// How far an opening's centre may lie outside its host wall's faces
   /// when the host is found geometrically [m].
   double opening_host_tolerance_m = 0.30;
-  /// Translate the model in xy by minus the centre of its plan bounding
-  /// box, rounded to whole metres (z is kept), so georeferenced
-  /// coordinates (national grid, 1e5..1e7 m) keep millimetre precision in
-  /// the stored single-precision meshes. The offset is reported in the
-  /// stats and the records' / meshes' metadata. Off by default: the world
-  /// frame stays the file's, and coordinates beyond 10 km are warned about.
-  bool recenter = false;
+  /// Recentre a model whose plan centre lies farther than
+  /// recenter_threshold_m from the origin by a whole-km x/y offset
+  /// (IfcImportStats::world_offset_m; world = file - offset), so the float
+  /// meshes keep mm precision (STANDARDS §4) -- IFC files are often
+  /// georeferenced (national grid, 1e5..1e7 m). Beyond the threshold a warn
+  /// is logged either way. As the Revit import.
+  bool recenter = true;
+  double recenter_threshold_m = 1e4;
   /// Build the per-class meshes.
   bool meshes = true;
 };
@@ -74,8 +76,9 @@ struct IfcImportOptions {
 struct IfcImportStats {
   std::string schema;         ///< FILE_SCHEMA of the header, e.g. "IFC4"
   double length_unit_m = 1.0; ///< metres per file length unit
-  /// World offset applied (recenter), added to file coordinates [m].
-  std::array<double, 3> offset_m{0, 0, 0};
+  /// World = file coordinates - world_offset_m (x/y only; zero unless the
+  /// model was recentred).
+  std::array<double, 3> world_offset_m{0.0, 0.0, 0.0};
   std::size_t products = 0; ///< products read (spatial ones excluded)
   std::size_t products_no_geometry = 0;
   std::size_t storeys = 0;
@@ -87,12 +90,16 @@ struct IfcImportStats {
   std::size_t openings_by_relation = 0; ///< host via fills / voids
   std::size_t openings_by_geometry = 0; ///< host found geometrically
   std::size_t openings_unhosted = 0;
+  /// s or z from the void it fills / OverallWidth / OverallHeight
+  std::size_t openings_extent_params = 0;
+  std::size_t openings_extent_geometry = 0; ///< both from its geometry
   std::size_t spaces = 0;
   std::size_t spaces_from_footprint = 0; ///< no body: FootPrint (+ Box)
   std::size_t spaces_no_geometry = 0;    ///< neither body nor footprint
   std::size_t spaces_bad_outline = 0;
-  std::size_t space_pieces_dropped = 0; ///< disjoint footprint pieces
-  std::size_t elements_no_storey = 0;   ///< no storey via the spatial tree
+  std::size_t space_pieces_dropped = 0;  ///< disjoint outline pieces left out
+  std::size_t space_islands_dropped = 0; ///< rings inside a hole left out
+  std::size_t elements_no_storey = 0;    ///< no storey via the spatial tree
   std::map<std::string, std::size_t> classes; ///< products per IFC class
 };
 

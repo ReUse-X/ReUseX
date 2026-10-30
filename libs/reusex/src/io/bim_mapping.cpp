@@ -6,6 +6,7 @@
 
 #include "core/ProjectDB.hpp"
 #include "core/guid.hpp"
+#include "core/logging.hpp"
 #include "core/space_polygon.hpp"
 
 #include <fmt/format.h>
@@ -240,7 +241,7 @@ WallFit fit_wall(const Soup &soup) {
 }
 
 std::optional<core::SpacePolygon> room_outline(const Soup &soup, double zmin,
-                                               std::size_t *dropped_pieces) {
+                                               OutlineDrops &drops) {
   // Welded plan vertices of the bottom faces.
   std::map<std::pair<long long, long long>, std::uint32_t> weld;
   std::vector<P2> pts;
@@ -322,13 +323,21 @@ std::optional<core::SpacePolygon> room_outline(const Soup &soup, double zmin,
     std::reverse(outer.begin(), outer.end());
   for (const auto &p : outer)
     poly.outer.push_back({p.x(), p.y()});
+  std::vector<std::vector<P2>> holes;
   for (std::size_t i = 1; i < rings.size(); ++i) {
     auto h = rings[i];
     if (!inside(outer, h.front())) {
-      if (dropped_pieces)
-        ++*dropped_pieces;
-      continue; // a second, disjoint piece
+      ++drops.pieces; // a second, disjoint piece
+      continue;
     }
+    // Rings are sorted by area, so a ring inside an earlier hole is an
+    // island (e.g. a room part enclosed by a column ring): not representable.
+    if (std::any_of(holes.begin(), holes.end(),
+                    [&](const auto &hh) { return inside(hh, h.front()); })) {
+      ++drops.islands;
+      continue;
+    }
+    holes.push_back(h);
     if (ring_area(h) > 0)
       std::reverse(h.begin(), h.end());
     std::vector<core::PlanPoint> hole;
@@ -349,6 +358,30 @@ void fill_space_metrics(core::SpaceRecord &s, const Soup &soup) {
   const double prism = s.area * (s.z_ceiling - s.z_floor);
   s.volume = (vol > 1e-6 && vol < 1.5 * prism) ? vol : prism;
   s.compactness = perim > 0 ? 4.0 * M_PI * s.area / (perim * perim) : -1.0;
+}
+
+Eigen::Vector3d far_offset(const Eigen::Vector3d &lo, const Eigen::Vector3d &hi,
+                           bool recenter, double threshold_m,
+                           const std::string &who) {
+  Eigen::Vector3d off = Eigen::Vector3d::Zero();
+  if (!(lo.x() <= hi.x()))
+    return off; // nothing to measure
+  const Eigen::Vector3d c = 0.5 * (lo + hi);
+  if (recenter && std::hypot(c.x(), c.y()) > threshold_m) {
+    off = Eigen::Vector3d(std::round(c.x() / 1000.0) * 1000.0,
+                          std::round(c.y() / 1000.0) * 1000.0, 0.0);
+    core::warn("{}: the model lies {:.0f} m from the origin; recentred by "
+               "({:.0f}, {:.0f}) m (world = source - world_offset_m, kept in "
+               "every storey's metadata and mesh parameters)",
+               who, std::hypot(c.x(), c.y()), off.x(), off.y());
+  }
+  const double far = std::max((lo - off).cwiseAbs().maxCoeff(),
+                              (hi - off).cwiseAbs().maxCoeff());
+  if (far > threshold_m)
+    core::warn("{}: coordinates reach {:.0f} m from the origin; stored "
+               "(float) meshes lose precision beyond {:.0f} m",
+               who, far, threshold_m);
+  return off;
 }
 
 std::array<double, 16> level_frame(double z0) {
@@ -401,7 +434,7 @@ std::pair<double, double> span_on(const HostWall &g, const Soup &soup) {
     s_lo = std::min(s_lo, s);
     s_hi = std::max(s_hi, s);
   }
-  return {std::clamp(s_lo, 0.0, g.length), std::clamp(s_hi, 0.0, g.length)};
+  return {s_lo, s_hi};
 }
 
 // ------------------------------------------------------------- identity ---
@@ -433,6 +466,20 @@ void MeshMerger::add(const std::string &category, const Soup &soup,
     cat = category;
   merged.append(soup);
   ++elements_[slug];
+}
+
+void MeshMerger::extend(Eigen::Vector3d &lo, Eigen::Vector3d &hi) const {
+  for (const auto &[slug, cs] : by_slug_)
+    for (const auto &p : cs.second.v) {
+      lo = lo.cwiseMin(p);
+      hi = hi.cwiseMax(p);
+    }
+}
+
+void MeshMerger::shift(const Eigen::Vector3d &offset) {
+  for (auto &[slug, cs] : by_slug_)
+    for (auto &p : cs.second.v)
+      p -= offset;
 }
 
 std::vector<ImportedMesh> MeshMerger::take() {
