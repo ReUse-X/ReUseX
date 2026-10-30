@@ -906,6 +906,8 @@ import_speckle_revit(ProjectDB &db, const SpeckleRevitImportOptions &opt,
   SpeckleReader reader(opt.server_url, opt.token);
   reader.set_cancel_token(opt.cancel_token);
   reader.set_timeout_seconds(opt.timeout_s);
+  reader.set_connect_filter(opt.connect_filter);
+  reader.set_curl_setup(opt.curl_setup);
   const auto throw_if_cancelled = [&](const char *where) {
     if (opt.cancel_token && opt.cancel_token->load(std::memory_order_acquire))
       throw std::runtime_error(

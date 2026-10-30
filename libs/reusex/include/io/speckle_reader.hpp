@@ -4,6 +4,8 @@
 
 #pragma once
 
+#include "reusex/io/speckle_transport.hpp"
+
 #include <nlohmann/json.hpp>
 
 #include <atomic>
@@ -13,6 +15,7 @@
 #include <string>
 #include <string_view>
 #include <unordered_map>
+#include <utility>
 #include <vector>
 
 /// @file
@@ -228,6 +231,15 @@ class SpeckleReader {
   /// by their own 60 s).
   void set_timeout_seconds(long seconds) { timeout_s_ = seconds; }
 
+  /// Vet every connection by its resolved peer address (see ConnectFilter,
+  /// `io/speckle_transport.hpp`); also disables proxies. Empty = none.
+  void set_connect_filter(ConnectFilter filter) {
+    connect_filter_ = std::move(filter);
+  }
+  /// Configure every curl handle after the reader's own options (see
+  /// CurlSetup, `io/speckle_transport.hpp`). Empty = none.
+  void set_curl_setup(CurlSetup setup) { curl_setup_ = std::move(setup); }
+
   /// Project name and all of its models.
   [[nodiscard]] ProjectInfo query_project(const std::string &project) const;
 
@@ -268,6 +280,8 @@ class SpeckleReader {
   std::size_t max_download_bytes_ = std::size_t{4} << 30; // 4 GiB
   const std::atomic_bool *cancel_ = nullptr;
   long timeout_s_ = 0;
+  ConnectFilter connect_filter_;
+  CurlSetup curl_setup_;
 };
 
 } // namespace reusex::io::speckle

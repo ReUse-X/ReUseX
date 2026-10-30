@@ -816,7 +816,10 @@ External-format adapters only — project state itself lives in `core/ProjectDB`
   stage is refused; the CLI and the Qt client pass
   `StageExecutorOptions::local_user()`, which reads `SPECKLE_TOKEN` -- never
   from parameters; cancellable, `speckle_timeout_s`; server policy
-  `default_speckle_server_allowed()` or the `allowed_speckle_server` hook). Revit internal frame in metres, one shared level frame;
+  `default_speckle_server_allowed()` or the `allowed_speckle_server` hook;
+  transport guard `speckle_connect_filter` (vets every connection by peer
+  address, disables proxies -- ruxd's SSRF guard) and the raw
+  `speckle_curl_setup` hook, curl-free in `io/speckle_transport.hpp`). Revit internal frame in metres, one shared level frame;
   mapping rules in `docs/CONTRACTS.md` ("Import write: Revit model via
   Speckle")
 - `ifc.hpp`: IFC file -> solid model + per-class meshes through web-ifc

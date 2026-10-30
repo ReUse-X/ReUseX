@@ -6,8 +6,11 @@
 
 #include "core/logging.hpp"
 
+#include <arpa/inet.h>
 #include <curl/curl.h>
 #include <fmt/format.h>
+#include <netinet/in.h>
+#include <sys/socket.h>
 
 #include <algorithm>
 #include <atomic>
@@ -17,8 +20,10 @@
 #include <mutex>
 #include <set>
 #include <stdexcept>
+#include <string>
 #include <unordered_set>
 #include <utility>
+#include <vector>
 
 namespace reusex::io::speckle {
 
@@ -289,9 +294,59 @@ struct HttpRequest {
   const std::string *post_json = nullptr; ///< GraphQL query body, or GET
   bool long_transfer = false; ///< no total timeout, low-speed abort instead
   std::size_t max_bytes = 0;
-  const std::atomic_bool *cancel = nullptr; ///< abort when set
-  long timeout_s = 0;                       ///< overall limit; 0 = default
+  const std::atomic_bool *cancel = nullptr;      ///< abort when set
+  long timeout_s = 0;                            ///< overall limit; 0 = default
+  const ConnectFilter *connect_filter = nullptr; ///< unset/empty = none
+  const CurlSetup *curl_setup = nullptr;         ///< unset/empty = none
 };
+
+/// "1.2.3.4:443" / "[::1]:80" for a refusal message.
+std::string format_address(const sockaddr *addr, std::size_t len) {
+  char text[INET6_ADDRSTRLEN] = {};
+  if (addr->sa_family == AF_INET && len >= sizeof(sockaddr_in)) {
+    const auto *in = reinterpret_cast<const sockaddr_in *>(addr);
+    if (::inet_ntop(AF_INET, &in->sin_addr, text, sizeof text))
+      return fmt::format("{}:{}", text, ntohs(in->sin_port));
+  } else if (addr->sa_family == AF_INET6 && len >= sizeof(sockaddr_in6)) {
+    const auto *in6 = reinterpret_cast<const sockaddr_in6 *>(addr);
+    if (::inet_ntop(AF_INET6, &in6->sin6_addr, text, sizeof text))
+      return fmt::format("[{}]:{}", text, ntohs(in6->sin6_port));
+  }
+  return fmt::format("<address family {}>", addr->sa_family);
+}
+
+/// CURLOPT_OPENSOCKETDATA of a request with a ConnectFilter.
+struct ConnectGuard {
+  const ConnectFilter *filter = nullptr;
+  std::vector<std::string> refused; ///< formatted peer addresses
+};
+
+/// CURLOPT_OPENSOCKETFUNCTION: create the socket only for an address the
+/// filter allows. Returning CURL_SOCKET_BAD makes curl try the next address
+/// and, with none left, fail with CURLE_COULDNT_CONNECT.
+curl_socket_t guarded_open_socket(void *clientp, curlsocktype /*purpose*/,
+                                  curl_sockaddr *address) {
+  auto *guard = static_cast<ConnectGuard *>(clientp);
+  const auto len = static_cast<std::size_t>(address->addrlen);
+  bool allowed = false;
+  try {
+    allowed = (*guard->filter)(&address->addr, len);
+  } catch (const std::exception &e) {
+    core::warn("Speckle: connect filter threw: {}", e.what());
+  } catch (...) {
+    core::warn("Speckle: connect filter threw a non-standard exception");
+  }
+  if (!allowed) {
+    try {
+      guard->refused.push_back(format_address(&address->addr, len));
+    } catch (...) { // NOLINT(bugprone-empty-catch): no throw into C
+    }
+    return CURL_SOCKET_BAD;
+  }
+  // As curl's own: never leak the socket into a child process.
+  return ::socket(address->family, address->socktype | SOCK_CLOEXEC,
+                  address->protocol);
+}
 
 int cancel_progress(void *clientp, curl_off_t, curl_off_t, curl_off_t,
                     curl_off_t) {
@@ -355,6 +410,17 @@ std::string http_perform(const HttpRequest &req) {
   } else {
     curl_easy_setopt(c, CURLOPT_HTTPGET, 1L);
   }
+  ConnectGuard guard;
+  if (req.connect_filter && *req.connect_filter) {
+    guard.filter = req.connect_filter;
+    curl_easy_setopt(c, CURLOPT_OPENSOCKETFUNCTION, guarded_open_socket);
+    curl_easy_setopt(c, CURLOPT_OPENSOCKETDATA, &guard);
+    // Through a proxy the filter would vet the proxy, not the server.
+    curl_easy_setopt(c, CURLOPT_PROXY, "");
+  }
+  // Last, so the front end's configurator can override any of the above.
+  if (req.curl_setup && *req.curl_setup)
+    (*req.curl_setup)(static_cast<void *>(c));
 
   const CURLcode res = curl_easy_perform(c);
   long http_code = 0;
@@ -367,6 +433,14 @@ std::string http_perform(const HttpRequest &req) {
         req.what, req.max_bytes >> 20, req.url));
   if (res == CURLE_ABORTED_BY_CALLBACK)
     throw std::runtime_error(fmt::format("Speckle {}: cancelled", req.what));
+  if (res != CURLE_OK && !guard.refused.empty()) {
+    std::string refused;
+    for (const auto &a : guard.refused)
+      refused += (refused.empty() ? "" : ", ") + a;
+    throw std::runtime_error(
+        fmt::format("Speckle {}: connection to {} refused by policy ({})",
+                    req.what, refused, req.url));
+  }
   if (res != CURLE_OK)
     throw std::runtime_error(fmt::format("Speckle {}: curl error: {} ({})",
                                          req.what, curl_easy_strerror(res),
@@ -870,6 +944,8 @@ json SpeckleReader::graphql_query(const std::string &query,
   req.max_bytes = max_download_bytes_;
   req.cancel = cancel_;
   req.timeout_s = timeout_s_;
+  req.connect_filter = &connect_filter_;
+  req.curl_setup = &curl_setup_;
   const std::string response = http_perform(req);
 
   json parsed;
@@ -984,6 +1060,8 @@ SpeckleReader::fetch_object_tree(const std::string &project,
   req.max_bytes = max_download_bytes_;
   req.cancel = cancel_;
   req.timeout_s = timeout_s_;
+  req.connect_filter = &connect_filter_;
+  req.curl_setup = &curl_setup_;
   core::debug("Speckle: downloading object tree {} from project {}", object_id,
               project);
   stopwatch sw;
@@ -1009,6 +1087,8 @@ json SpeckleReader::fetch_object(const std::string &project,
   req.max_bytes = max_download_bytes_;
   req.cancel = cancel_;
   req.timeout_s = timeout_s_;
+  req.connect_filter = &connect_filter_;
+  req.curl_setup = &curl_setup_;
   std::string body = http_perform(req);
   try {
     return json::parse(body);

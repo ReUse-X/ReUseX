@@ -1816,6 +1816,8 @@ StageResult run_import_speckle(ProjectDB &db, const StageContext &ctx,
         fmt::format("no Speckle token configured for {}", imp.server_url));
   imp.cancel_token = ctx.cancel_token;
   imp.timeout_s = options.speckle_timeout_s;
+  imp.connect_filter = options.speckle_connect_filter;
+  imp.curl_setup = options.speckle_curl_setup;
 
   const auto skipped = [](const io::speckle::RevitImportStats &s) {
     info("import_speckle: {} levels ({} reference levels, no storey); "
