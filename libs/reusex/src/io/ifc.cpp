@@ -42,6 +42,8 @@
 
 namespace reusex::io::ifc {
 
+using nlohmann::json;
+
 std::string ifc_class_slug(const std::string &ifc_class) {
   std::string s = ifc_class;
   if (s.rfind("Ifc", 0) == 0 || s.rfind("IFC", 0) == 0)
@@ -90,7 +92,6 @@ bool has_ifc_support() { return true; }
 
 namespace {
 
-using nlohmann::json;
 using webifc::parsing::IfcTokenType;
 namespace schema = webifc::schema;
 using bim::P2;
