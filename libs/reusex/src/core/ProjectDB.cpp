@@ -3383,8 +3383,61 @@ class ProjectDB::Impl {
     return readStorey(s);
   }
 
-  size_t saveStoreys(const std::vector<core::StoreyRecord> &storeys,
-                     int runId) {
+  /// The import mode of the solid-model writers (saveStoreys, saveWalls,
+  /// saveOpenings, saveSpaces), used by replaceImportedSolidModel: instead of
+  /// replacing every unlocked row, a writer in import mode deletes the rows
+  /// whose source is "imported" (locked ones included), keeps every other
+  /// row, and lets a record take over an unlocked detected / manual row that
+  /// holds its guid (a storey: or its idx). A locked row still wins.
+  struct ImportTally {
+    size_t replaced_imported = 0; ///< earlier imported rows deleted
+    size_t taken_over = 0;        ///< unlocked rows a record replaced
+    size_t skipped_locked = 0;    ///< records a locked row held back
+  };
+
+  /// Execute one statement and return the rows it changed (cascaded
+  /// deletes are not counted).
+  size_t execChanges(const char *sql) {
+    execOrThrow(sql);
+    return static_cast<size_t>(sqlite3_changes(db));
+  }
+
+  /// The guid column of every row a SELECT returns.
+  std::set<std::string, std::less<>> selectGuids(const char *sql,
+                                                 const char *who) {
+    std::set<std::string, std::less<>> out;
+    sqlite3_stmt *s = prepare_or_throw(db, sql, who);
+    StmtGuard guard(s);
+    int rc;
+    while ((rc = sqlite3_step(s)) == SQLITE_ROW)
+      out.insert(column_text(s, 0));
+    if (rc != SQLITE_DONE)
+      throw std::runtime_error(std::string(who) +
+                               ": reading rows: " + sqlite3_errmsg(db));
+    return out;
+  }
+
+  /// Import mode: delete the unlocked row of @p table that holds @p guid
+  /// (and, for storeys, @p idx), so the imported record can take its place.
+  void takeOverUnlocked(const char *table, std::string_view guid,
+                        const int *idx, ImportTally &tally, const char *who) {
+    const std::string sql =
+        std::string("DELETE FROM ") + table +
+        (idx ? " WHERE locked = 0 AND (guid = ? OR idx = ?);"
+             : " WHERE locked = 0 AND guid = ?;");
+    sqlite3_stmt *s = prepare_or_throw(db, sql.c_str(), who);
+    StmtGuard guard(s);
+    bind_text(s, 1, guid);
+    if (idx)
+      sqlite3_bind_int(s, 2, *idx);
+    if (sqlite3_step(s) != SQLITE_DONE)
+      throw std::runtime_error(std::string(who) + ": replacing row " +
+                               std::string(guid) + ": " + sqlite3_errmsg(db));
+    tally.taken_over += static_cast<size_t>(sqlite3_changes(db));
+  }
+
+  size_t saveStoreys(const std::vector<core::StoreyRecord> &storeys, int runId,
+                     ImportTally *imp = nullptr) {
     checkWritable();
     if (!hasStoreysTable)
       throw std::runtime_error("save_storeys: project schema predates v30");
@@ -3407,6 +3460,9 @@ class ProjectDB::Impl {
     }
 
     Savepoint sp(db, "save_storeys");
+    if (imp)
+      imp->replaced_imported +=
+          execChanges("DELETE FROM storeys WHERE source = 'imported';");
     std::set<std::string> lockedGuids;
     std::set<int> lockedIdx;
     {
@@ -3423,7 +3479,8 @@ class ProjectDB::Impl {
         throw std::runtime_error("save_storeys: reading locked rows: " +
                                  std::string(sqlite3_errmsg(db)));
     }
-    execOrThrow("DELETE FROM storeys WHERE locked = 0;");
+    if (!imp)
+      execOrThrow("DELETE FROM storeys WHERE locked = 0;");
 
     sqlite3_stmt *ins = prepare_or_throw(
         db,
@@ -3438,14 +3495,20 @@ class ProjectDB::Impl {
         reusex::info("save_storeys: storey {} ({}) is locked; kept the stored "
                      "row",
                      r.idx, r.guid);
+        if (imp)
+          ++imp->skipped_locked;
         continue;
       }
       if (lockedIdx.count(r.idx)) {
         reusex::warn("save_storeys: storey idx {} is held by a locked row "
                      "with another guid; the new storey {} was not written",
                      r.idx, r.guid);
+        if (imp)
+          ++imp->skipped_locked;
         continue;
       }
+      if (imp)
+        takeOverUnlocked("storeys", r.guid, &r.idx, *imp, "save_storeys");
       sqlite3_reset(ins);
       sqlite3_clear_bindings(ins);
       bind_text(ins, 1, r.guid);
@@ -3894,7 +3957,8 @@ class ProjectDB::Impl {
   }
 
   size_t saveWalls(const std::vector<core::WallRecord> &walls,
-                   const std::vector<core::WallJoinRecord> &joins, int runId) {
+                   const std::vector<core::WallJoinRecord> &joins, int runId,
+                   ImportTally *imp = nullptr) {
     checkWritable();
     if (!hasWallsTable)
       throw std::runtime_error("save_walls: project schema predates v33");
@@ -3912,18 +3976,17 @@ class ProjectDB::Impl {
     }
 
     Savepoint sp(db, "save_walls");
-    std::set<std::string, std::less<>> lockedGuids;
-    {
-      sqlite3_stmt *s = prepare_or_throw(
-          db, "SELECT guid FROM walls WHERE locked = 1;", "save_walls");
-      StmtGuard guard(s);
-      int rc;
-      while ((rc = sqlite3_step(s)) == SQLITE_ROW)
-        lockedGuids.insert(column_text(s, 0));
-      if (rc != SQLITE_DONE)
-        throw std::runtime_error("save_walls: reading locked rows: " +
-                                 std::string(sqlite3_errmsg(db)));
-    }
+    // Joins of the imported walls go with them (ON DELETE CASCADE).
+    if (imp)
+      imp->replaced_imported +=
+          execChanges("DELETE FROM walls WHERE source = 'imported';");
+    const auto lockedGuids =
+        selectGuids("SELECT guid FROM walls WHERE locked = 1;", "save_walls");
+    // The walls that stay in the table, which a join may name: the locked
+    // ones, or in import mode every row left.
+    const auto keptGuids =
+        imp ? selectGuids("SELECT guid FROM walls;", "save_walls")
+            : lockedGuids;
     static const std::set<std::string, std::less<>> kKinds = {"corner", "tee",
                                                               "collinear"};
     static const std::set<std::string, std::less<>> kEnds = {"start", "end",
@@ -3939,12 +4002,15 @@ class ProjectDB::Impl {
       if (j.wall_a == j.wall_b)
         throw std::invalid_argument(where + " joins a wall to itself");
       for (const auto &g : {j.wall_a, j.wall_b})
-        if (!guids.count(g) && !lockedGuids.count(g))
-          throw std::invalid_argument(where + " names wall " + g +
-                                      ", which is neither saved nor locked");
+        if (!guids.count(g) && !keptGuids.count(g))
+          throw std::invalid_argument(
+              where + " names wall " + g +
+              (imp ? ", which is neither saved nor stored"
+                   : ", which is neither saved nor locked"));
     }
     // Joins of unlocked walls go with them (ON DELETE CASCADE).
-    execOrThrow("DELETE FROM walls WHERE locked = 0;");
+    if (!imp)
+      execOrThrow("DELETE FROM walls WHERE locked = 0;");
 
     sqlite3_stmt *ins = prepare_or_throw(
         db,
@@ -3964,6 +4030,8 @@ class ProjectDB::Impl {
         ++skipped;
         continue;
       }
+      if (imp)
+        takeOverUnlocked("walls", r.guid, nullptr, *imp, "save_walls");
       sqlite3_reset(ins);
       sqlite3_clear_bindings(ins);
       bind_text(ins, 1, r.guid);
@@ -4025,6 +4093,8 @@ class ProjectDB::Impl {
     if (skipped > 0)
       reusex::info("save_walls: {} wall(s) are locked; kept the stored rows",
                    skipped);
+    if (imp)
+      imp->skipped_locked += skipped;
     return written;
   }
 
@@ -4142,7 +4212,7 @@ class ProjectDB::Impl {
   }
 
   size_t saveOpenings(const std::vector<core::OpeningRecord> &openings,
-                      int runId) {
+                      int runId, ImportTally *imp = nullptr) {
     checkWritable();
     if (!hasOpeningsTable)
       throw std::runtime_error("save_openings: project schema predates v34");
@@ -4178,19 +4248,13 @@ class ProjectDB::Impl {
     }
 
     Savepoint sp(db, "save_openings");
-    std::set<std::string, std::less<>> lockedGuids;
-    {
-      sqlite3_stmt *s = prepare_or_throw(
-          db, "SELECT guid FROM openings WHERE locked = 1;", "save_openings");
-      StmtGuard guard(s);
-      int rc;
-      while ((rc = sqlite3_step(s)) == SQLITE_ROW)
-        lockedGuids.insert(column_text(s, 0));
-      if (rc != SQLITE_DONE)
-        throw std::runtime_error("save_openings: reading locked rows: " +
-                                 std::string(sqlite3_errmsg(db)));
-    }
-    execOrThrow("DELETE FROM openings WHERE locked = 0;");
+    if (imp)
+      imp->replaced_imported +=
+          execChanges("DELETE FROM openings WHERE source = 'imported';");
+    const auto lockedGuids = selectGuids(
+        "SELECT guid FROM openings WHERE locked = 1;", "save_openings");
+    if (!imp)
+      execOrThrow("DELETE FROM openings WHERE locked = 0;");
 
     sqlite3_stmt *ins = prepare_or_throw(
         db,
@@ -4206,6 +4270,8 @@ class ProjectDB::Impl {
         ++skipped;
         continue;
       }
+      if (imp)
+        takeOverUnlocked("openings", r.guid, nullptr, *imp, "save_openings");
       sqlite3_reset(ins);
       sqlite3_clear_bindings(ins);
       bind_text(ins, 1, r.guid);
@@ -4236,6 +4302,8 @@ class ProjectDB::Impl {
       reusex::info(
           "save_openings: {} opening(s) are locked; kept the stored rows",
           skipped);
+    if (imp)
+      imp->skipped_locked += skipped;
     return written;
   }
 
@@ -4610,7 +4678,7 @@ class ProjectDB::Impl {
 
   size_t saveSpaces(const std::vector<core::SpaceRecord> &spaces,
                     const std::vector<core::SpaceBoundaryRecord> &boundaries,
-                    int runId) {
+                    int runId, ImportTally *imp = nullptr) {
     checkWritable();
     if (!hasSpacesTable)
       throw std::runtime_error("save_spaces: project schema predates v35");
@@ -4659,20 +4727,14 @@ class ProjectDB::Impl {
     }
 
     Savepoint sp(db, "save_spaces");
-    std::set<std::string, std::less<>> lockedGuids;
-    {
-      sqlite3_stmt *s = prepare_or_throw(
-          db, "SELECT guid FROM spaces WHERE locked = 1;", "save_spaces");
-      StmtGuard guard(s);
-      int rc;
-      while ((rc = sqlite3_step(s)) == SQLITE_ROW)
-        lockedGuids.insert(column_text(s, 0));
-      if (rc != SQLITE_DONE)
-        throw std::runtime_error("save_spaces: reading locked rows: " +
-                                 std::string(sqlite3_errmsg(db)));
-    }
-    // Boundaries of unlocked spaces go with them (ON DELETE CASCADE).
-    execOrThrow("DELETE FROM spaces WHERE locked = 0;");
+    // Boundaries of deleted spaces go with them (ON DELETE CASCADE).
+    if (imp)
+      imp->replaced_imported +=
+          execChanges("DELETE FROM spaces WHERE source = 'imported';");
+    const auto lockedGuids =
+        selectGuids("SELECT guid FROM spaces WHERE locked = 1;", "save_spaces");
+    if (!imp)
+      execOrThrow("DELETE FROM spaces WHERE locked = 0;");
 
     sqlite3_stmt *ins = prepare_or_throw(
         db,
@@ -4689,6 +4751,8 @@ class ProjectDB::Impl {
         ++skipped;
         continue;
       }
+      if (imp)
+        takeOverUnlocked("spaces", r.guid, nullptr, *imp, "save_spaces");
       sqlite3_reset(ins);
       sqlite3_clear_bindings(ins);
       bind_text(ins, 1, r.guid);
@@ -4746,6 +4810,8 @@ class ProjectDB::Impl {
     if (skipped > 0)
       reusex::info("save_spaces: {} space(s) are locked; kept the stored rows",
                    skipped);
+    if (imp)
+      imp->skipped_locked += skipped;
     return written;
   }
 
@@ -4762,6 +4828,132 @@ class ProjectDB::Impl {
     checkWritable();
     if (hasSpacesTable)
       execOrThrow("DELETE FROM space_boundaries; DELETE FROM spaces;");
+  }
+
+  /// One COUNT(*) query.
+  size_t countRows(const char *sql, const char *who) {
+    sqlite3_stmt *s = prepare_or_throw(db, sql, who);
+    StmtGuard guard(s);
+    if (sqlite3_step(s) != SQLITE_ROW)
+      throw std::runtime_error(std::string(who) + ": " + sqlite3_errmsg(db));
+    return static_cast<size_t>(sqlite3_column_int64(s, 0));
+  }
+
+  ProjectDB::SolidModelImportResult
+  replaceImportedSolidModel(const core::SolidModel &m, int runId) {
+    constexpr const char *who = "replace_imported_solid_model";
+    checkWritable();
+    // The writers throw for a missing table too, but only once they are
+    // reached; say it up front, naming every kind the model provides.
+    std::vector<std::string> missing;
+    if (m.has_storeys() && !hasStoreysTable)
+      missing.emplace_back("storeys (v30)");
+    if (m.has_walls() && !hasWallsTable)
+      missing.emplace_back("walls (v33)");
+    if (m.has_openings() && !hasOpeningsTable)
+      missing.emplace_back("openings (v34)");
+    if (m.has_spaces() && !hasSpacesTable)
+      missing.emplace_back("spaces (v35)");
+    if (!missing.empty())
+      throw std::runtime_error(
+          fmt::format("{}: the project has no table for {}", who,
+                      fmt::join(missing, ", ")));
+
+    ProjectDB::SolidModelImportResult r;
+    ImportTally tally;
+    Savepoint sp(db, "replace_imported_solid_model");
+    // Storeys first (walls and spaces name one by idx), walls before the
+    // openings and space boundaries that name a wall by guid.
+    if (m.has_storeys())
+      r.storeys = saveStoreys(m.storeys, runId, &tally);
+    if (m.has_walls())
+      r.walls = saveWalls(m.walls, m.wall_joins, runId, &tally);
+    if (m.has_openings())
+      r.openings = saveOpenings(m.openings, runId, &tally);
+    if (m.has_spaces())
+      r.spaces = saveSpaces(m.spaces, m.space_boundaries, runId, &tally);
+
+    // An imported opening or boundary must name a wall the project holds
+    // (imported now, or stored already): load_solid_model() would drop it,
+    // so the import would not come back out. Checked after the writes, so
+    // the walls of this same import count; a throw rolls everything back.
+    if ((m.has_openings() && !m.openings.empty()) ||
+        (m.has_spaces() && !m.space_boundaries.empty())) {
+      const auto walls = hasWallsTable
+                             ? selectGuids("SELECT guid FROM walls;", who)
+                             : std::set<std::string, std::less<>>{};
+      if (m.has_openings())
+        for (const auto &o : m.openings)
+          if (!walls.count(o.wall))
+            throw std::invalid_argument(fmt::format(
+                "{}: opening {} names wall {}, which the project does not "
+                "hold",
+                who, o.guid, o.wall));
+      if (m.has_spaces())
+        for (const auto &b : m.space_boundaries)
+          if (!walls.count(b.wall))
+            throw std::invalid_argument(fmt::format(
+                "{}: the boundary of space {} names wall {}, which the "
+                "project does not hold",
+                who, b.space, b.wall));
+    }
+    sp.release();
+
+    r.replaced_imported = tally.replaced_imported;
+    r.taken_over = tally.taken_over;
+    r.skipped_locked = tally.skipped_locked;
+    if (r.replaced_imported > 0)
+      reusex::info("{}: replaced {} previously imported row(s)", who,
+                   r.replaced_imported);
+    if (r.taken_over > 0)
+      reusex::warn("{}: {} imported record(s) replaced an unlocked detected / "
+                   "manual row holding the same guid (a storey: or idx)",
+                   who, r.taken_over);
+    if (r.skipped_locked > 0)
+      reusex::warn("{}: {} imported record(s) were not written: a locked "
+                   "detected / manual row holds their guid (a storey: or "
+                   "idx), and the locked row wins",
+                   who, r.skipped_locked);
+    // Rows the import left without the element they name: earlier openings
+    // or boundaries on a re-imported wall that is gone now, or imported
+    // walls / spaces on a storey idx the project does not hold.
+    if (m.has_walls() && hasOpeningsTable) {
+      const size_t n = countRows("SELECT COUNT(*) FROM openings WHERE "
+                                 "wall_guid NOT IN (SELECT guid FROM walls);",
+                                 who);
+      if (n > 0)
+        reusex::warn("{}: {} stored opening(s) name a wall the walls table no "
+                     "longer holds; load_solid_model() leaves them out",
+                     who, n);
+    }
+    if (m.has_walls() && hasSpacesTable) {
+      const size_t n = countRows(
+          "SELECT COUNT(*) FROM space_boundaries WHERE wall_guid NOT IN "
+          "(SELECT guid FROM walls);",
+          who);
+      if (n > 0)
+        reusex::warn("{}: {} stored space boundar(y/ies) name a wall the "
+                     "walls table no longer holds; load_solid_model() leaves "
+                     "them out",
+                     who, n);
+    }
+    if (hasStoreysTable &&
+        countRows("SELECT COUNT(*) FROM storeys;", who) > 0) {
+      size_t n = 0;
+      if (m.has_walls())
+        n += countRows("SELECT COUNT(*) FROM walls WHERE source = 'imported' "
+                       "AND storey NOT IN (SELECT idx FROM storeys);",
+                       who);
+      if (m.has_spaces())
+        n += countRows("SELECT COUNT(*) FROM spaces WHERE source = 'imported' "
+                       "AND storey NOT IN (SELECT idx FROM storeys);",
+                       who);
+      if (n > 0)
+        reusex::warn("{}: {} imported wall(s) / space(s) stand on a storey idx "
+                     "the storeys table does not hold",
+                     who, n);
+    }
+    return r;
   }
 
   // ── Scan helpers (#129) ──────────────────────────────────────────────────
@@ -9475,6 +9667,12 @@ std::vector<core::SpaceBoundaryRecord> ProjectDB::space_boundaries() const {
 }
 
 void ProjectDB::delete_spaces() { impl_->deleteSpaces(); }
+
+ProjectDB::SolidModelImportResult
+ProjectDB::replace_imported_solid_model(const core::SolidModel &model,
+                                        int run_id) {
+  return impl_->replaceImportedSolidModel(model, run_id);
+}
 
 core::SensorIntrinsics ProjectDB::sensor_frame_intrinsics(int nodeId) const {
   return impl_->getSensorFrameIntrinsics(nodeId);

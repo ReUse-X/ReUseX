@@ -42,10 +42,13 @@ DESCRIPTION:
   marks every element source "imported" and locked, and stores it; --export
   writes the project's model, in the format --export's own extension picks.
 
-  The project's solid-model tables (storeys, walls, spaces, openings) do not
-  exist yet, so an import into a project stores nothing and fails. Use
-  --dry-run to validate a plan and write it back normalised without touching
-  the project; the authoring loop that uses it is
+  An import replaces the project's earlier imported storeys, walls, spaces
+  and openings (each kind the plan provides) and leaves detected and manual
+  rows alone, except that an imported element takes over an unlocked row
+  with its guid (a storey: its guid or idx) and gives way to a locked one;
+  both are logged. Plane classes and scene relations in a plan are not
+  stored. Use --dry-run to validate a plan and write it back normalised
+  without touching the project; the authoring loop that uses it is
   docs/guides/solid-model-reference-authoring.md.
 
 EXAMPLES:
@@ -111,23 +114,27 @@ int run_subcommand_edit_plan(SubcommandEditPlanOptions const &opt,
       }
 
       reusex::ProjectDB db(global_opt.project_db);
-      const auto stored = io::store_solid_model(db, model);
-      if (!stored.not_stored.empty())
-        spdlog::warn("edit plan: not stored — the project has no table for {} "
-                     "yet",
-                     fmt::join(stored.not_stored, ", "));
-      if (stored.stored() == 0) {
-        spdlog::error("edit plan: nothing was imported into '{}': the "
-                      "solid-model tables do not exist yet. Use --dry-run to "
-                      "validate the plan, and `rux render --plan` to check it "
-                      "against the scan",
-                      global_opt.project_db.string());
-        return RuxError::NOT_IMPLEMENTED;
+      io::SolidModelStoreResult stored;
+      try {
+        stored = io::store_solid_model(db, model);
+      } catch (const std::invalid_argument &e) {
+        spdlog::error("edit plan: the project refused plan '{}': {}",
+                      opt.import_path.string(), e.what());
+        return RuxError::INVALID_ARGUMENT;
       }
+      if (!stored.not_stored.empty())
+        spdlog::warn("edit plan: not stored (no project table holds them for "
+                     "an import): {}",
+                     fmt::join(stored.not_stored, ", "));
+      if (stored.stored() == 0 && stored.replaced_imported == 0)
+        spdlog::warn("edit plan: nothing was imported into '{}': the plan has "
+                     "no storey, wall, space or opening the project could "
+                     "take ({} held back by locked rows)",
+                     global_opt.project_db.string(), stored.skipped_locked);
       spdlog::info("edit plan: imported {} storeys, {} walls, {} spaces, {} "
-                   "openings",
-                   stored.storeys, stored.walls, stored.spaces,
-                   stored.openings);
+                   "openings (replaced {} earlier imported row(s))",
+                   stored.storeys, stored.walls, stored.spaces, stored.openings,
+                   stored.replaced_imported);
     }
 
     if (!opt.export_path.empty()) {

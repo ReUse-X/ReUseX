@@ -5,6 +5,7 @@
 #include "io/solid_model_json.hpp"
 
 #include "core/ProjectDB.hpp"
+#include "core/guid.hpp"
 #include "core/logging.hpp"
 #include "yaml_json.hpp"
 
@@ -858,21 +859,66 @@ void mark_imported(core::SolidModel &model) {
   mark(model.openings);
 }
 
-SolidModelStoreResult store_solid_model(ProjectDB & /*db*/,
+SolidModelStoreResult store_solid_model(ProjectDB &db,
                                         const core::SolidModel &model) {
-  // The table-backed import plugs in here, kind by kind, as each table lands
-  // (WP1 storeys, WP3 walls, WP4 spaces, WP5 openings): write the kind's rows
-  // (replacing the project's imported rows of that kind), count them, and
-  // stop listing the kind in `not_stored`. Until then nothing is written.
+  // The tables key every row by guid, the document does not require one
+  // (an authored reference often leaves it out where nothing refers to the
+  // element). Mint the missing ones deterministically, so a re-import of
+  // the same document gives the same rows: uuid5(project guid,
+  // "imported/storeys/<idx>"), and "imported/<kind>/<position in the
+  // model>" for the rest.
+  const core::SolidModel *to_store = &model;
+  core::SolidModel minted;
+  const auto missing = [](const auto &records) {
+    return std::any_of(records.begin(), records.end(),
+                       [](const auto &r) { return r.guid.empty(); });
+  };
+  if (missing(model.storeys) || missing(model.walls) || missing(model.spaces) ||
+      missing(model.openings)) {
+    minted = model;
+    const std::string ns = db.project_guid();
+    std::size_t n = 0;
+    for (auto &s : minted.storeys)
+      if (s.guid.empty()) {
+        s.guid = core::deterministic_guid(
+            ns, fmt::format("imported/storeys/{}", s.idx));
+        ++n;
+      }
+    const auto mint = [&](auto &records, std::string_view kind) {
+      for (std::size_t i = 0; i < records.size(); ++i)
+        if (records[i].guid.empty()) {
+          records[i].guid = core::deterministic_guid(
+              ns, fmt::format("imported/{}/{}", kind, i));
+          ++n;
+        }
+    };
+    mint(minted.walls, "walls");
+    mint(minted.spaces, "spaces");
+    mint(minted.openings, "openings");
+    core::info("store_solid_model: minted a guid for {} element(s) the model "
+               "gives none",
+               n);
+    to_store = &minted;
+  }
+
+  // One SAVEPOINT in ProjectDB: the project's imported rows of each kind
+  // the model provides are replaced, detected / manual rows stay (see
+  // ProjectDB::replace_imported_solid_model for the guid / idx rules).
+  const auto imported = db.replace_imported_solid_model(*to_store);
   SolidModelStoreResult r;
-  if (model.has_storeys())
-    r.not_stored.emplace_back("storeys");
-  if (model.has_walls())
-    r.not_stored.emplace_back("walls");
-  if (model.has_spaces())
-    r.not_stored.emplace_back("spaces");
-  if (model.has_openings())
-    r.not_stored.emplace_back("openings");
+  r.storeys = imported.storeys;
+  r.walls = imported.walls;
+  r.spaces = imported.spaces;
+  r.openings = imported.openings;
+  r.replaced_imported = imported.replaced_imported;
+  r.taken_over = imported.taken_over;
+  r.skipped_locked = imported.skipped_locked;
+  // No table holds an imported plane class (they belong to a detected
+  // cloud's planes) or a scene relation.
+  if (model.has_plane_classes())
+    r.not_stored.emplace_back("plane_classes");
+  if (!model.scene_relations.empty())
+    r.not_stored.emplace_back("scene_relations");
   return r;
 }
 

@@ -51,7 +51,10 @@ subcommand makes, so a stage that validates cannot then be refused when run.
   `building_components`, `meshes` — or, for the solid-model tables
   (`storeys`, `plane_classes`, `walls`, ...), by a stable GUID with `source` / `locked` columns: a
   re-run replaces the unlocked rows and keeps the locked ones, and a
-  re-detected element keeps the GUID of the stored element it matches. New
+  re-detected element keeps the GUID of the stored element it matches.
+  Rows with `source = imported` come from an imported model (`rux edit plan
+  --import`, see "Import write: solid-model plan" below) and are locked, so
+  no re-run touches them; only the next import replaces them. New
   GUIDs are deterministic (`core::deterministic_guid` over the project GUID,
   `ProjectDB::project_guid()`). A file copy of a `.rux` is the **same**
   project: same project GUID, same row GUIDs.
@@ -812,6 +815,47 @@ or `instances` keeps its original `stage`/`parameters` (e.g. reconstruct's
 its GUID (and its part's link) only when reconciliation matches it by overlap.
 The part never lands in a rejected (Afvist) type: the automatic type choice
 skips rejected types and creates a new one when only a rejected type matches.
+
+### Import write: solid-model plan (rux edit plan --import)
+
+<!-- No backticks in this heading: test_stage_contract parses backticked
+     `### ` headings as pipeline stages, and this is not one. -->
+
+Store an imported building model -- an authored reference plan, later a
+Revit (via Speckle) or IFC model -- in the solid-model tables
+(`io::store_solid_model()` over `ProjectDB::replace_imported_solid_model()`).
+Not a pipeline stage: no `Stage`, no `rux validate --stage` entry.
+
+| | |
+|---|---|
+| Consumes | a solid-model document (`docs/design/solid-model-json.md`), validated strictly; the elements are stamped `source = imported`, `locked = 1` (`io::mark_imported()`) |
+| Produces | `storeys`, `walls` + `wall_joins`, `openings`, `spaces` + `space_boundaries` rows, for each kind the document provides |
+| Checks   | every opening and space boundary names a wall the walls table holds after the import |
+
+For each kind the document provides (a non-empty array, or an empty one
+that is present), the project's earlier `imported` rows of that kind are
+deleted, locked ones included (joins and boundaries go with their walls and
+spaces), and the document's rows are written; kinds it leaves out are not
+touched. Detected and manual rows stay, with two exceptions, each logged at
+`warn` with the count:
+
+- an imported element whose GUID an **unlocked** detected / manual row holds
+  replaces that row. Storeys are keyed by `idx` (walls and spaces name their
+  storey by it), so an imported storey also replaces an unlocked storey of
+  the same `idx`: imported storey 0 becomes the project's storey 0, and the
+  detected walls of that idx are then read in its level frame;
+- an imported element whose GUID (a storey: GUID or `idx`) a **locked**
+  detected / manual row holds is not written: the locked row wins, as in
+  every stage.
+
+An element without a GUID gets `uuid5(project_guid, "imported/storeys/<idx>")`
+or `uuid5(project_guid, "imported/<kind>/<index in the document>")`, so
+importing the same document twice writes the same rows. The whole import is
+one SAVEPOINT: a refused element leaves every table as it was. Plane classes
+and scene relations in a document are not stored (reported as not stored).
+`rux edit plan --export` reads the tables back (`io::load_solid_model()`);
+`JSON -> tables -> JSON` is lossless up to row order and the document's
+`name` / `description`, which have no table.
 
 ### `attributes` (`rux create attributes`)
 

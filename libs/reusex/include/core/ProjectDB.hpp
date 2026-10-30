@@ -904,6 +904,51 @@ class ProjectDB {
   /// action).
   void delete_spaces();
 
+  // --- Solid-model import (io::store_solid_model, `rux edit plan --import`)
+
+  /// What replace_imported_solid_model() wrote and replaced.
+  struct SolidModelImportResult {
+    size_t storeys = 0, walls = 0, spaces = 0, openings = 0; ///< rows written
+    /// Rows with source "imported" deleted (locked ones included), over the
+    /// kinds the model provides; their joins / boundaries not counted.
+    size_t replaced_imported = 0;
+    /// Unlocked detected / manual rows an imported record replaced because
+    /// it holds the same guid (a storey: the same guid or idx).
+    size_t taken_over = 0;
+    /// Records not written because a locked detected / manual row holds
+    /// their guid (a storey: guid or idx) -- the locked row wins.
+    size_t skipped_locked = 0;
+  };
+
+  /// Store an imported building model (a reference plan, a Revit / IFC
+  /// model): for each element kind @p model provides (SolidModel::has_*),
+  /// delete the project's rows whose source is "imported" -- locked ones
+  /// included, joins / boundaries with their walls / spaces -- and write
+  /// @p model's records as they are (callers stamp source "imported",
+  /// locked with io::mark_imported()). Every other row stays, with two
+  /// exceptions, each logged at warn with the count:
+  ///  - a record whose guid (a storey: guid or idx) an UNLOCKED detected /
+  ///    manual row holds replaces that row: storeys are keyed by idx, so an
+  ///    imported storey 0 becomes the project's storey 0, and an exported
+  ///    and re-imported detected element becomes the imported version;
+  ///  - a record whose guid (a storey: guid or idx) a LOCKED detected /
+  ///    manual row holds is not written: the locked row wins, as for
+  ///    save_storeys() and the other writers.
+  /// Kinds the model does not provide are not touched. A wall join may name
+  /// any wall the table holds after the import; an opening or a space
+  /// boundary must name one (std::invalid_argument otherwise). The whole
+  /// call is one SAVEPOINT (it nests in a ProjectDB::Transaction): a refused
+  /// record leaves every table as it was. Plane classes and scene relations
+  /// in @p model are not stored (plane classes belong to a detected cloud).
+  /// @p run_id is the pipeline_log row that produced them (-1 = none).
+  /// @throws std::invalid_argument for a record save_storeys(),
+  ///         save_walls(), save_openings() or save_spaces() refuses, or an
+  ///         opening / boundary naming a wall the project does not hold;
+  ///         std::runtime_error on a read-only project or one without a
+  ///         table for a kind the model provides.
+  SolidModelImportResult
+  replace_imported_solid_model(const core::SolidModel &model, int run_id = -1);
+
   // --- Scans (multi-session import, #129) ---
 
   /// One row of the `scans` table.  Each `rux import` creates one record;
