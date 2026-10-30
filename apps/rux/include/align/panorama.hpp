@@ -14,6 +14,7 @@
 struct SubcommandAlignPanoramaOptions {
   bool dry_run = false;   ///< compute + report only, do not write poses
   bool overwrite = false; ///< re-align panoramas that are already aligned
+  bool force = false;     ///< also re-align manually placed panoramas
   /// Algorithm parameters. The flags bind straight to these fields, so their
   /// defaults ARE the library's (STANDARDS §4, reusex-bx2.7).
   reusex::geometry::PanoramaAlignmentOptions align;
