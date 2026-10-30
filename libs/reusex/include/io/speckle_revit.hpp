@@ -13,6 +13,7 @@
 #include <array>
 #include <cstddef>
 #include <cstdint>
+#include <functional>
 #include <map>
 #include <optional>
 #include <string>
@@ -34,15 +35,19 @@
 /// Read-only: nothing here, nor in `import_speckle_revit`, writes to a
 /// Speckle server (only `SpeckleReader` is used).
 ///
-/// Frame. World is Revit's internal coordinate system, in metres, as the
-/// connector writes mesh vertices; nothing is georeferenced or aligned to a
-/// scan (that is out of scope). Level elevations arrive relative to the
-/// level's elevation base (often the survey point), so their offset to the
-/// internal z is measured from the walls (base constraint + base offset vs
-/// mesh bottom; `RevitImportStats::elevation_offset_m`). All storeys share
-/// one level frame, as detected storeys do: a translation putting the lowest
-/// level's floor at z = 0, so storey k's `z_floor` is its height above the
-/// lowest level, and walls / openings / spaces carry level-frame z.
+/// Frame. World is the frame the connector wrote the mesh vertices in, in
+/// metres: Revit's internal origin, or the project base / survey point,
+/// depending on the connector's reference-point setting. Nothing is
+/// georeferenced or aligned to a scan (out of scope); a model far from the
+/// origin is recentred by a whole-km x/y offset (world_offset_m). Level
+/// elevations arrive relative to the level's elevation base (often the survey
+/// point), so their offset to the internal z is measured from the walls (base
+/// constraint + base offset vs mesh bottom;
+/// `RevitImportStats::elevation_offset_m`). All storeys share one level frame,
+/// as detected storeys do: a translation putting the lowest building storey's
+/// floor at z = 0, so storey k's `z_floor` is its height above it, and walls /
+/// openings / spaces carry level-frame z. Only levels flagged as building
+/// storeys become storeys.
 
 namespace reusex {
 class ProjectDB;
@@ -72,6 +77,12 @@ struct RevitImportOptions {
   std::optional<double> elevation_offset_m;
   /// Build the per-category meshes.
   bool meshes = true;
+  /// Recentre a model whose plan centre lies farther than
+  /// recenter_threshold_m from the origin by a whole-km x/y offset
+  /// (RevitImportStats::world_offset_m), so float meshes keep mm precision
+  /// (STANDARDS §4). Beyond the threshold a warn is logged either way.
+  bool recenter = true;
+  double recenter_threshold_m = 1e4;
 };
 
 /// One merged triangle mesh (world frame, metres).
@@ -89,6 +100,15 @@ struct RevitImportStats {
   std::size_t instance_proxies = 0;    ///< InstanceProxies expanded
   std::size_t instance_unresolved = 0; ///< proxies whose definition is missing
   std::size_t levels = 0;
+  /// Levels not flagged as a building storey (LEVEL_IS_BUILDING_STORY =
+  /// No): no storey of their own; their elements go to the storey at or
+  /// below them, and that storey's metadata lists them.
+  std::size_t reference_levels = 0;
+  std::vector<std::string> reference_level_names;
+  /// World = Revit internal - world_offset_m (x/y only; zero unless the
+  /// model was recentred).
+  std::array<double, 3> world_offset_m{0.0, 0.0, 0.0};
+  std::size_t elements_bad_geometry = 0; ///< invalid face lists; skipped
   /// Revit internal z minus level elevation [m], and how it was found:
   /// "option" | "walls (N of M agree)" | "assumed 0".
   double elevation_offset_m = 0.0;
@@ -101,11 +121,15 @@ struct RevitImportStats {
   std::size_t openings_by_parent = 0;   ///< host from parentApplicationId
   std::size_t openings_by_geometry = 0; ///< host found geometrically
   std::size_t openings_unhosted = 0;
+  std::size_t openings_extent_params = 0;   ///< s or z from Revit params
+  std::size_t openings_extent_geometry = 0; ///< both from geometry
   std::size_t spaces = 0;
   std::size_t rooms_unplaced = 0; ///< Rooms without a volume mesh
   std::vector<std::string> unplaced_room_names;
-  std::size_t rooms_bad_outline = 0;  ///< volume mesh gave no footprint
-  std::size_t elements_no_storey = 0; ///< level unknown, placed by height
+  std::size_t rooms_bad_outline = 0;    ///< volume mesh gave no footprint
+  std::size_t room_pieces_dropped = 0;  ///< disjoint outline pieces left out
+  std::size_t room_islands_dropped = 0; ///< rings inside a hole left out
+  std::size_t elements_no_storey = 0;   ///< level unknown, placed by height
   std::map<std::string, std::size_t> categories; ///< elements per category
 };
 
@@ -129,11 +153,34 @@ RevitImport import_revit(const nlohmann::json &resolved_root,
 /// ("Plumbing Fixtures" -> "plumbing_fixtures").
 std::string category_slug(const std::string &category);
 
+/// What import_revit_into() stored.
+struct RevitStoreResult {
+  RevitImportStats stats;
+  SolidModelStoreResult stored;
+  std::size_t meshes_saved = 0;
+  std::size_t meshes_removed = 0; ///< stale imported meshes deleted
+};
+
+/// Map a resolved Revit tree and store it in @p db: one pipeline_log row
+/// ("import_speckle", parameters = @p source), import_revit() with the
+/// project GUID as namespace, mark_imported + store_solid_model, and the
+/// category meshes as `imported/<slug>` (stage "import_speckle", parameters
+/// = @p source + category, element count, world_offset_m). When meshes are
+/// on, earlier "import_speckle" meshes this tree no longer has are deleted;
+/// with `options.meshes == false` no mesh is written or deleted. Records and
+/// meshes go in one transaction. @p resolved_root is called once, after the
+/// log row is opened, so a failed download is logged too.
+/// @throws whatever @p resolved_root or import_revit() throws (the log row
+///         then ends failed and nothing is stored).
+RevitStoreResult import_revit_into(
+    ProjectDB &db, const std::function<nlohmann::json()> &resolved_root,
+    const RevitImportOptions &options, const nlohmann::json &source);
+
 struct SpeckleRevitImportOptions {
   std::string server_url = "https://app.speckle.systems";
   std::string project;
   std::string model;
-  std::string version;        ///< empty = the model's latest version
+  std::string version;        ///< empty = the latest version (any age)
   std::string token;          ///< empty = SPECKLE_TOKEN
   RevitImportOptions mapping; ///< guid_namespace is set from the project
 };
@@ -146,12 +193,9 @@ struct SpeckleRevitImportResult {
   std::size_t meshes_removed = 0; ///< stale imported meshes deleted
 };
 
-/// `rux import speckle`: fetch a Revit model version from Speckle (read
-/// only), map it with import_revit(), store the records as imported
-/// (io::mark_imported + io::store_solid_model) and the category meshes as
-/// `imported/<slug>` (stage "import_speckle"; earlier meshes of that stage
-/// that this import no longer has are deleted). Logs one pipeline_log row
-/// ("import_speckle").
+/// `rux import speckle`: look the version up (SpeckleReader::query_version
+/// by id, else latest_version), then import_revit_into() with a fetch that
+/// downloads and resolves its object tree (read only).
 /// @throws std::runtime_error on a network / server error, a version that
 ///         does not exist, or a tree that is not a Revit model.
 SpeckleRevitImportResult

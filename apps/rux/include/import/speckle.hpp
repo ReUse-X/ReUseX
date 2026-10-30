@@ -13,6 +13,9 @@
 struct SubcommandImportSpeckleOptions {
   reusex::io::speckle::SpeckleRevitImportOptions import;
   bool no_meshes = false;
+  /// --elevation-offset given: overrides the measured offset.
+  bool elevation_offset_set = false;
+  double elevation_offset_m = 0.0;
 };
 
 void setup_subcommand_import_speckle(CLI::App &app,

@@ -33,8 +33,16 @@ namespace {
 struct Fixture {
   std::string units = "mm";
   double per_mm = 1.0;
+  double shift_x_mm = 0.0; ///< added to every x (a model far from origin)
 
   double L(double mm) const { return mm / per_mm; }
+
+  /// Definition geometry lives in the instance's own frame: never shifted.
+  Fixture local() const {
+    Fixture f = *this;
+    f.shift_x_mm = 0.0;
+    return f;
+  }
 
   json param(const std::string &idn, json value, bool length = false) const {
     json p = {{"value", value}, {"name", idn}, {"internalDefinitionName", idn}};
@@ -53,7 +61,7 @@ struct Fixture {
            bool quads = false) const {
     std::vector<double> v;
     for (int i = 0; i < 8; ++i) {
-      v.push_back(L(i & 1 ? x1 : x0));
+      v.push_back(L((i & 1 ? x1 : x0) + shift_x_mm));
       v.push_back(L(i & 2 ? y1 : y0));
       v.push_back(L(i & 4 ? z1 : z0));
     }
@@ -98,7 +106,7 @@ struct Fixture {
   }
 
   json proxy(const std::string &def, std::vector<double> m) const {
-    m[3] = L(m[3]);
+    m[3] = L(m[3] + shift_x_mm);
     m[7] = L(m[7]);
     m[11] = L(m[11]);
     return {{"speckle_type", "Speckle.Core.Models.Instances.InstanceProxy"},
@@ -116,7 +124,13 @@ struct Fixture {
   }
 
   json level(const std::string &name, double elevation_mm,
-             const std::string &app) const {
+             const std::string &app, bool storey = true) const {
+    json props = {{"elementId", app + "-eid"}};
+    if (!storey)
+      props["Parameters"] = {
+          {"Instance Parameters",
+           {{"Identity Data",
+             {{"bs", param("LEVEL_IS_BUILDING_STORY", "No")}}}}}};
     return {{"speckle_type", "Objects.Other.LevelProxy"},
             {"applicationId", app},
             {"objects", json::array()},
@@ -125,7 +139,7 @@ struct Fixture {
               {"name", name},
               {"elevation", L(elevation_mm)},
               {"units", units},
-              {"properties", {{"elementId", app + "-eid"}}}}}};
+              {"properties", props}}}};
   }
 
   /// Levels L0 (elevation 10 000 mm) and L1 (13 000 mm), with Revit internal
@@ -149,7 +163,10 @@ struct Fixture {
         element("Doors", "door-1", "L0",
                 json::array({proxy("DEF-DOOR", {1, 0, 0, 2000, 0, 1, 0, 0, 0, 0,
                                                 1, z, 0, 0, 0, 1})}),
-                json::object(), {{"parentApplicationId", "wall-a"}});
+                {{"rw", param("FAMILY_ROUGH_WIDTH_PARAM", 1000.0, true)},
+                 {"rh", param("FAMILY_ROUGH_HEIGHT_PARAM", 2200.0, true)},
+                 {"sill", param("INSTANCE_SILL_HEIGHT_PARAM", 0.0, true)}},
+                {{"parentApplicationId", "wall-a"}});
     // Window: no parent, found on wall A geometrically.
     json window =
         element("Windows", "win-1", "L0",
@@ -168,9 +185,9 @@ struct Fixture {
     json unplaced = element("Rooms", "room-2", "L1", json::array());
     unplaced["name"] = "Storage 202";
 
-    json door_mesh = box(-450, -100, 0, 450, 100, 2100);
+    json door_mesh = local().box(-450, -100, 0, 450, 100, 2100);
     door_mesh["applicationId"] = "door-geom";
-    json chair_mesh = box(0, 0, 0, 1000, 500, 800);
+    json chair_mesh = local().box(0, 0, 0, 1000, 500, 800);
     chair_mesh["applicationId"] = "chair-geom";
 
     json level_coll = {
@@ -261,10 +278,13 @@ void check_model(const RevitImport &r) {
                    [](const auto &o) { return o.kind == "door"; });
   REQUIRE(door != m.openings.end());
   CHECK(door->wall == w.guid);
-  CHECK(door->s_start == Approx(1.55));
-  CHECK(door->s_end == Approx(2.45));
+  // Rough opening (1000 x 2200) centred on the geometry, not its 900 mm.
+  CHECK(door->s_start == Approx(1.5));
+  CHECK(door->s_end == Approx(2.5));
   CHECK(door->z_sill == Approx(0.0).margin(1e-9));
-  CHECK(door->z_head == Approx(2.1));
+  CHECK(door->z_head == Approx(2.2));
+  CHECK(json::parse(door->metadata)["extent_source"]["s"] ==
+        "FAMILY_ROUGH_WIDTH_PARAM");
   CHECK(door->is_external);
   const auto win =
       std::find_if(m.openings.begin(), m.openings.end(),
@@ -428,4 +448,220 @@ TEST_CASE("an imported Revit model round-trips through the project tables",
   for (const auto &o : back.openings)
     CHECK(o.wall == r.model.walls[0].guid);
   CHECK(back.storeys[1].level_transform[11] == Approx(-0.5));
+}
+
+namespace {
+
+/// The elements of the fixture's L0 collection (walls collection first).
+json &level_elements(json &root) { return root["elements"][0]["elements"]; }
+
+json &element_by_app(json &root, const std::string &app) {
+  for (auto &e : level_elements(root)) {
+    if (e.value("applicationId", "") == app)
+      return e;
+    if (e.contains("elements"))
+      for (auto &w : e["elements"])
+        if (w.value("applicationId", "") == app)
+          return w;
+  }
+  throw std::runtime_error("no element " + app);
+}
+
+/// A flat quad (n = 4 face) at height z.
+json quad(const Fixture &f, double x0, double y0, double x1, double y1,
+          double z) {
+  return {{"speckle_type", "Objects.Geometry.Mesh"},
+          {"units", f.units},
+          {"vertices", {x0, y0, z, x1, y0, z, x1, y1, z, x0, y1, z}},
+          {"faces", {4, 0, 1, 2, 3}}};
+}
+
+} // namespace
+
+TEST_CASE("import_revit: only building-storey levels become storeys",
+          "[io][speckle][revit]") {
+  const Fixture f;
+  json root = f.model();
+  root["levelProxies"].push_back(f.level("Below", 9000, "lvl-b", false));
+  root["levelProxies"].push_back(f.level("Mid", 11500, "lvl-m", false));
+  root["levelProxies"].push_back(f.level("Upper", 14000, "lvl-u", false));
+  element_by_app(root, "wall-a")["level"] = "Mid";   // between L0 and L1
+  element_by_app(root, "room-1")["level"] = "Upper"; // above L1
+  const auto r = import_revit(root);
+  REQUIRE(r.model.storeys.size() == 2);
+  CHECK(r.model.storeys[0].name == "L0");
+  CHECK(r.model.storeys[0].z_floor == Approx(0.0).margin(1e-9));
+  // z0 is the lowest building storey, not the lower reference level.
+  CHECK(r.model.storeys[0].level_transform[11] == Approx(-0.5));
+  CHECK(r.stats.reference_levels == 3);
+  const auto md0 = json::parse(r.model.storeys[0].metadata);
+  REQUIRE(md0["revit"]["reference_levels"].size() == 2); // Below, Mid
+  CHECK(md0["revit"]["reference_levels"][0]["name"] == "Below");
+  CHECK(md0["revit"]["reference_levels"][1]["name"] == "Mid");
+  CHECK(json::parse(r.model.storeys[1].metadata)["revit"]["reference_levels"][0]
+                                                ["name"] == "Upper");
+  REQUIRE(r.model.walls.size() == 1);
+  CHECK(r.model.walls[0].storey == 0);
+  REQUIRE(r.model.spaces.size() == 1);
+  CHECK(r.model.spaces[0].storey == 1);
+  CHECK(r.stats.elements_no_storey == 0);
+}
+
+TEST_CASE("import_revit recentres a model far from the origin",
+          "[io][speckle][revit]") {
+  Fixture f;
+  f.shift_x_mm = 600000.0 * 1000.0; // 600 km
+  const auto r = import_revit(f.model());
+  CHECK(r.stats.world_offset_m[0] == Approx(600000.0));
+  CHECK(r.stats.world_offset_m[1] == 0.0);
+  check_model(r); // the same model, recentred
+  CHECK(json::parse(r.model.storeys[0].metadata)["world_offset_m"][0] ==
+        Approx(600000.0));
+
+  RevitImportOptions keep;
+  keep.recenter = false;
+  const auto k = import_revit(f.model(), keep);
+  CHECK(k.stats.world_offset_m[0] == 0.0);
+  CHECK(k.model.walls[0].x0 == Approx(600000.0));
+}
+
+TEST_CASE("import_revit links a nested hosted element to its parent wall",
+          "[io][speckle][revit]") {
+  const Fixture f;
+  json root = f.model();
+  json door = element_by_app(root, "door-1");
+  door["properties"].erase("parentApplicationId");
+  // Move the door off the wall's line: geometry alone would not host it.
+  door["displayValue"][0]["transform"][7] = 3000.0;
+  auto &elems = level_elements(root);
+  for (std::size_t i = 0; i < elems.size(); ++i)
+    if (elems[i].value("applicationId", "") == "door-1") {
+      elems.erase(i);
+      break;
+    }
+  element_by_app(root, "wall-a")["elements"] = json::array({door});
+  const auto r = import_revit(root);
+  REQUIRE(r.model.openings.size() == 2);
+  CHECK(r.stats.openings_by_parent == 1);
+  const auto d = std::find_if(r.model.openings.begin(), r.model.openings.end(),
+                              [](const auto &o) { return o.kind == "door"; });
+  REQUIRE(d != r.model.openings.end());
+  CHECK(d->wall == r.model.walls[0].guid);
+}
+
+TEST_CASE("import_revit skips an element with an invalid face list",
+          "[io][speckle][revit]") {
+  const Fixture f;
+  json root = f.model();
+  json broken = f.box(0, 0, 0, 100, 100, 100);
+  broken["faces"][1] = -1;
+  json bad = f.element("Furniture", "bad-1", "L0", json::array({broken}));
+  level_elements(root).push_back(bad);
+  const auto r = import_revit(root);
+  CHECK(r.stats.elements_bad_geometry == 1);
+  CHECK(r.model.walls.size() == 1);
+  const auto *chair = mesh_named(r, "imported/furniture");
+  REQUIRE(chair);
+  CHECK(chair->elements == 1); // only the chair
+}
+
+TEST_CASE("import_revit keeps a room's column hole, drops islands and pieces",
+          "[io][speckle][revit]") {
+  const Fixture f;
+  json root = f.model();
+  // Bottom of a 4 x 4 m room with a 1 x 1 m column: a frame of 4 quads.
+  const double z = 500;
+  std::vector<double> v = {0,    0, z,    4000, 0,    z,    4000, 4000,
+                           z,    0, 4000, z,    1500, 1500, z,    2500,
+                           1500, z, 2500, 2500, z,    1500, 2500, z};
+  json bottom = {
+      {"speckle_type", "Objects.Geometry.Mesh"},
+      {"units", f.units},
+      {"vertices", v},
+      {"faces", {4, 0, 1, 5, 4, 4, 1, 2, 6, 5, 4, 2, 3, 7, 6, 4, 3, 0, 4, 7}}};
+  json room =
+      f.element("Rooms", "room-col", "L0",
+                json::array({bottom, quad(f, 0, 0, 4000, 4000, z + 2800),
+                             // an island inside the column ring
+                             quad(f, 1800, 1800, 2200, 2200, z),
+                             // a disjoint piece next to the room
+                             quad(f, 5000, 0, 6000, 1000, z)}));
+  room["name"] = "Hall 9";
+  level_elements(root).push_back(room);
+  const auto r = import_revit(root);
+  const auto s = std::find_if(r.model.spaces.begin(), r.model.spaces.end(),
+                              [](const auto &x) { return x.name == "Hall 9"; });
+  REQUIRE(s != r.model.spaces.end());
+  CHECK(s->polygon.outer.size() == 4);
+  REQUIRE(s->polygon.holes.size() == 1);
+  CHECK(s->polygon.holes[0].size() == 4);
+  CHECK(s->area == Approx(16.0 - 1.0));
+  CHECK(r.stats.room_islands_dropped == 1);
+  CHECK(r.stats.room_pieces_dropped == 1);
+}
+
+TEST_CASE("import_revit_into stores meshes, removes stale ones, logs",
+          "[io][speckle][revit][projectdb]") {
+  reusex::test_support::TempPath tmp("test_speckle_revit_into");
+  const Fixture f;
+  const json full = f.model();
+  json no_chair = full;
+  {
+    auto &elems = level_elements(no_chair);
+    for (std::size_t i = 0; i < elems.size(); ++i)
+      if (elems[i].value("applicationId", "") == "chair-1") {
+        elems.erase(i);
+        break;
+      }
+  }
+  const json source = {{"source", "test"}, {"version", "v1"}};
+  reusex::ProjectDB db(tmp.path);
+
+  RevitImportOptions opt;
+  auto r1 = import_revit_into(db, [&] { return full; }, opt, source);
+  CHECK(r1.meshes_saved == 4);
+  CHECK(r1.stored.walls == 1);
+  CHECK(db.has_mesh("imported/furniture"));
+  const auto md = db.mesh_metadata("imported/walls");
+  CHECK(md.stage == "import_speckle");
+  const auto params = json::parse(md.parameters);
+  CHECK(params["version"] == "v1");
+  CHECK(params["elements"] == 3);
+
+  // --no-meshes: no mesh written, none deleted.
+  RevitImportOptions no_meshes;
+  no_meshes.meshes = false;
+  auto r2 = import_revit_into(db, [&] { return no_chair; }, no_meshes, source);
+  CHECK(r2.meshes_saved == 0);
+  CHECK(r2.meshes_removed == 0);
+  CHECK(db.has_mesh("imported/furniture"));
+  CHECK(db.has_mesh("imported/walls"));
+
+  // A version without the chair removes the furniture mesh.
+  auto r3 = import_revit_into(db, [&] { return no_chair; }, opt, source);
+  CHECK(r3.meshes_saved == 3);
+  CHECK(r3.meshes_removed == 1);
+  CHECK_FALSE(db.has_mesh("imported/furniture"));
+
+  // A failed fetch is logged and stores nothing.
+  CHECK_THROWS_AS(import_revit_into(
+                      db, []() -> json { throw std::runtime_error("offline"); },
+                      opt, source),
+                  std::runtime_error);
+  const auto log = db.pipeline_log();
+  std::size_t ok = 0, failed = 0;
+  for (const auto &e : log) {
+    if (e.stage != "import_speckle")
+      continue;
+    if (e.status == "success")
+      ++ok;
+    if (e.status == "failed") {
+      ++failed;
+      CHECK(e.error_msg.find("offline") != std::string::npos);
+    }
+    CHECK(json::parse(e.parameters)["source"] == "test");
+  }
+  CHECK(ok == 3);
+  CHECK(failed == 1);
+  CHECK(db.has_mesh("imported/walls"));
 }

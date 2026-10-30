@@ -906,6 +906,38 @@ SpeckleReader::query_versions(const std::string &project,
   return parse_versions(data);
 }
 
+VersionInfo SpeckleReader::query_version(const std::string &project,
+                                         const std::string &model,
+                                         const std::string &version) const {
+  require_id(project, "project");
+  require_id(model, "model");
+  require_id(version, "version");
+  static const std::string query =
+      "query ModelVersion($project: String!, $model: String!, $version: "
+      "String!) { project(id: $project) { id model(id: $model) { id "
+      "version(id: $version) { id referencedObject sourceApplication "
+      "createdAt message } } } }";
+  json data = graphql_query(
+      query, {{"project", project}, {"model", model}, {"version", version}},
+      project);
+  const json *v = nullptr;
+  if (data.contains("project") && data["project"].is_object() &&
+      data["project"].contains("model") &&
+      data["project"]["model"].is_object() &&
+      data["project"]["model"].contains("version") &&
+      data["project"]["model"]["version"].is_object())
+    v = &data["project"]["model"]["version"];
+  if (!v)
+    throw std::runtime_error(
+        fmt::format("Speckle: version '{}' not found in model '{}' of "
+                    "project '{}', or no access to it",
+                    version, model, project));
+  // Reuse the list parser for the field mapping.
+  json wrapped = {
+      {"project", {{"model", {{"versions", {{"items", json::array({*v})}}}}}}}};
+  return parse_versions(wrapped).front();
+}
+
 VersionInfo SpeckleReader::latest_version(const std::string &project,
                                           const std::string &model) const {
   auto versions = query_versions(project, model, 1);
