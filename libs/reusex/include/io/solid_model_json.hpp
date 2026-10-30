@@ -101,6 +101,10 @@ struct SolidModelStoreResult {
   /// Records not written: a locked detected / manual row holds their guid
   /// (a storey: guid or idx).
   std::size_t skipped_locked = 0;
+  /// Wall joins / space boundaries that went with a taken-over row.
+  std::size_t dropped_relations = 0;
+  /// Imported wall joins not written: both walls held back by locked rows.
+  std::size_t skipped_joins = 0;
   /// Parts of the model no table holds for an import, so they were not
   /// stored: "plane_classes" (they belong to a detected cloud's planes) and
   /// "scene_relations", in that order. Storeys, walls, spaces and openings
@@ -129,7 +133,13 @@ struct SolidModelStoreResult {
 /// where nothing refers to the element) gets a deterministic one, so a
 /// re-import of the same document writes the same rows:
 /// `core::deterministic_guid(project_guid, "imported/storeys/<idx>")`, and
-/// `"imported/<walls|spaces|openings>/<index in the model>"` for the rest. All
+/// `"imported/<walls|spaces|openings>/<index in the model>"` for the rest.
+/// Caveat: that index is the element's position in the document, so
+/// reordering, inserting or deleting elements before it gives the element a
+/// different guid on the next import (its row is replaced as a new one, and
+/// anything keyed by the old guid -- a survey part's element_guid, a
+/// quantity -- no longer finds it). Give elements a guid when they must
+/// keep their identity across edits of the document. All
 /// in one SAVEPOINT; the rules, and what throws, are
 /// ProjectDB::replace_imported_solid_model's.
 ///

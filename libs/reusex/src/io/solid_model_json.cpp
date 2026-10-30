@@ -913,6 +913,8 @@ SolidModelStoreResult store_solid_model(ProjectDB &db,
   r.replaced_imported = imported.replaced_imported;
   r.taken_over = imported.taken_over;
   r.skipped_locked = imported.skipped_locked;
+  r.dropped_relations = imported.dropped_relations;
+  r.skipped_joins = imported.skipped_joins;
   // No table holds an imported plane class (they belong to a detected
   // cloud's planes) or a scene relation.
   if (model.has_plane_classes())

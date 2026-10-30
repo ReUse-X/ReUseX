@@ -918,6 +918,12 @@ class ProjectDB {
     /// Records not written because a locked detected / manual row holds
     /// their guid (a storey: guid or idx) -- the locked row wins.
     size_t skipped_locked = 0;
+    /// Wall joins and space boundaries that went (ON DELETE CASCADE) with
+    /// a taken-over wall / space.
+    size_t dropped_relations = 0;
+    /// Imported wall joins not written because both their walls were held
+    /// back by locked rows.
+    size_t skipped_joins = 0;
   };
 
   /// Store an imported building model (a reference plan, a Revit / IFC
@@ -934,16 +940,30 @@ class ProjectDB {
   ///  - a record whose guid (a storey: guid or idx) a LOCKED detected /
   ///    manual row holds is not written: the locked row wins, as for
   ///    save_storeys() and the other writers.
+  /// A taken-over row's wall joins / space boundaries go with it
+  /// (dropped_relations). An imported storey that matches one unlocked row
+  /// by guid and ANOTHER by idx takes over both, so the walls / spaces of
+  /// the first row's idx are left on a storey the table no longer holds:
+  /// the call counts walls / spaces of every source on a missing storey idx
+  /// and warns with the number (load_solid_model() still returns them).
   /// Kinds the model does not provide are not touched. A wall join may name
-  /// any wall the table holds after the import; an opening or a space
-  /// boundary must name one (std::invalid_argument otherwise). The whole
-  /// call is one SAVEPOINT (it nests in a ProjectDB::Transaction): a refused
-  /// record leaves every table as it was. Plane classes and scene relations
-  /// in @p model are not stored (plane classes belong to a detected cloud).
+  /// any wall the table holds after the import, but must touch at least one
+  /// wall of @p model's walls: joins have no source column and go only with
+  /// their walls, so a join between two stored walls could never be
+  /// replaced by a re-import; one whose walls were both held back by locked
+  /// rows is not written (skipped_joins). An opening or a space boundary
+  /// must name a wall the table holds (std::invalid_argument otherwise).
+  /// Every diagnostic is counted before the SAVEPOINT is released, so a
+  /// failure rolls the import back rather than surfacing after the commit. The
+  /// whole call is one SAVEPOINT (it nests in a ProjectDB::Transaction): a
+  /// refused record leaves every table as it was. Plane classes and scene
+  /// relations in @p model are not stored (plane classes belong to a detected
+  /// cloud).
   /// @p run_id is the pipeline_log row that produced them (-1 = none).
   /// @throws std::invalid_argument for a record save_storeys(),
-  ///         save_walls(), save_openings() or save_spaces() refuses, or an
-  ///         opening / boundary naming a wall the project does not hold;
+  ///         save_walls(), save_openings() or save_spaces() refuses, a join
+  ///         touching no wall of @p model, or an opening / boundary naming
+  ///         a wall the project does not hold;
   ///         std::runtime_error on a read-only project or one without a
   ///         table for a kind the model provides.
   SolidModelImportResult
