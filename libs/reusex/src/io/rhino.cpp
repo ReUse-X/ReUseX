@@ -246,15 +246,21 @@ auto make_sphere_mesh(double cx, double cy, double cz, double radius,
 namespace {
 
 /// Create a sublayer under a parent layer, returning its index.
+///
+/// The parent is set BEFORE the layer joins the model: a layer name is
+/// unique only among its siblings, so a layer added by name alone and
+/// re-parented afterwards is renamed ("Walls 01") when another parent
+/// already holds one of that name.
 int add_sublayer(ONX_Model &model, const std::string &name,
                  const ON_Layer *parent, ON_Color color = ON_Color::Black) {
-  ON_wString wname(name.c_str());
-  int idx = model.AddLayer(wname, color);
-  auto *layer = const_cast<ON_Layer *>(
-      ON_Layer::Cast(model.LayerFromIndex(idx).ModelComponent()));
+  ON_Layer layer;
+  layer.SetName(ON_wString(name.c_str()));
+  layer.SetColor(color);
   if (parent)
-    layer->SetParentLayerId(parent->Id());
-  return idx;
+    layer.SetParentLayerId(parent->Id());
+  const ON_ModelComponentReference ref = model.AddModelComponent(layer, true);
+  const ON_Layer *added = ON_Layer::Cast(ref.ModelComponent());
+  return added ? added->Index() : ON_UNSET_INT_INDEX;
 }
 
 /// The layer colour of an element category.
@@ -397,9 +403,13 @@ auto export_to_rhino(const ExportScene &scene) -> std::unique_ptr<ONX_Model> {
       attr->m_name = ON_wString(entry.name.c_str());
       attr->m_layer_index = mat_layer_idx;
 
-      // Store all properties as user strings
+      // Store all properties as user strings, except "images": the
+      // passport's base64 JPEG blob (the Speckle export skips it too), which
+      // made up ~40 % of a demo .3dm as UTF-16 user text (reusex-f97m).
       for (const auto &[key, value] : entry.properties)
-        attr->SetUserString(ON_wString(key.c_str()), ON_wString(value.c_str()));
+        if (key != "images")
+          attr->SetUserString(ON_wString(key.c_str()),
+                              ON_wString(value.c_str()));
 
       model->AddManagedModelGeometryComponent(dot, attr);
     }

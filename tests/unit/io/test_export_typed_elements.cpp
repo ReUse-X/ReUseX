@@ -511,3 +511,60 @@ TEST_CASE("TypedExport_CloudReduction_KeepsNormalsAndLabelsAligned",
   // The stored cloud is never touched.
   CHECK(db.point_cloud_xyzrgb("cloud")->size() == 1000);
 }
+
+TEST_CASE("TypedExport_Rhino_SameTypeLayerOnTwoStoreys_KeepsItsName",
+          "[io][rhino][typed]") {
+  // A layer name is unique only among its siblings: "Walls" under two
+  // storeys must not come back as "Walls" and "Walls 01".
+  io::ExportScene scene;
+  scene.storeys = {{0, "s0", "Etage 0", 0, 3}, {1, "s1", "Etage 1", 3, 6}};
+  for (int k = 0; k < 2; ++k) {
+    io::ExportScene::ElementEntry e;
+    e.category = "wall";
+    e.guid = "w" + std::to_string(k);
+    e.storey = k;
+    e.mesh = pcl::PolygonMesh::Ptr(new pcl::PolygonMesh);
+    pcl::PointCloud<pcl::PointXYZ> v;
+    v.push_back({0, 0, 0});
+    v.push_back({1, 0, 0});
+    v.push_back({0, 1, 0});
+    pcl::toPCLPointCloud2(v, e.mesh->cloud);
+    pcl::Vertices t;
+    t.vertices = {0, 1, 2};
+    e.mesh->polygons.push_back(t);
+    scene.elements.push_back(std::move(e));
+  }
+  TempPath file("test_typed_export_two_storeys", ".3dm");
+  REQUIRE(io::export_to_rhino(scene)->Write(file.path.c_str(), 0));
+  ONX_Model back;
+  REQUIRE(back.Read(file.path.c_str()));
+  const auto n = layer_counts(back);
+  CHECK(n.at("Etage 0/Walls") == 1);
+  CHECK(n.at("Etage 1/Walls") == 1);
+  CHECK(n.count("Etage 1/Walls 01") == 0);
+}
+
+TEST_CASE("Rhino_MaterialImagesBlob_NotWrittenAsUserText",
+          "[io][rhino][f97m]") {
+  io::ExportScene scene;
+  io::ExportScene::MaterialEntry m;
+  m.name = "M1";
+  m.properties = {{"images", std::string(1000, 'A')}, {"Material", "Wood"}};
+  scene.materials.push_back(m);
+  const auto model = io::export_to_rhino(scene);
+  bool found = false;
+  ONX_ModelComponentIterator objs(*model,
+                                  ON_ModelComponent::Type::ModelGeometry);
+  for (const ON_ModelComponent *c = objs.FirstComponent(); c;
+       c = objs.NextComponent()) {
+    const auto *g = ON_ModelGeometryComponent::Cast(c);
+    const ON_3dmObjectAttributes *a = g ? g->Attributes(nullptr) : nullptr;
+    if (!a)
+      continue;
+    found = true;
+    ON_wString v;
+    CHECK(a->GetUserString(L"Material", v));
+    CHECK_FALSE(a->GetUserString(L"images", v));
+  }
+  CHECK(found);
+}
