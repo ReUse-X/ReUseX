@@ -10,7 +10,10 @@
 #include <fmt/format.h>
 
 #include <algorithm>
+#include <cctype>
 #include <cstdlib>
+#include <memory>
+#include <mutex>
 #include <set>
 #include <stdexcept>
 #include <unordered_set>
@@ -21,123 +24,9 @@ namespace reusex::io::speckle {
 using nlohmann::json;
 
 // ============================================================
-// HTTP (read-only: GET, and POST of a GraphQL *query* document)
+// Small helpers
 // ============================================================
 namespace {
-
-constexpr std::size_t progress_step_bytes = 8u << 20; // 8 MiB
-
-struct Sink {
-  std::string body;
-  std::string label;
-  std::size_t next_progress = progress_step_bytes;
-};
-
-size_t sink_write(char *ptr, size_t size, size_t nmemb, void *userdata) {
-  auto *sink = static_cast<Sink *>(userdata);
-  sink->body.append(ptr, size * nmemb);
-  if (sink->body.size() >= sink->next_progress) {
-    core::debug("Speckle: {} — {:.1f} MiB received", sink->label,
-                static_cast<double>(sink->body.size()) / (1 << 20));
-    sink->next_progress += progress_step_bytes;
-  }
-  return size * nmemb;
-}
-
-/// Turn a non-2xx status into an exception with a message a user can act on.
-[[noreturn]] void throw_http_error(long code, const std::string &what,
-                                   const std::string &project,
-                                   const std::string &body) {
-  std::string reason;
-  if (code == 401)
-    reason = "not authenticated — the token is missing or invalid";
-  else if (code == 403)
-    reason = fmt::format("token invalid or no access to project '{}'", project);
-  else if (code == 404)
-    reason = "not found — check the project and object ids";
-  else
-    reason = "unexpected response";
-  constexpr std::size_t max_body = 300;
-  throw std::runtime_error(fmt::format(
-      "Speckle {} failed (HTTP {}): {}. Server said: {}", what, code, reason,
-      body.size() > max_body ? body.substr(0, max_body) + "…" : body));
-}
-
-struct HttpRequest {
-  std::string url;
-  std::string token;
-  std::string what;    ///< for messages, e.g. "object download"
-  std::string project; ///< for the 403 message
-  std::string accept = "application/json";
-  const std::string *post_json = nullptr; ///< GraphQL query body, or GET
-  bool long_transfer = false; ///< no total timeout, low-speed abort instead
-};
-
-std::string http_perform(const HttpRequest &req) {
-  CURL *curl = curl_easy_init();
-  if (!curl)
-    throw std::runtime_error("curl_easy_init failed");
-
-  Sink sink;
-  sink.label = req.what;
-  struct curl_slist *headers = nullptr;
-  headers = curl_slist_append(headers, ("Accept: " + req.accept).c_str());
-  if (!req.token.empty())
-    headers = curl_slist_append(headers,
-                                ("Authorization: Bearer " + req.token).c_str());
-  if (req.post_json)
-    headers = curl_slist_append(headers, "Content-Type: application/json");
-
-  // Required for signal-based timeout to work in multithreaded programs.
-  curl_easy_setopt(curl, CURLOPT_NOSIGNAL, 1L);
-  curl_easy_setopt(curl, CURLOPT_CONNECTTIMEOUT, 10L);
-  if (req.long_transfer) {
-    // A full object tree can be hundreds of MB: bound stalls, not size.
-    curl_easy_setopt(curl, CURLOPT_LOW_SPEED_LIMIT, 1024L);
-    curl_easy_setopt(curl, CURLOPT_LOW_SPEED_TIME, 60L);
-  } else {
-    curl_easy_setopt(curl, CURLOPT_TIMEOUT, 60L);
-  }
-  curl_easy_setopt(curl, CURLOPT_URL, req.url.c_str());
-  curl_easy_setopt(curl, CURLOPT_ACCEPT_ENCODING, ""); // gzip/deflate/br
-  curl_easy_setopt(curl, CURLOPT_FOLLOWLOCATION, 1L);
-  curl_easy_setopt(curl, CURLOPT_HTTPHEADER, headers);
-  curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, sink_write);
-  curl_easy_setopt(curl, CURLOPT_WRITEDATA, &sink);
-  if (req.post_json) {
-    curl_easy_setopt(curl, CURLOPT_POSTFIELDS, req.post_json->c_str());
-    curl_easy_setopt(curl, CURLOPT_POSTFIELDSIZE,
-                     static_cast<long>(req.post_json->size()));
-  } else {
-    curl_easy_setopt(curl, CURLOPT_HTTPGET, 1L);
-  }
-
-  CURLcode res = curl_easy_perform(curl);
-  long http_code = 0;
-  curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &http_code);
-  curl_slist_free_all(headers);
-  curl_easy_cleanup(curl);
-
-  if (res != CURLE_OK)
-    throw std::runtime_error(fmt::format("Speckle {}: curl error: {} ({})",
-                                         req.what, curl_easy_strerror(res),
-                                         req.url));
-  if (http_code < 200 || http_code >= 300)
-    throw_http_error(http_code, req.what, req.project, sink.body);
-  return std::move(sink.body);
-}
-
-std::string http_get(const std::string &url, const std::string &token,
-                     const std::string &what, const std::string &project,
-                     bool long_transfer) {
-  HttpRequest req;
-  req.url = url;
-  req.token = token;
-  req.what = what;
-  req.project = project;
-  req.long_transfer = long_transfer;
-  return http_perform(req);
-}
 
 std::string_view trim_left(std::string_view s) {
   while (!s.empty() && (s.front() == ' ' || s.front() == '\t' ||
@@ -153,16 +42,330 @@ std::string string_or_empty(const json &obj, const char *key) {
   return it->get<std::string>();
 }
 
+void require_id(std::string_view id, const char *what) {
+  if (!is_valid_speckle_id(id))
+    throw std::invalid_argument(fmt::format(
+        "Speckle: invalid {} id '{}' (expected 1-128 characters [A-Za-z0-9])",
+        what, id.substr(0, 64)));
+}
+
+std::string lower(std::string s) {
+  std::transform(s.begin(), s.end(), s.begin(), [](unsigned char c) {
+    return static_cast<char>(std::tolower(c));
+  });
+  return s;
+}
+
+} // anonymous namespace
+
+bool is_valid_speckle_id(std::string_view id) {
+  if (id.empty() || id.size() > 128)
+    return false;
+  return std::all_of(id.begin(), id.end(), [](char c) {
+    return (c >= '0' && c <= '9') || (c >= 'a' && c <= 'z') ||
+           (c >= 'A' && c <= 'Z');
+  });
+}
+
+bool is_query_document(std::string_view doc) {
+  // A small GraphQL lexer: enough to find operation keywords and the
+  // brace depth they sit at, skipping comments and (block) strings.
+  int depth = 0;
+  bool expect_definition = true; // at depth 0, before a definition starts
+  bool saw_operation = false;
+  std::size_t i = 0;
+  const std::size_t n = doc.size();
+  auto is_name_char = [](char c) {
+    return c == '_' || (c >= '0' && c <= '9') || (c >= 'a' && c <= 'z') ||
+           (c >= 'A' && c <= 'Z');
+  };
+  while (i < n) {
+    const char c = doc[i];
+    if (c == '#') { // comment to end of line
+      while (i < n && doc[i] != '\n' && doc[i] != '\r')
+        ++i;
+      continue;
+    }
+    if (c == '"') {
+      if (doc.substr(i, 3) == "\"\"\"") { // block string
+        auto end = doc.find("\"\"\"", i + 3);
+        if (end == std::string_view::npos)
+          return false;
+        i = end + 3;
+        continue;
+      }
+      ++i;
+      while (i < n && doc[i] != '"') {
+        if (doc[i] == '\\')
+          ++i;
+        ++i;
+      }
+      if (i >= n)
+        return false; // unterminated string
+      ++i;
+      continue;
+    }
+    if (c == '{') {
+      if (depth == 0 && expect_definition)
+        return false; // anonymous `{ ... }` shorthand
+      ++depth;
+      ++i;
+      continue;
+    }
+    if (c == '}') {
+      if (--depth < 0)
+        return false;
+      if (depth == 0)
+        expect_definition = true;
+      ++i;
+      continue;
+    }
+    if (is_name_char(c)) {
+      std::size_t start = i;
+      while (i < n && is_name_char(doc[i]))
+        ++i;
+      std::string_view word = doc.substr(start, i - start);
+      if (word == "mutation" || word == "subscription")
+        return false; // anywhere outside strings/comments
+      if (depth == 0 && expect_definition) {
+        if (word == "query")
+          saw_operation = true;
+        else if (word != "fragment")
+          return false;
+        expect_definition = false;
+      }
+      continue;
+    }
+    ++i; // punctuation, whitespace, commas, ( ) $ : ! = @ [ ] ...
+  }
+  return depth == 0 && saw_operation;
+}
+
+// ============================================================
+// HTTP (read-only: GET, and POST of a GraphQL *query* document)
+// ============================================================
+namespace detail {
+
+std::string http_error_message(long status, const std::string &what,
+                               const std::string &project,
+                               const std::string &body) {
+  std::string reason;
+  if (status == 401)
+    reason = "not authenticated — the token is missing or invalid";
+  else if (status == 403)
+    reason = fmt::format("token invalid or no access to project '{}'", project);
+  else if (status == 404)
+    reason = "not found — check the project and object ids";
+  else
+    reason = "unexpected response";
+  constexpr std::size_t max_body = 300;
+  return fmt::format(
+      "Speckle {} failed (HTTP {}): {}. Server said: {}", what, status, reason,
+      body.size() > max_body ? body.substr(0, max_body) + "…" : body);
+}
+
+json graphql_data_or_throw(const json &parsed, const std::string &project) {
+  if (!parsed.is_object())
+    throw std::runtime_error("Speckle GraphQL: response is not an object");
+  if (auto errors = parsed.find("errors");
+      errors != parsed.end() && errors->is_array() && !errors->empty()) {
+    const json &first = (*errors)[0];
+    std::string message = string_or_empty(first, "message");
+    std::string code;
+    if (auto ext = first.find("extensions");
+        ext != first.end() && ext->is_object())
+      code = string_or_empty(*ext, "code");
+    if (code == "FORBIDDEN" || code == "UNAUTHENTICATED" ||
+        code == "UNAUTHORIZED")
+      throw std::runtime_error(fmt::format(
+          "Speckle GraphQL: token invalid or no access to project '{}' ({}: "
+          "{})",
+          project, code, message));
+    throw std::runtime_error(fmt::format("Speckle GraphQL error{}: {}",
+                                         code.empty() ? "" : " " + code,
+                                         message));
+  }
+  auto data = parsed.find("data");
+  if (data == parsed.end() || !data->is_object())
+    throw std::runtime_error("Speckle GraphQL: response has no data");
+  return *data;
+}
+
+bool is_allowed_server_url(const std::string &server_url) {
+  const std::string url = lower(server_url);
+  if (url.rfind("https://", 0) == 0)
+    return url.size() > 8;
+  if (url.rfind("http://", 0) != 0)
+    return false;
+  std::string_view rest = std::string_view(url).substr(7);
+  std::string_view host;
+  if (!rest.empty() && rest.front() == '[') {
+    auto close = rest.find(']');
+    if (close == std::string_view::npos)
+      return false;
+    host = rest.substr(0, close + 1);
+    rest.remove_prefix(close + 1);
+  } else {
+    auto end = rest.find_first_of(":/?#");
+    host = rest.substr(0, end);
+    rest.remove_prefix(end == std::string_view::npos ? rest.size() : end);
+  }
+  if (!rest.empty() && rest.front() != ':' && rest.front() != '/')
+    return false;
+  return host == "localhost" || host == "127.0.0.1" || host == "[::1]";
+}
+
+} // namespace detail
+
+namespace {
+
+constexpr std::size_t progress_step_bytes = 8u << 20; // 8 MiB
+
+struct Sink {
+  std::string body;
+  std::string label;
+  std::size_t max_bytes = 0;
+  bool over_limit = false;
+  std::size_t next_progress = progress_step_bytes;
+};
+
+size_t sink_write(char *ptr, size_t size, size_t nmemb, void *userdata) {
+  auto *sink = static_cast<Sink *>(userdata);
+  const std::size_t bytes = size * nmemb;
+  if (sink->body.size() + bytes > sink->max_bytes) {
+    sink->over_limit = true;
+    return 0; // makes curl abort with CURLE_WRITE_ERROR
+  }
+  sink->body.append(ptr, bytes);
+  if (sink->body.size() >= sink->next_progress) {
+    core::debug("Speckle: {} — {:.1f} MiB received", sink->label,
+                static_cast<double>(sink->body.size()) / (1 << 20));
+    sink->next_progress += progress_step_bytes;
+  }
+  return bytes;
+}
+
+void ensure_curl_global_init() {
+  static std::once_flag once;
+  static CURLcode result = CURLE_OK;
+  std::call_once(once, [] { result = curl_global_init(CURL_GLOBAL_DEFAULT); });
+  if (result != CURLE_OK)
+    throw std::runtime_error(
+        fmt::format("curl_global_init failed: {}", curl_easy_strerror(result)));
+}
+
+struct CurlDeleter {
+  void operator()(CURL *c) const { curl_easy_cleanup(c); }
+};
+using CurlHandle = std::unique_ptr<CURL, CurlDeleter>;
+
+/// Owns a curl header list; append() throws when curl cannot allocate.
+class HeaderList {
+    public:
+  HeaderList() = default;
+  HeaderList(const HeaderList &) = delete;
+  HeaderList &operator=(const HeaderList &) = delete;
+  ~HeaderList() { curl_slist_free_all(list_); }
+
+  void append(const std::string &header) {
+    curl_slist *next = curl_slist_append(list_, header.c_str());
+    if (!next)
+      throw std::runtime_error("curl_slist_append failed");
+    list_ = next;
+  }
+  [[nodiscard]] curl_slist *get() const { return list_; }
+
+    private:
+  curl_slist *list_ = nullptr;
+};
+
+struct HttpRequest {
+  std::string url;
+  std::string token;
+  std::string what;    ///< for messages, e.g. "object download"
+  std::string project; ///< for the 403 message
+  std::string accept = "application/json";
+  const std::string *post_json = nullptr; ///< GraphQL query body, or GET
+  bool long_transfer = false; ///< no total timeout, low-speed abort instead
+  std::size_t max_bytes = 0;
+};
+
+std::string http_perform(const HttpRequest &req) {
+  ensure_curl_global_init();
+  CurlHandle curl(curl_easy_init());
+  if (!curl)
+    throw std::runtime_error("curl_easy_init failed");
+  CURL *c = curl.get();
+
+  Sink sink;
+  sink.label = req.what;
+  sink.max_bytes = req.max_bytes;
+  HeaderList headers;
+  headers.append("Accept: " + req.accept);
+  if (!req.token.empty())
+    headers.append("Authorization: Bearer " + req.token);
+  if (req.post_json)
+    headers.append("Content-Type: application/json");
+
+  // The server URL was vetted by is_allowed_server_url: plain http only to
+  // localhost. Redirects may only go to https.
+  const bool plain_http = lower(req.url).rfind("http://", 0) == 0;
+  curl_easy_setopt(c, CURLOPT_PROTOCOLS_STR, plain_http ? "http" : "https");
+  curl_easy_setopt(c, CURLOPT_REDIR_PROTOCOLS_STR, "https");
+  curl_easy_setopt(c, CURLOPT_FOLLOWLOCATION, 1L);
+  curl_easy_setopt(c, CURLOPT_MAXREDIRS, 5L);
+  // Required for signal-based timeout to work in multithreaded programs.
+  curl_easy_setopt(c, CURLOPT_NOSIGNAL, 1L);
+  curl_easy_setopt(c, CURLOPT_CONNECTTIMEOUT, 10L);
+  if (req.long_transfer) {
+    // A full object tree can be hundreds of MB: bound stalls, not time.
+    curl_easy_setopt(c, CURLOPT_LOW_SPEED_LIMIT, 1024L);
+    curl_easy_setopt(c, CURLOPT_LOW_SPEED_TIME, 60L);
+  } else {
+    curl_easy_setopt(c, CURLOPT_TIMEOUT, 60L);
+  }
+  curl_easy_setopt(c, CURLOPT_URL, req.url.c_str());
+  curl_easy_setopt(c, CURLOPT_ACCEPT_ENCODING, ""); // gzip/deflate/br
+  curl_easy_setopt(c, CURLOPT_HTTPHEADER, headers.get());
+  curl_easy_setopt(c, CURLOPT_WRITEFUNCTION, sink_write);
+  curl_easy_setopt(c, CURLOPT_WRITEDATA, &sink);
+  if (req.post_json) {
+    curl_easy_setopt(c, CURLOPT_POSTFIELDS, req.post_json->c_str());
+    curl_easy_setopt(c, CURLOPT_POSTFIELDSIZE,
+                     static_cast<long>(req.post_json->size()));
+  } else {
+    curl_easy_setopt(c, CURLOPT_HTTPGET, 1L);
+  }
+
+  const CURLcode res = curl_easy_perform(c);
+  long http_code = 0;
+  curl_easy_getinfo(c, CURLINFO_RESPONSE_CODE, &http_code);
+
+  if (sink.over_limit)
+    throw std::runtime_error(fmt::format(
+        "Speckle {}: response exceeds the download limit of {} MiB ({}); "
+        "raise SpeckleReader::set_max_download_bytes if this is expected",
+        req.what, req.max_bytes >> 20, req.url));
+  if (res != CURLE_OK)
+    throw std::runtime_error(fmt::format("Speckle {}: curl error: {} ({})",
+                                         req.what, curl_easy_strerror(res),
+                                         req.url));
+  if (http_code < 200 || http_code >= 300)
+    throw std::runtime_error(detail::http_error_message(
+        http_code, req.what, req.project, sink.body));
+  return std::move(sink.body);
+}
+
 // ---- Object-tree helpers ----
 
 bool is_reference(const json &v) {
   if (!v.is_object())
     return false;
-  auto ref = v.find("referencedId");
-  if (ref == v.end() || !ref->is_string())
-    return false;
   auto type = v.find("speckle_type");
-  return type == v.end() || (type->is_string() && *type == "reference");
+  if (type == v.end() || !type->is_string() || *type != "reference")
+    return false;
+  auto ref = v.find("referencedId");
+  return ref != v.end() && ref->is_string();
 }
 
 bool is_data_chunk(const json &v) {
@@ -193,15 +396,105 @@ std::string strip_detach_prefix(const std::string &key) {
   return rest;
 }
 
+/// Number of times each id is referenced, over every stored object and the
+/// value being resolved. Iterative, so a deep tree cannot overflow the stack.
+std::unordered_map<std::string, std::size_t>
+count_reference_uses(const std::unordered_map<std::string, json> &objects,
+                     const json &value) {
+  std::unordered_map<std::string, std::size_t> uses;
+  std::vector<const json *> stack;
+  stack.reserve(1024);
+  stack.push_back(&value);
+  for (const auto &[id, obj] : objects)
+    stack.push_back(&obj);
+  while (!stack.empty()) {
+    const json *v = stack.back();
+    stack.pop_back();
+    if (v->is_object()) {
+      if (is_reference(*v)) {
+        ++uses[(*v)["referencedId"].get<std::string>()];
+        continue;
+      }
+      for (const auto &el : *v)
+        stack.push_back(&el);
+    } else if (v->is_array()) {
+      for (const auto &el : *v)
+        stack.push_back(&el);
+    }
+  }
+  return uses;
+}
+
 class Resolver {
     public:
-  explicit Resolver(const std::unordered_map<std::string, json> &objects)
-      : objects_(objects) {}
+  Resolver(const std::unordered_map<std::string, json> &objects,
+           const ResolveOptions &options, const json &value)
+      : objects_(objects), options_(options),
+        uses_(count_reference_uses(objects, value)) {}
 
-  json walk(const json &v) {
+  /// Resolve a top-level value. When it is a stored object itself (it
+  /// carries the `id` of one), that id counts as in progress, so a
+  /// reference back to it is reported as a cycle rather than expanded once.
+  json walk_top(const json &v) {
+    if (v.is_object() && !is_reference(v)) {
+      auto id = v.find("id");
+      if (id != v.end() && id->is_string() &&
+          objects_.count(id->get<std::string>())) {
+        const std::string key = id->get<std::string>();
+        in_progress_.insert(key);
+        path_.push_back(key);
+        json out = walk(v, 1);
+        path_.pop_back();
+        in_progress_.erase(key);
+        return out;
+      }
+    }
+    return walk(v, 1);
+  }
+
+  ResolveReport finish() {
+    report_.missing_ids.assign(missing_.begin(), missing_.end());
+    report_.cyclic_ids.assign(cyclic_.begin(), cyclic_.end());
+    return std::move(report_);
+  }
+
+    private:
+  struct Cached {
+    json value;
+    std::size_t nodes = 0;
+    std::size_t depth = 0; ///< nesting of the subtree itself
+  };
+
+  void add_nodes(std::size_t n) {
+    report_.nodes += n;
+    if (report_.nodes > options_.max_nodes)
+      throw std::runtime_error(fmt::format(
+          "Speckle: resolved object tree exceeds {} JSON nodes (inside object "
+          "{}); a target shared by many parents inflates when inlined — "
+          "resolve a subtree, or raise ResolveOptions::max_nodes",
+          options_.max_nodes, current_id()));
+  }
+
+  void check_depth(std::size_t depth) {
+    report_.max_depth_reached = std::max(report_.max_depth_reached, depth);
+    local_max_depth_ = std::max(local_max_depth_, depth);
+    if (depth > options_.max_depth)
+      throw std::runtime_error(fmt::format(
+          "Speckle: object tree nests deeper than {} levels (inside object "
+          "{}); refusing to resolve further",
+          options_.max_depth, current_id()));
+  }
+
+  [[nodiscard]] std::string current_id() const {
+    return path_.empty() ? std::string("<value>") : path_.back();
+  }
+
+  json walk(const json &v, std::size_t depth) {
+    if (v.is_object() && is_reference(v))
+      return deref(v["referencedId"].get<std::string>(), v, depth);
+    check_depth(depth);
+    add_nodes(1);
     if (v.is_object()) {
-      if (is_reference(v))
-        return deref(v["referencedId"].get<std::string>(), v);
       json out = json::object();
       for (const auto &[key, val] : v.items()) {
         if (key == "__closure")
@@ -209,7 +502,7 @@ class Resolver {
         std::string name = strip_detach_prefix(key);
         if (name != key && (v.contains(name) || out.contains(name)))
           name = key; // both spellings present: keep the detached one apart
-        out[name] = walk(val);
+        out[name] = walk(val, depth + 1);
       }
       return out;
     }
@@ -217,7 +510,7 @@ class Resolver {
       json out = json::array();
       bool all_chunks = !v.empty();
       for (const auto &el : v) {
-        out.push_back(walk(el));
+        out.push_back(walk(el, depth + 1));
         all_chunks = all_chunks && is_data_chunk(out.back());
       }
       if (!all_chunks)
@@ -232,35 +525,25 @@ class Resolver {
     return v;
   }
 
-  /// Resolve a top-level value. When it is a stored object itself (it
-  /// carries the `id` of one), that id counts as in progress, so a
-  /// reference back to it is reported as a cycle rather than expanded once.
-  json walk_top(const json &v) {
-    if (v.is_object() && !is_reference(v)) {
-      auto id = v.find("id");
-      if (id != v.end() && id->is_string() &&
-          objects_.count(id->get<std::string>())) {
-        const std::string key = id->get<std::string>();
-        in_progress_.insert(key);
-        json out = walk(v);
-        in_progress_.erase(key);
-        return out;
-      }
-    }
-    return walk(v);
-  }
+  json deref(const std::string &id, const json &stub, std::size_t depth) {
+    // Uses left after this one; a target used once is never cached.
+    std::size_t &left = uses_[id];
+    if (left > 0)
+      --left;
 
-  ResolveReport finish() {
-    report_.missing_ids.assign(missing_.begin(), missing_.end());
-    report_.cyclic_ids.assign(cyclic_.begin(), cyclic_.end());
-    return std::move(report_);
-  }
-
-    private:
-  json deref(const std::string &id, const json &stub) {
     if (auto hit = cache_.find(id); hit != cache_.end()) {
       ++report_.references_resolved;
-      return hit->second;
+      ++report_.cache_hits;
+      // The cached subtree was built at some depth; this use may sit
+      // deeper, so its own nesting counts again from here.
+      check_depth(depth + hit->second.depth);
+      add_nodes(hit->second.nodes);
+      if (left == 0) { // last use: hand the cached value over
+        json out = std::move(hit->second.value);
+        cache_.erase(hit);
+        return out;
+      }
+      return hit->second.value;
     }
     if (in_progress_.count(id)) {
       cyclic_.insert(id);
@@ -271,16 +554,35 @@ class Resolver {
       missing_.insert(id);
       return stub;
     }
+
     in_progress_.insert(id);
-    json resolved = walk(it->second);
+    path_.push_back(id);
+    const std::size_t nodes_before = report_.nodes;
+    const std::size_t outer_max_depth = local_max_depth_;
+    local_max_depth_ = depth;
+    json resolved = walk(it->second, depth);
+    const std::size_t subtree_depth = local_max_depth_ - depth;
+    local_max_depth_ = std::max(outer_max_depth, local_max_depth_);
+    path_.pop_back();
     in_progress_.erase(id);
     ++report_.references_resolved;
-    return cache_.emplace(id, std::move(resolved)).first->second;
+
+    if (left > 0 && !is_data_chunk(it->second)) {
+      auto &entry = cache_[id];
+      entry.nodes = report_.nodes - nodes_before;
+      entry.depth = subtree_depth;
+      entry.value = resolved; // one copy kept for the remaining uses
+    }
+    return resolved;
   }
 
   const std::unordered_map<std::string, json> &objects_;
-  std::unordered_map<std::string, json> cache_;
+  const ResolveOptions &options_;
+  std::unordered_map<std::string, std::size_t> uses_;
+  std::unordered_map<std::string, Cached> cache_;
   std::unordered_set<std::string> in_progress_;
+  std::vector<std::string> path_;
+  std::size_t local_max_depth_ = 0;
   std::set<std::string> missing_;
   std::set<std::string> cyclic_;
   ResolveReport report_;
@@ -393,8 +695,9 @@ std::map<std::string, std::size_t> ObjectTree::type_histogram() const {
   return hist;
 }
 
-json ObjectTree::resolve(const json &value, ResolveReport *report) const {
-  Resolver resolver(objects_);
+json ObjectTree::resolve(const json &value, ResolveReport *report,
+                         const ResolveOptions &options) const {
+  Resolver resolver(objects_, options, value);
   json out = resolver.walk_top(value);
   ResolveReport r = resolver.finish();
   if (!r.missing_ids.empty())
@@ -410,8 +713,9 @@ json ObjectTree::resolve(const json &value, ResolveReport *report) const {
   return out;
 }
 
-json ObjectTree::resolve_root(ResolveReport *report) const {
-  return resolve(root(), report);
+json ObjectTree::resolve_root(ResolveReport *report,
+                              const ResolveOptions &options) const {
+  return resolve(root(), report, options);
 }
 
 // ============================================================
@@ -427,9 +731,50 @@ ProjectInfo parse_project_info(const json &data) {
   info.name = string_or_empty(*project, "name");
   if (auto models = project->find("models");
       models != project->end() && models->is_object()) {
-    for (const auto &m : models->value("items", json::array()))
-      info.models.push_back(
-          {string_or_empty(m, "id"), string_or_empty(m, "name")});
+    if (auto items = models->find("items");
+        items != models->end() && items->is_array())
+      for (const auto &m : *items)
+        if (m.is_object())
+          info.models.push_back(
+              {string_or_empty(m, "id"), string_or_empty(m, "name")});
+  }
+  return info;
+}
+
+ProjectInfo
+collect_project_pages(const std::function<json(const json &cursor)> &fetch_page,
+                      int max_pages) {
+  ProjectInfo info;
+  json cursor = nullptr;
+  for (int page = 0; page < max_pages; ++page) {
+    const json data = fetch_page(cursor);
+    ProjectInfo page_info = parse_project_info(data);
+    if (page == 0) {
+      info.id = page_info.id;
+      info.name = page_info.name;
+    }
+    const bool empty_page = page_info.models.empty();
+    for (auto &m : page_info.models)
+      info.models.push_back(std::move(m));
+
+    const json &project = data["project"];
+    auto models = project.find("models");
+    if (models == project.end() || !models->is_object())
+      break; // null / absent models: nothing more to page through
+    auto total = models->find("totalCount");
+    const bool reached_total = total != models->end() &&
+                               total->is_number_integer() &&
+                               info.models.size() >= total->get<std::size_t>();
+    auto next = models->find("cursor");
+    const bool has_cursor = next != models->end() && next->is_string() &&
+                            !next->get_ref<const std::string &>().empty();
+    if (empty_page || reached_total || !has_cursor)
+      break;
+    if (page + 1 == max_pages)
+      core::warn("Speckle: stopped listing models of project '{}' after {} "
+                 "pages ({} models); more may exist",
+                 info.name, max_pages, info.models.size());
+    cursor = *next;
   }
   return info;
 }
@@ -445,7 +790,12 @@ std::vector<VersionInfo> parse_versions(const json &data) {
   auto versions = model->find("versions");
   if (versions == model->end() || !versions->is_object())
     return out;
-  for (const auto &v : versions->value("items", json::array())) {
+  auto items = versions->find("items");
+  if (items == versions->end() || !items->is_array())
+    return out;
+  for (const auto &v : *items) {
+    if (!v.is_object())
+      continue;
     VersionInfo vi;
     vi.id = string_or_empty(v, "id");
     vi.referenced_object = string_or_empty(v, "referencedObject");
@@ -467,6 +817,11 @@ SpeckleReader::SpeckleReader(std::string server_url, std::string token)
     server_url_.pop_back();
   if (server_url_.empty())
     throw std::runtime_error("SpeckleReader: empty server URL");
+  if (!detail::is_allowed_server_url(server_url_))
+    throw std::runtime_error(fmt::format(
+        "SpeckleReader: refusing server URL '{}': use https:// (plain http "
+        "is only allowed to localhost)",
+        server_url_));
   if (token_.empty()) {
     if (const char *env = std::getenv("SPECKLE_TOKEN"))
       token_ = env;
@@ -479,9 +834,8 @@ SpeckleReader::SpeckleReader(std::string server_url, std::string token)
 json SpeckleReader::graphql_query(const std::string &query,
                                   const json &variables,
                                   const std::string &project) const {
-  // Read-only by construction: refuse anything but a query operation.
-  std::string_view doc = trim_left(query);
-  if (doc.rfind("query", 0) != 0)
+  // Read-only by construction: refuse anything but query operations.
+  if (!is_query_document(query))
     throw std::logic_error("SpeckleReader: only GraphQL queries are allowed");
 
   const std::string body =
@@ -492,6 +846,7 @@ json SpeckleReader::graphql_query(const std::string &query,
   req.what = "GraphQL query";
   req.project = project;
   req.post_json = &body;
+  req.max_bytes = max_download_bytes_;
   const std::string response = http_perform(req);
 
   json parsed;
@@ -501,59 +856,27 @@ json SpeckleReader::graphql_query(const std::string &query,
     throw std::runtime_error(
         fmt::format("Speckle GraphQL: invalid JSON response: {}", e.what()));
   }
-  if (auto errors = parsed.find("errors");
-      errors != parsed.end() && errors->is_array() && !errors->empty()) {
-    const json &first = (*errors)[0];
-    std::string message = string_or_empty(first, "message");
-    std::string code;
-    if (auto ext = first.find("extensions");
-        ext != first.end() && ext->is_object())
-      code = string_or_empty(*ext, "code");
-    if (code == "FORBIDDEN" || code == "UNAUTHENTICATED" ||
-        code == "UNAUTHORIZED")
-      throw std::runtime_error(fmt::format(
-          "Speckle GraphQL: token invalid or no access to project '{}' ({}: "
-          "{})",
-          project, code, message));
-    throw std::runtime_error(fmt::format("Speckle GraphQL error{}: {}",
-                                         code.empty() ? "" : " " + code,
-                                         message));
-  }
-  auto data = parsed.find("data");
-  if (data == parsed.end() || !data->is_object())
-    throw std::runtime_error("Speckle GraphQL: response has no data");
-  return *data;
+  return detail::graphql_data_or_throw(parsed, project);
 }
 
 ProjectInfo SpeckleReader::query_project(const std::string &project) const {
+  require_id(project, "project");
   static const std::string query =
       "query ProjectModels($project: String!, $cursor: String) { "
       "project(id: $project) { id name "
       "models(limit: 100, cursor: $cursor) { cursor totalCount "
       "items { id name } } } }";
-  ProjectInfo info;
-  json cursor = nullptr;
   // Bounded pagination (STANDARDS §5): 100 pages of 100 models.
-  for (int page = 0; page < 100; ++page) {
-    json data = graphql_query(query, {{"project", project}, {"cursor", cursor}},
-                              project);
-    if (data["project"].is_null())
-      throw std::runtime_error(fmt::format(
-          "Speckle: project '{}' not found, or no access to it", project));
-    ProjectInfo page_info = parse_project_info(data);
-    if (page == 0) {
-      info.id = page_info.id;
-      info.name = page_info.name;
-    }
-    const bool empty_page = page_info.models.empty();
-    for (auto &m : page_info.models)
-      info.models.push_back(std::move(m));
-    const json &models = data["project"]["models"];
-    const std::size_t total = models.value("totalCount", std::size_t{0});
-    cursor = models.contains("cursor") ? models["cursor"] : json(nullptr);
-    if (empty_page || cursor.is_null() || info.models.size() >= total)
-      break;
-  }
+  ProjectInfo info = collect_project_pages(
+      [&](const json &cursor) {
+        json data = graphql_query(
+            query, {{"project", project}, {"cursor", cursor}}, project);
+        if (!data.contains("project") || data["project"].is_null())
+          throw std::runtime_error(fmt::format(
+              "Speckle: project '{}' not found, or no access to it", project));
+        return data;
+      },
+      100);
   core::debug("Speckle: project '{}' ({}) has {} model(s)", info.name, project,
               info.models.size());
   return info;
@@ -562,6 +885,8 @@ ProjectInfo SpeckleReader::query_project(const std::string &project) const {
 std::vector<VersionInfo>
 SpeckleReader::query_versions(const std::string &project,
                               const std::string &model, int limit) const {
+  require_id(project, "project");
+  require_id(model, "model");
   if (limit < 1)
     throw std::invalid_argument("SpeckleReader::query_versions: limit < 1");
   static const std::string query =
@@ -572,10 +897,10 @@ SpeckleReader::query_versions(const std::string &project,
   json data = graphql_query(
       query, {{"project", project}, {"model", model}, {"limit", limit}},
       project);
-  if (data["project"].is_null())
+  if (!data.contains("project") || data["project"].is_null())
     throw std::runtime_error(fmt::format(
         "Speckle: project '{}' not found, or no access to it", project));
-  if (data["project"]["model"].is_null())
+  if (!data["project"].contains("model") || data["project"]["model"].is_null())
     throw std::runtime_error(fmt::format(
         "Speckle: model '{}' not found in project '{}'", model, project));
   return parse_versions(data);
@@ -593,12 +918,19 @@ VersionInfo SpeckleReader::latest_version(const std::string &project,
 ObjectTree
 SpeckleReader::fetch_object_tree(const std::string &project,
                                  const std::string &object_id) const {
-  const std::string url =
-      fmt::format("{}/objects/{}/{}", server_url_, project, object_id);
+  require_id(project, "project");
+  require_id(object_id, "object");
+  HttpRequest req;
+  req.url = fmt::format("{}/objects/{}/{}", server_url_, project, object_id);
+  req.token = token_;
+  req.what = "object download";
+  req.project = project;
+  req.long_transfer = true;
+  req.max_bytes = max_download_bytes_;
   core::debug("Speckle: downloading object tree {} from project {}", object_id,
               project);
   stopwatch sw;
-  std::string body = http_get(url, token_, "object download", project, true);
+  std::string body = http_perform(req);
   core::debug("Speckle: received {:.1f} MiB in {:.1f} s, parsing",
               static_cast<double>(body.size()) / (1 << 20), sw.elapsed());
   ObjectTree tree = ObjectTree::parse(body, object_id);
@@ -609,9 +941,16 @@ SpeckleReader::fetch_object_tree(const std::string &project,
 
 json SpeckleReader::fetch_object(const std::string &project,
                                  const std::string &object_id) const {
-  const std::string url =
+  require_id(project, "project");
+  require_id(object_id, "object");
+  HttpRequest req;
+  req.url =
       fmt::format("{}/objects/{}/{}/single", server_url_, project, object_id);
-  std::string body = http_get(url, token_, "object fetch", project, false);
+  req.token = token_;
+  req.what = "object fetch";
+  req.project = project;
+  req.max_bytes = max_download_bytes_;
+  std::string body = http_perform(req);
   try {
     return json::parse(body);
   } catch (const json::parse_error &e) {
