@@ -40,6 +40,15 @@ EXAMPLES:
       --project 63142b1e80 --model c15702ceaf
   rux -p house.rux import speckle --project P --model M --version V
   rux -p house.rux import speckle --project P --model M --no-meshes
+  rux -p house.rux import speckle --project P --model M \
+      --elevation-offset -20.82
+
+NOTES:
+  - Only levels flagged as building storeys become storeys; elements on
+    other (reference) levels go to the storey at or below them.
+  - Door / window extents come from the Revit rough opening (else nominal
+    width / height, else the geometry).
+  - --no-meshes writes no mesh and deletes none.
 )");
 
   const reusex::io::speckle::SpeckleRevitImportOptions defaults;
@@ -61,7 +70,17 @@ EXAMPLES:
                   "Thinner walls (finish layers) get no wall record [m]")
       ->default_val(defaults.mapping.min_wall_thickness_m);
 
-  sub->callback([opt, global_opt]() {
+  auto *eo = sub->add_option(
+      "--elevation-offset", opt->elevation_offset_m,
+      "Revit internal z minus level elevation [m] (default: measured from "
+      "the walls)");
+  sub->add_option("--recenter-threshold",
+                  opt->import.mapping.recenter_threshold_m,
+                  "Recentre a model farther than this from the origin [m]")
+      ->default_val(defaults.mapping.recenter_threshold_m);
+
+  sub->callback([opt, global_opt, eo]() {
+    opt->elevation_offset_set = eo->count() > 0;
     spdlog::trace("calling run_subcommand_import_speckle");
     rux::finish(run_subcommand_import_speckle(*opt, *global_opt));
   });
@@ -71,6 +90,8 @@ int run_subcommand_import_speckle(SubcommandImportSpeckleOptions const &opt,
                                   const RuxOptions &global_opt) {
   auto import = opt.import;
   import.mapping.meshes = !opt.no_meshes;
+  if (opt.elevation_offset_set)
+    import.mapping.elevation_offset_m = opt.elevation_offset_m;
   try {
     reusex::ProjectDB db(global_opt.project_db);
     const auto r = reusex::io::speckle::import_speckle_revit(db, import);
@@ -84,6 +105,10 @@ int run_subcommand_import_speckle(SubcommandImportSpeckleOptions const &opt,
                  "imported rows",
                  s.walls_thin, s.walls_not_straight, s.openings_unhosted,
                  s.rooms_unplaced, r.stored.replaced_imported);
+    spdlog::info("Levels: {} ({} reference levels, no storey); openings "
+                 "sized from Revit parameters: {}, from geometry: {}",
+                 s.levels, s.reference_levels, s.openings_extent_params,
+                 s.openings_extent_geometry);
     if (r.stored.skipped_locked > 0)
       spdlog::warn("{} records were not written: a locked detected / manual "
                    "row holds their guid or storey idx",

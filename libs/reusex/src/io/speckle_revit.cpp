@@ -173,6 +173,9 @@ std::string property_string(const json &element, const char *key) {
 struct Soup {
   std::vector<Eigen::Vector3d> v;
   std::vector<std::array<std::uint32_t, 3>> t;
+  /// A mesh of it had an invalid face list (negative / out-of-range index,
+  /// non-integer entry): the whole element is skipped.
+  bool bad = false;
 
   [[nodiscard]] bool empty() const { return t.empty(); }
 
@@ -226,6 +229,11 @@ struct Geometry {
       return;
     const auto &verts = *vit;
     const std::size_t nv = verts.size() / 3;
+    for (const auto &x : verts)
+      if (!x.is_number()) {
+        out.bad = true;
+        return;
+      }
     const auto base = static_cast<std::uint32_t>(out.v.size());
     out.v.reserve(out.v.size() + nv);
     for (std::size_t i = 0; i < nv; ++i)
@@ -236,29 +244,35 @@ struct Geometry {
     const auto &faces = *fit;
     std::size_t i = 0;
     std::vector<std::uint32_t> poly;
+    auto index_at = [&](std::size_t at) -> std::int64_t {
+      const json &f = faces[at];
+      return f.is_number_integer() ? f.get<std::int64_t>() : -1;
+    };
+    std::vector<std::array<std::uint32_t, 3>> tris;
     while (i < faces.size()) {
-      std::size_t n = faces[i].get<std::size_t>();
+      std::int64_t n = index_at(i);
       if (n == 0)
         n = 3;
       else if (n == 1)
         n = 4;
-      if (i + n >= faces.size())
-        break; // truncated face list
+      if (n < 3 || i + static_cast<std::size_t>(n) >= faces.size()) {
+        out.bad = true; // malformed or truncated face list
+        return;
+      }
       poly.clear();
-      bool ok = true;
-      for (std::size_t k = 1; k <= n; ++k) {
-        const auto idx = faces[i + k].get<std::size_t>();
-        if (idx >= nv) {
-          ok = false;
-          break;
+      for (std::int64_t k = 1; k <= n; ++k) {
+        const std::int64_t idx = index_at(i + static_cast<std::size_t>(k));
+        if (idx < 0 || static_cast<std::size_t>(idx) >= nv) {
+          out.bad = true;
+          return;
         }
         poly.push_back(base + static_cast<std::uint32_t>(idx));
       }
-      if (ok)
-        for (std::size_t k = 1; k + 1 < poly.size(); ++k)
-          out.t.push_back({poly[0], poly[k], poly[k + 1]});
-      i += n + 1;
+      for (std::size_t k = 1; k + 1 < poly.size(); ++k)
+        tris.push_back({poly[0], poly[k], poly[k + 1]});
+      i += static_cast<std::size_t>(n) + 1;
     }
+    out.t.insert(out.t.end(), tris.begin(), tris.end());
   }
 
   /// Geometry of one displayValue item: a mesh, an instance proxy (its
@@ -281,8 +295,14 @@ struct Geometry {
         ++unresolved;
         return;
       }
-      // Row-major 4x4; its translation is in the proxy's units, its linear
-      // part is unitless.
+      // Row-major 4x4 (translation at [3], [7], [11]); the translation is in
+      // the proxy's units, the linear part unitless. Checked on a real Revit
+      // export (rvt-oda-importer, 1305 proxies): every transform's bottom
+      // row is (0, 0, 0, 1); read row-major, 163 of 343 furniture /
+      // casework / plumbing items on the two levels that have placed rooms
+      // land inside a room of their own level (the rest stand in corridors
+      // and unplaced rooms) and the most common bottom height is exactly
+      // the level floor; read column-major, none of them do.
       const double ps = units_of(item, scale);
       Eigen::Matrix4d m;
       for (int r = 0; r < 4; ++r)
@@ -463,7 +483,14 @@ WallFit fit_wall(const Soup &soup) {
 }
 
 /// Footprint of a room volume: the outline of its bottom faces.
-std::optional<core::SpacePolygon> room_outline(const Soup &soup, double zmin) {
+/// What room_outline() had to leave out.
+struct OutlineDrops {
+  std::size_t pieces = 0;  ///< rings outside the largest one
+  std::size_t islands = 0; ///< rings inside a hole
+};
+
+std::optional<core::SpacePolygon> room_outline(const Soup &soup, double zmin,
+                                               OutlineDrops &drops) {
   // Welded plan vertices of the bottom faces.
   std::map<std::pair<long long, long long>, std::uint32_t> weld;
   std::vector<P2> pts;
@@ -555,10 +582,21 @@ std::optional<core::SpacePolygon> room_outline(const Soup &soup, double zmin) {
     std::reverse(outer.begin(), outer.end());
   for (const auto &p : outer)
     poly.outer.push_back({p.x(), p.y()});
+  std::vector<std::vector<P2>> holes;
   for (std::size_t i = 1; i < rings.size(); ++i) {
     auto h = rings[i];
-    if (!inside(outer, h.front()))
-      continue; // a second, disjoint piece: dropped
+    if (!inside(outer, h.front())) {
+      ++drops.pieces; // a second, disjoint piece
+      continue;
+    }
+    // Rings are sorted by area, so a ring inside an earlier hole is an
+    // island (e.g. a room part enclosed by a column ring): not representable.
+    if (std::any_of(holes.begin(), holes.end(),
+                    [&](const auto &hh) { return inside(hh, h.front()); })) {
+      ++drops.islands;
+      continue;
+    }
+    holes.push_back(h);
     if (ring_area(h) > 0)
       std::reverse(h.begin(), h.end());
     std::vector<core::PlanPoint> hole;
@@ -592,6 +630,7 @@ struct Element {
   std::string category;
   std::string app_id;
   std::string level;
+  std::string parent_app; ///< applicationId of the element it is nested in
   Soup geom;
 };
 
@@ -701,49 +740,112 @@ RevitImport import_revit(const json &root, const RevitImportOptions &opt) {
   std::vector<Element> walls, openings, rooms;
   std::map<std::string, std::pair<std::string, Soup>> by_slug; // meshes
   std::map<std::string, std::size_t> mesh_elements;
-  std::function<void(const json &)> walk = [&](const json &node) {
-    if (node.is_array()) {
-      for (const auto &x : node)
-        walk(x);
-      return;
-    }
-    if (!node.is_object())
-      return;
-    if (is_element(node)) {
-      ++st.elements;
-      Element e;
-      e.obj = &node;
-      e.category = node["category"].get<std::string>();
-      e.app_id = str_of(node, "applicationId");
-      e.level = str_of(node, "level");
-      ++st.categories[e.category];
-      if (auto dv = node.find("displayValue");
-          dv != node.end() && dv->is_array())
-        for (const auto &x : *dv)
-          geo.gather(x, Eigen::Affine3d::Identity(),
-                     units_of(node, geo.root_scale), 0, e.geom);
-      if (e.geom.empty())
-        ++st.elements_no_geometry;
-      else if (opt.meshes && e.category != "Rooms") {
-        auto &[cat, soup] = by_slug[category_slug(e.category)];
-        if (cat.empty())
-          cat = e.category;
-        soup.append(e.geom);
-        ++mesh_elements[category_slug(e.category)];
-      }
-      if (e.category == "Walls")
-        walls.push_back(std::move(e));
-      else if (e.category == "Doors" || e.category == "Windows")
-        openings.push_back(std::move(e));
-      else if (e.category == "Rooms")
-        rooms.push_back(std::move(e));
-    }
-    if (auto it = node.find("elements"); it != node.end())
-      walk(*it);
-  };
+  std::function<void(const json &, const std::string &)> walk =
+      [&](const json &node, const std::string &parent) {
+        if (node.is_array()) {
+          for (const auto &x : node)
+            walk(x, parent);
+          return;
+        }
+        if (!node.is_object())
+          return;
+        std::string self = parent;
+        if (is_element(node)) {
+          ++st.elements;
+          Element e;
+          e.obj = &node;
+          e.category = node["category"].get<std::string>();
+          e.app_id = str_of(node, "applicationId");
+          e.level = str_of(node, "level");
+          e.parent_app = parent;
+          self = e.app_id;
+          ++st.categories[e.category];
+          if (auto dv = node.find("displayValue");
+              dv != node.end() && dv->is_array())
+            for (const auto &x : *dv)
+              geo.gather(x, Eigen::Affine3d::Identity(),
+                         units_of(node, geo.root_scale), 0, e.geom);
+          if (e.geom.bad) {
+            ++st.elements_bad_geometry;
+            e.geom = Soup{};
+          }
+          if (e.geom.empty())
+            ++st.elements_no_geometry;
+          else if (opt.meshes && e.category != "Rooms") {
+            auto &[cat, soup] = by_slug[category_slug(e.category)];
+            if (cat.empty())
+              cat = e.category;
+            soup.append(e.geom);
+            ++mesh_elements[category_slug(e.category)];
+          }
+          if (e.category == "Walls")
+            walls.push_back(std::move(e));
+          else if (e.category == "Doors" || e.category == "Windows")
+            openings.push_back(std::move(e));
+          else if (e.category == "Rooms")
+            rooms.push_back(std::move(e));
+        }
+        if (auto it = node.find("elements"); it != node.end())
+          walk(*it, self);
+      };
   // Walk the root itself: a copy would leave Element::obj dangling.
   if (auto it = root.find("elements"); it != root.end())
-    walk(*it);
+    walk(*it, std::string{});
+  if (st.elements_bad_geometry > 0)
+    core::warn("import_revit: {} elements have a mesh with an invalid face "
+               "list (negative / out-of-range index); skipped",
+               st.elements_bad_geometry);
+
+  // ---- precision: recentre a model far from the origin (STANDARDS §4).
+  // Everything below (records and meshes) is computed in double; the stored
+  // meshes are float, which keeps ~1 mm only within ~1e4 m of the origin.
+  {
+    Eigen::Vector3d lo = Eigen::Vector3d::Constant(
+                        std::numeric_limits<double>::infinity()),
+                    hi = -lo;
+    auto grow = [&](const Soup &soup) {
+      for (const auto &p : soup.v) {
+        lo = lo.cwiseMin(p);
+        hi = hi.cwiseMax(p);
+      }
+    };
+    for (const auto *list : {&walls, &openings, &rooms})
+      for (const auto &e : *list)
+        grow(e.geom);
+    for (const auto &[slug, cs] : by_slug)
+      grow(cs.second);
+    if (lo.x() <= hi.x()) {
+      const Eigen::Vector3d c = 0.5 * (lo + hi);
+      if (opt.recenter && std::hypot(c.x(), c.y()) > opt.recenter_threshold_m) {
+        const Eigen::Vector3d off(std::round(c.x() / 1000.0) * 1000.0,
+                                  std::round(c.y() / 1000.0) * 1000.0, 0.0);
+        auto shift = [&](Soup &soup) {
+          for (auto &p : soup.v)
+            p -= off;
+        };
+        for (auto *list : {&walls, &openings, &rooms})
+          for (auto &e : *list)
+            shift(e.geom);
+        for (auto &[slug, cs] : by_slug)
+          shift(cs.second);
+        st.world_offset_m = {off.x(), off.y(), off.z()};
+        lo -= off;
+        hi -= off;
+        core::warn("import_revit: the model lies {:.0f} m from the origin; "
+                   "recentred by ({:.0f}, {:.0f}) m (world = Revit internal "
+                   "- world_offset_m, kept in every record's metadata and "
+                   "mesh parameters)",
+                   std::hypot(c.x(), c.y()), off.x(), off.y());
+      }
+      const double far =
+          std::max(lo.cwiseAbs().maxCoeff(), hi.cwiseAbs().maxCoeff());
+      if (far > opt.recenter_threshold_m)
+        core::warn("import_revit: coordinates reach {:.0f} m from the "
+                   "origin; stored (float) meshes lose precision beyond "
+                   "{:.0f} m",
+                   far, opt.recenter_threshold_m);
+    }
+  }
   st.instance_proxies = geo.proxies;
   st.instance_unresolved = geo.unresolved;
   if (geo.unresolved > 0)
@@ -791,22 +893,62 @@ RevitImport import_revit(const json &root, const RevitImportOptions &opt) {
              "({})",
              st.elevation_offset_m, st.elevation_offset_source);
 
-  // ---- storeys: one shared level frame, the lowest level's floor at z = 0
+  // ---- storeys: the building-storey levels (LEVEL_IS_BUILDING_STORY),
+  // one shared level frame with the lowest storey's floor at z = 0.
+  // Reference levels (not a building storey) become no storey; their
+  // elements go to the storey at or below them.
   std::sort(levels.begin(), levels.end(), [](const Level &a, const Level &b) {
     return a.elevation_m < b.elevation_m ||
            (a.elevation_m == b.elevation_m && a.name < b.name);
   });
-  const double z0 = levels.front().elevation_m + st.elevation_offset_m;
+  std::vector<Level> storey_levels, reference_levels;
+  for (const auto &l : levels)
+    (l.building_storey ? storey_levels : reference_levels).push_back(l);
+  if (storey_levels.empty()) {
+    core::warn("import_revit: no level is flagged as a building storey; "
+               "using all {} levels",
+               levels.size());
+    storey_levels = levels;
+    reference_levels.clear();
+  }
+  st.reference_levels = reference_levels.size();
+  for (const auto &l : reference_levels)
+    st.reference_level_names.push_back(l.name);
+  if (!reference_levels.empty())
+    core::info("import_revit: {} reference levels (not building storeys) "
+               "give no storey; their elements go to the storey at or below",
+               reference_levels.size());
+  const double z0 = storey_levels.front().elevation_m + st.elevation_offset_m;
+  // The storey a level at elevation e belongs to: the highest storey at or
+  // below it (1 mm tolerance), else the lowest.
+  auto storey_at = [&](double elevation_m) {
+    int idx = 0;
+    for (std::size_t i = 0; i < storey_levels.size(); ++i)
+      if (storey_levels[i].elevation_m <= elevation_m + 1e-3)
+        idx = static_cast<int>(i);
+    return idx;
+  };
   std::map<std::string, int> storey_of_level;
-  for (std::size_t i = 0; i < levels.size(); ++i) {
-    const auto &l = levels[i];
+  std::vector<json> refs_of_storey(storey_levels.size(), json::array());
+  for (const auto &l : reference_levels) {
+    const int idx = storey_at(l.elevation_m);
+    storey_of_level.emplace(l.name, idx);
+    refs_of_storey[static_cast<std::size_t>(idx)].push_back(
+        {{"name", l.name},
+         {"applicationId", l.app_id},
+         {"elementId", l.element_id},
+         {"elevation_m", l.elevation_m}});
+  }
+  for (std::size_t i = 0; i < storey_levels.size(); ++i) {
+    const auto &l = storey_levels[i];
     core::StoreyRecord s;
     s.idx = static_cast<int>(i);
     s.name = l.name;
     s.z_floor = l.elevation_m + st.elevation_offset_m - z0;
-    s.z_ceiling = i + 1 < levels.size()
-                      ? levels[i + 1].elevation_m + st.elevation_offset_m - z0
-                      : s.z_floor + opt.default_storey_height_m;
+    s.z_ceiling =
+        i + 1 < storey_levels.size()
+            ? storey_levels[i + 1].elevation_m + st.elevation_offset_m - z0
+            : s.z_floor + opt.default_storey_height_m;
     s.level_transform = {1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, -z0, 0, 0, 0, 1};
     s.guid =
         guid_for("storeys", l.app_id.empty() ? "name:" + l.name : l.app_id, i);
@@ -816,11 +958,14 @@ RevitImport import_revit(const json &root, const RevitImportOptions &opt) {
                  {"name", l.name},
                  {"elevation_m", l.elevation_m},
                  {"building_storey", l.building_storey}}},
-               {"elevation_offset_m", st.elevation_offset_m}};
+               {"elevation_offset_m", st.elevation_offset_m},
+               {"world_offset_m", st.world_offset_m}};
     if (!l.ifc_guid.empty())
       md["revit"]["IfcGUID"] = l.ifc_guid;
+    if (!refs_of_storey[i].empty())
+      md["revit"]["reference_levels"] = refs_of_storey[i];
     s.metadata = md.dump();
-    storey_of_level.emplace(l.name, s.idx);
+    storey_of_level[l.name] = s.idx;
     out.model.storeys.push_back(std::move(s));
   }
   out.model.provided.storeys = true;
@@ -920,7 +1065,10 @@ RevitImport import_revit(const json &root, const RevitImportOptions &opt) {
     const P2 c(0.5 * (lo.x() + hi.x()), 0.5 * (lo.y() + hi.y()));
     std::optional<std::size_t> host;
     bool by_parent = false;
-    if (auto pid = property_string(*e.obj, "parentApplicationId"); !pid.empty())
+    std::string pid = property_string(*e.obj, "parentApplicationId");
+    if (pid.empty())
+      pid = e.parent_app; // hosted element nested under its host
+    if (!pid.empty())
       if (auto it = wall_by_app.find(pid); it != wall_by_app.end()) {
         host = it->second;
         by_parent = true;
@@ -956,9 +1104,58 @@ RevitImport import_revit(const json &root, const RevitImportOptions &opt) {
       s_lo = std::min(s_lo, s);
       s_hi = std::max(s_hi, s);
     }
+    // Extents: the Revit rough opening (the hole in the wall) when the
+    // family gives one, else its nominal width / height, else the
+    // geometry (which includes casings and linings). The width is centred on
+    // the geometry's extent along the host; the height starts at the sill
+    // height above the element's level. A parameter extent that does not
+    // overlap the geometry at all (a wrong level, say) is not used.
+    const double ps = units_of(*e.obj, geo.root_scale);
+    std::string s_source = "geometry", z_source = "geometry";
+    auto first_length = [&](std::initializer_list<const char *> idns,
+                            std::string &which) -> std::optional<double> {
+      for (const char *idn : idns)
+        if (auto v = param_length(*e.obj, idn, ps); v && *v > 0) {
+          which = idn;
+          return v;
+        }
+      return std::nullopt;
+    };
+    std::string wsrc, hsrc;
+    const auto width =
+        first_length({"FAMILY_ROUGH_WIDTH_PARAM", "GENERIC_WIDTH",
+                      "FAMILY_WIDTH_PARAM", "DOOR_WIDTH", "WINDOW_WIDTH"},
+                     wsrc);
+    const auto height =
+        first_length({"FAMILY_ROUGH_HEIGHT_PARAM", "GENERIC_HEIGHT",
+                      "FAMILY_HEIGHT_PARAM", "DOOR_HEIGHT", "WINDOW_HEIGHT"},
+                     hsrc);
+    if (width) {
+      const double sc = 0.5 * (s_lo + s_hi);
+      s_lo = sc - 0.5 * *width;
+      s_hi = sc + 0.5 * *width;
+      s_source = wsrc;
+    }
+    double z_lo = lo.z(), z_hi = hi.z();
+    if (height) {
+      auto lv = elevation_by_name.find(e.level);
+      const auto sill = param_length(*e.obj, "INSTANCE_SILL_HEIGHT_PARAM", ps);
+      if (lv != elevation_by_name.end() && sill) {
+        const double zs = lv->second + st.elevation_offset_m + *sill;
+        const double zh = zs + *height;
+        if (zh > lo.z() && zs < hi.z()) {
+          z_lo = zs;
+          z_hi = zh;
+          z_source = hsrc;
+        }
+      }
+    }
     s_lo = std::clamp(s_lo, 0.0, g.length);
     s_hi = std::clamp(s_hi, 0.0, g.length);
-    if (s_hi - s_lo < kMinOpeningWidthM || hi.z() - lo.z() < 0.05) {
+    (s_source == "geometry" && z_source == "geometry"
+         ? st.openings_extent_geometry
+         : st.openings_extent_params)++;
+    if (s_hi - s_lo < kMinOpeningWidthM || z_hi - z_lo < 0.05) {
       ++st.openings_unhosted;
       continue;
     }
@@ -968,11 +1165,12 @@ RevitImport import_revit(const json &root, const RevitImportOptions &opt) {
     o.kind = e.category == "Doors" ? "door" : "window";
     o.s_start = s_lo;
     o.s_end = s_hi;
-    o.z_sill = lo.z() - z0;
-    o.z_head = hi.z() - z0;
+    o.z_sill = z_lo - z0;
+    o.z_head = z_hi - z0;
     o.is_external = out.model.walls[*host].is_external;
     json md = {{"revit", revit_identity(e)},
-               {"host", by_parent ? "parentApplicationId" : "geometry"}};
+               {"host", by_parent ? "parentApplicationId" : "geometry"},
+               {"extent_source", {{"s", s_source}, {"z", z_source}}}};
     if (auto m = param_string(*e.obj, "ALL_MODEL_MARK"); !m.empty())
       md["revit"]["mark"] = m;
     o.metadata = md.dump();
@@ -997,7 +1195,10 @@ RevitImport import_revit(const json &root, const RevitImportOptions &opt) {
       continue;
     }
     const auto [zlo, zhi] = e.geom.z_range();
-    auto poly = room_outline(e.geom, zlo);
+    OutlineDrops drops;
+    auto poly = room_outline(e.geom, zlo, drops);
+    st.room_pieces_dropped += drops.pieces;
+    st.room_islands_dropped += drops.islands;
     if (!poly) {
       ++st.rooms_bad_outline;
       continue;
@@ -1046,6 +1247,11 @@ RevitImport import_revit(const json &root, const RevitImportOptions &opt) {
     core::warn("import_revit: {} rooms have a volume mesh without a closed "
                "bottom outline; skipped",
                st.rooms_bad_outline);
+  if (st.room_pieces_dropped + st.room_islands_dropped > 0)
+    core::warn("import_revit: room outlines left out {} disjoint pieces "
+               "(only the largest piece of a room is kept) and {} islands "
+               "inside holes",
+               st.room_pieces_dropped, st.room_islands_dropped);
   if (st.elements_no_storey > 0)
     core::warn("import_revit: {} elements name no known level; placed on the "
                "storey their bottom stands in",
@@ -1072,47 +1278,15 @@ RevitImport import_revit(const json &root, const RevitImportOptions &opt) {
   return out;
 }
 
-SpeckleRevitImportResult
-import_speckle_revit(ProjectDB &db, const SpeckleRevitImportOptions &opt) {
-  if (opt.project.empty() || opt.model.empty())
-    throw std::invalid_argument(
-        "import_speckle_revit: a project and a model id are required");
-  SpeckleReader reader(opt.server_url, opt.token);
-  SpeckleRevitImportResult res;
-  if (opt.version.empty()) {
-    res.version = reader.latest_version(opt.project, opt.model);
-  } else {
-    const auto versions = reader.query_versions(opt.project, opt.model, 100);
-    auto it = std::find_if(versions.begin(), versions.end(),
-                           [&](const auto &v) { return v.id == opt.version; });
-    if (it == versions.end())
-      throw std::runtime_error(fmt::format(
-          "import_speckle_revit: version '{}' is not among the newest 100 "
-          "versions of model '{}'",
-          opt.version, opt.model));
-    res.version = *it;
-  }
-  core::info("import_speckle_revit: project {} model {} version {} ({}, {})",
-             opt.project, opt.model, res.version.id,
-             res.version.source_application, res.version.created_at);
-
-  const json source = {{"source", "speckle"},
-                       {"server", reader.server_url()},
-                       {"project", opt.project},
-                       {"model", opt.model},
-                       {"version", res.version.id},
-                       {"root_object", res.version.referenced_object},
-                       {"source_application", res.version.source_application}};
+RevitStoreResult import_revit_into(ProjectDB &db,
+                                   const std::function<json()> &resolved_root,
+                                   const RevitImportOptions &options,
+                                   const json &source) {
+  RevitStoreResult res;
   const int log_id = db.log_pipeline_start("import_speckle", source.dump());
   try {
-    const ObjectTree tree =
-        reader.fetch_object_tree(opt.project, res.version.referenced_object);
-    ResolveReport report;
-    const json root = tree.resolve_root(&report);
-    core::info("import_speckle_revit: {} objects, {} references resolved",
-               tree.size(), report.references_resolved);
-
-    RevitImportOptions mapping = opt.mapping;
+    const json root = resolved_root();
+    RevitImportOptions mapping = options;
     mapping.guid_namespace = db.project_guid();
     RevitImport imported = import_revit(root, mapping);
     res.stats = imported.stats;
@@ -1144,18 +1318,22 @@ import_speckle_revit(ProjectDB &db, const SpeckleRevitImportOptions &opt) {
       params["elements"] = m.elements;
       params["units"] = "m";
       params["frame"] = "revit_internal";
+      params["world_offset_m"] = res.stats.world_offset_m;
       db.save_mesh(m.name, mesh, "import_speckle", params.dump());
       written.insert(m.name);
       ++res.meshes_saved;
     }
-    for (const auto &name : db.list_meshes()) {
-      if (name.rfind("imported/", 0) != 0 || written.count(name))
-        continue;
-      if (db.mesh_metadata(name).stage != "import_speckle")
-        continue;
-      db.delete_mesh(name);
-      ++res.meshes_removed;
-    }
+    // Earlier imported meshes this version no longer has -- only when this
+    // import writes meshes at all: --no-meshes leaves them alone.
+    if (mapping.meshes)
+      for (const auto &name : db.list_meshes()) {
+        if (name.rfind("imported/", 0) != 0 || written.count(name))
+          continue;
+        if (db.mesh_metadata(name).stage != "import_speckle")
+          continue;
+        db.delete_mesh(name);
+        ++res.meshes_removed;
+      }
     tx.commit();
     if (res.meshes_removed > 0)
       core::info("import_speckle_revit: removed {} meshes of an earlier "
@@ -1166,6 +1344,44 @@ import_speckle_revit(ProjectDB &db, const SpeckleRevitImportOptions &opt) {
     db.log_pipeline_end(log_id, false, e.what());
     throw;
   }
+  return res;
+}
+
+SpeckleRevitImportResult
+import_speckle_revit(ProjectDB &db, const SpeckleRevitImportOptions &opt) {
+  if (opt.project.empty() || opt.model.empty())
+    throw std::invalid_argument(
+        "import_speckle_revit: a project and a model id are required");
+  SpeckleReader reader(opt.server_url, opt.token);
+  SpeckleRevitImportResult res;
+  res.version = opt.version.empty()
+                    ? reader.latest_version(opt.project, opt.model)
+                    : reader.query_version(opt.project, opt.model, opt.version);
+  core::info("import_speckle_revit: project {} model {} version {} ({}, {})",
+             opt.project, opt.model, res.version.id,
+             res.version.source_application, res.version.created_at);
+
+  const json source = {{"source", "speckle"},
+                       {"server", reader.server_url()},
+                       {"project", opt.project},
+                       {"model", opt.model},
+                       {"version", res.version.id},
+                       {"root_object", res.version.referenced_object},
+                       {"source_application", res.version.source_application}};
+  auto fetch = [&]() {
+    const ObjectTree tree =
+        reader.fetch_object_tree(opt.project, res.version.referenced_object);
+    ResolveReport report;
+    json root = tree.resolve_root(&report);
+    core::info("import_speckle_revit: {} objects, {} references resolved",
+               tree.size(), report.references_resolved);
+    return root;
+  };
+  RevitStoreResult stored = import_revit_into(db, fetch, opt.mapping, source);
+  res.stats = std::move(stored.stats);
+  res.stored = stored.stored;
+  res.meshes_saved = stored.meshes_saved;
+  res.meshes_removed = stored.meshes_removed;
   return res;
 }
 

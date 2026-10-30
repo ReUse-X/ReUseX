@@ -887,15 +887,25 @@ object; never the token, which comes from `SPECKLE_TOKEN`).
 
 Mapping (`libs/reusex/include/io/speckle_revit.hpp`):
 
-- **Frame.** World is Revit's internal coordinate system in metres, as the
-  connector writes the meshes (any unit the root declares is converted);
-  nothing is aligned to a scan. Level elevations are relative to their
+- **Frame.** World is the frame the connector wrote the mesh vertices in,
+  in metres (any unit the root declares is converted): Revit's internal
+  origin, or the project base / survey point, depending on the connector's
+  reference-point setting -- so x / y depend on that setting. Nothing is
+  aligned to a scan. A model whose plan centre lies more than 10 km from the
+  origin is recentred by a whole-km x / y offset (`world_offset_m` in every
+  storey's metadata and every mesh's parameters; world = connector frame -
+  offset), so the float meshes keep mm precision (STANDARDS §4); a warn is
+  logged either way. Level elevations are relative to their
   elevation base (often the survey point); the offset to internal z is
   measured from the walls (bottom = base level + base offset; the mode over
-  all walls, logged with its vote count). All storeys share one level frame,
-  as detected storeys do: `level_transform` translates the lowest level's
-  floor to z = 0, `z_floor` is each level's height above it and `z_ceiling`
-  the next level's (the top storey: + `--storey-height`).
+  all walls, logged with its vote count; `--elevation-offset` overrides
+  it). Only levels flagged as a building storey (`LEVEL_IS_BUILDING_STORY`)
+  become storeys; elements on a reference level go to the storey at or
+  below it, and that storey's metadata lists the reference level. All
+  storeys share one level frame, as detected storeys do: `level_transform`
+  translates the lowest storey's floor to z = 0, `z_floor` is each storey's
+  height above it and `z_ceiling` the next storey's (the top storey: +
+  `--storey-height`).
 - **Walls**: a Walls element whose footprint (convex hull, minimum-area
   rectangle) is a straight rectangle becomes a wall: axis through the
   rectangle's middle, thickness = the type's width (else measured),
@@ -903,17 +913,23 @@ Mapping (`libs/reusex/include/io/speckle_revit.hpp`):
   Exterior. Walls thinner than `--min-wall-thickness` (finish layers) and
   non-straight footprints are mesh-only, each counted at warn.
 - **Openings**: Doors / Windows hosted on an imported wall, by
-  `parentApplicationId` else geometrically (centre within the wall's
-  thickness + 0.3 m, overlapping its run); `s_start` / `s_end` from the
-  element's extent along the host axis, `z_sill` / `z_head` from its z
-  range. Unhosted ones are mesh-only, counted at warn.
+  `parentApplicationId`, else the element they are nested under, else
+  geometrically (centre within the wall's thickness + 0.3 m, overlapping
+  its run). Width and height come from the Revit rough opening (else the
+  nominal width / height), the width centred on the element's extent along
+  the host axis and the height from its sill height above its level; the
+  geometry (casings included) is the fallback. `metadata.extent_source`
+  says which. Unhosted ones are mesh-only, counted at warn.
 - **Spaces**: Rooms with a volume mesh; the polygon is the outline of its
-  bottom faces (holes kept), `z_floor` / `z_ceiling` from the mesh, area,
+  bottom faces (holes kept; disjoint pieces and islands inside holes are
+  dropped, counted at warn), `z_floor` / `z_ceiling` from the mesh, area,
   perimeter, volume, compactness, kind `room`. Unplaced rooms (no volume
   mesh) are skipped, one warn listing their names.
 - **Meshes**: every element's geometry (instance proxies expanded) merged per
   category, Rooms excepted, in the world frame; a re-import deletes earlier
-  `import_speckle` meshes this version no longer has.
+  `import_speckle` meshes this version no longer has (`--no-meshes` writes
+  and deletes none). An element whose mesh has an invalid face list is
+  skipped, counted at warn.
 - **Identity**: GUIDs are `uuid5(project_guid,
   "imported/revit/<kind>/<Revit applicationId>")`, so a re-import of the
   same model keeps them; each record's `metadata` holds the Revit identity
