@@ -693,6 +693,10 @@ TEST_CASE("ClassifyPlanes_WallClassFloatingFree_GeometryOverrules",
   const auto ids = sc.room(0.0, /*label=*/true);
   const size_t floating = sc.wall_x(1.0, 1.0, 2.0, 0.7, 1.9, kWall);
   const size_t door_high = sc.wall_x(4.0, 1.0, 2.5, 0.0, 1.9, kWall);
+  // A short, floor-standing "wall" sheet (house2's conservatory: a 1.2 m
+  // high, 1 m wide board) stands on the floor but is neither tall nor long
+  // enough to be a wall (reusex-rqn.4).
+  const size_t low_sheet = sc.wall_x(2.5, 1.0, 2.0, 0.0, 1.2, kWall);
   // A kitchen backsplash between counter and wall cabinets: the wall's
   // face, seen only from 0.9 to 1.5 m, but long.
   const size_t backsplash = sc.wall_y(0.5, 1.0, 3.5, 0.9, 1.5, kWall);
@@ -704,6 +708,8 @@ TEST_CASE("ClassifyPlanes_WallClassFloatingFree_GeometryOverrules",
   CHECK(r.role_source[floating] == RoleSource::overruled);
   CHECK(rec(r, door_high).role == "wall");
   CHECK(r.role_source[door_high] == RoleSource::semantic);
+  CHECK(rec(r, low_sheet).role == "clutter");
+  CHECK(r.role_source[low_sheet] == RoleSource::overruled);
   CHECK(rec(r, backsplash).role == "wall");
   CHECK(r.role_source[backsplash] == RoleSource::semantic);
   CHECK(rec(r, ids[2]).role == "wall");

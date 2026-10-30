@@ -117,6 +117,12 @@ NOTES:
                   "is a wall only if it runs this far [m]")
       ->default_val(c.min_floating_wall_run_m)
       ->check(CLI::Range(0.0, 100.0));
+  sub->add_option("--min-class-wall-height-share",
+                  c.min_class_wall_height_share,
+                  "... and a shorter one that touches floor or ceiling only "
+                  "if it stands this share of the storey height")
+      ->default_val(c.min_class_wall_height_share)
+      ->check(CLI::Range(0.0, 1.0));
   sub->add_option("--role-map", opt->role_map,
                   "Class -> role map JSON file (default: the built-in map)");
   auto *print_map = sub->add_flag(
@@ -154,6 +160,7 @@ classify_stage_parameters(SubcommandCreateClassifyOptions const &opt) {
       .set("min_labelled_share", c.min_labelled_share)
       .set("min_class_share", c.min_class_share)
       .set("min_floating_wall_run_m", c.min_floating_wall_run_m)
+      .set("min_class_wall_height_share", c.min_class_wall_height_share)
       .set("role_map", opt.role_map)
       .dump();
 }

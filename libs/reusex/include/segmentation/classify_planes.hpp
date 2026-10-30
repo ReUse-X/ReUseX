@@ -23,7 +23,8 @@
 /// the plane is the one of those two with more votes. The record still
 /// carries the majority class and its own share. The class role "wall"
 /// needs a vertical plane that reaches within 2 x band_m of the floor, the
-/// ceiling or a split level (not the full height), or runs at least
+/// ceiling or a split level and stands at least min_class_wall_height_share
+/// of the storey's height (not the full height), or runs at least
 /// min_floating_wall_run_m along the wall. "Large" is
 /// min_large_area_m2, "too big for furniture" is max_furniture_area_m2, the
 /// storey's floor / ceiling heights come from its row (with no storeys: the
@@ -115,6 +116,11 @@ struct ClassifyPlanesOptions {
   /// "wall"-labelled sheet floating free of both (a cupboard side, a window
   /// reveal) is overruled [m] (reusex-rqn.4).
   double min_floating_wall_run_m = 1.5;
+  /// ...and one that runs shorter than that must, where it touches, stand
+  /// at least this share of the storey's height (from the floor it stands
+  /// on to the ceiling): a 1.2 m board on the floor is not a wall, a wall
+  /// seen to door height is (reusex-rqn.4).
+  double min_class_wall_height_share = 0.6;
 };
 
 /// Who decided a plane's role.

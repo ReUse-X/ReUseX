@@ -941,6 +941,8 @@ StageResult run_classify(ProjectDB &db, const json &params, int log_id) {
   o.min_class_share = param_or(params, "min_class_share", o.min_class_share);
   o.min_floating_wall_run_m =
       param_or(params, "min_floating_wall_run_m", o.min_floating_wall_run_m);
+  o.min_class_wall_height_share = param_or(
+      params, "min_class_wall_height_share", o.min_class_wall_height_share);
 
   // The class -> role map: a file path (rux create classify --role-map), an
   // inline role-map object (a job built by hand), or the built-in map.

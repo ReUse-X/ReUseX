@@ -649,6 +649,11 @@ const std::vector<ParameterDescriptor> &classify_parameters() {
              "A 'wall'-labelled plane that reaches neither floor nor ceiling "
              "is a wall only if it runs this far along the wall.",
              d.min_floating_wall_run_m, 0.0, 100.0),
+        dnum("min_class_wall_height_share", "Labelled wall height share",
+             "A shorter 'wall'-labelled plane that touches the floor or "
+             "ceiling is a wall only if it stands this share of the storey "
+             "height.",
+             d.min_class_wall_height_share, 0.0, 1.0),
         text("role_map", "Role map file",
              "Class -> role map JSON file (core/class_role_map.hpp); empty = "
              "the built-in map.",

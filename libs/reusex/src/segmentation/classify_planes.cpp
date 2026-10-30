@@ -227,16 +227,28 @@ bool class_role_fits(PlaneRole role, PlaneRole rules, const PlaneGeometry &g,
                      const Reference &ref, const ClassifyPlanesOptions &opt) {
   const bool horizontal = g.orientation == Orientation::horizontal;
   switch (role) {
-  case PlaneRole::wall:
+  case PlaneRole::wall: {
     // A wall stands on a floor or meets the ceiling; a "wall"-labelled
     // sheet floating free of both is a cupboard side or a reveal
     // (reusex-rqn.4). It need not be full height: walls seen to door height
     // keep their class.
     // The band is twice the rules' one: skirting, a radiator or a desk can
     // hide a wall's foot, a soffit its head.
-    return g.orientation == Orientation::vertical &&
-           (touches_floor_or_ceiling(g, ref, 2.0 * opt.band_m) ||
-            g.run >= opt.min_floating_wall_run_m);
+    // A short and narrow floor-standing sheet (a board, a cupboard back)
+    // is not one either: what touches must also stand at least
+    // min_class_wall_height_share of the storey's height.
+    if (g.orientation != Orientation::vertical)
+      return false;
+    if (g.run >= opt.min_floating_wall_run_m)
+      return true;
+    double base = ref.floor;
+    if (!touches_floor_or_ceiling(g, ref, 2.0 * opt.band_m, &base))
+      return false;
+    if (std::isnan(base) || !ref.has_ceiling())
+      return true;
+    return g.z_hi - g.z_lo >=
+           opt.min_class_wall_height_share * (ref.ceiling - base);
+  }
   case PlaneRole::floor:
     return horizontal && g.may_face_up() &&
            (!ref.has_floor() || rules == PlaneRole::floor ||
@@ -337,6 +349,9 @@ void check_options(const ClassifyPlanesOptions &o) {
     bad("min_labelled_share");
   if (!(o.min_floating_wall_run_m >= 0.0))
     bad("min_floating_wall_run_m");
+  if (!(o.min_class_wall_height_share >= 0.0 &&
+        o.min_class_wall_height_share <= 1.0))
+    bad("min_class_wall_height_share");
 }
 
 } // namespace

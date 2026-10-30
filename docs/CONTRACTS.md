@@ -371,7 +371,8 @@ rules. Each labelled point votes for its class's role, so near-synonyms add
 up ("cabinet" + "shelf" = furniture); a role needs `min_class_share` of the
 votes, or furniture and clutter together do and the larger of the two is
 taken (reusex-rqn.4). The class role `wall` needs a vertical plane that
-reaches within 2 × `band_m` of the floor, the ceiling or a split level, or
+reaches within 2 × `band_m` of the floor, the ceiling or a split level and
+stands at least `min_class_wall_height_share` of the storey's height, or
 runs at least `min_floating_wall_run_m` along the wall. Every class of the default `rux create annotate`
 prompt list (`vision/default_prompts.hpp`) has a role in the built-in map;
 a column is `clutter` (not a wall), a glass partition `wall`.

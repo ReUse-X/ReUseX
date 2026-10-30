@@ -268,6 +268,16 @@ unchanged (0.791). house2 0.615: its first labels make plane 92, a 1.4 m
 tall floor-standing "wall" sheet north of the conservatory, a wall that
 splits the conservatory (0.764 → 0.309); with it left to the rules house2
 is 0.642.
+Third round (same PR, 2026-10-30, re-annotated on main 5e6d8ed4): a
+"wall"-labelled plane that runs < 1.5 m must also stand
+`min_class_wall_height_share` (0.6) of its storey's height where it
+touches floor or ceiling, so plane 92 (1.25 m of a 2.5 m storey, 1.2 m
+run) goes back to the rules and the conservatory to 0.764; attic knee
+walls (1 m tall, ≥ 1.75 m long) keep their class. New labels, branch vs
+main on the same inputs: house2 room IoU 0.645 (main, no labels 0.631;
+main, new labels 0.616), NewOffice 0.889 (0.883 / 0.862), wall precision
+0.486 (0.459 / 0.425), opening precision 0.800 (0.714 / 0.735); house1
+0.788 (0.790 / 0.789).
 
 ### 4.4 (d) Trajectory
 
