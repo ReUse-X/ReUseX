@@ -51,7 +51,10 @@ subcommand makes, so a stage that validates cannot then be refused when run.
   `building_components`, `meshes` — or, for the solid-model tables
   (`storeys`, `plane_classes`, `walls`, ...), by a stable GUID with `source` / `locked` columns: a
   re-run replaces the unlocked rows and keeps the locked ones, and a
-  re-detected element keeps the GUID of the stored element it matches. New
+  re-detected element keeps the GUID of the stored element it matches.
+  Rows with `source = imported` come from an imported model (`rux edit plan
+  --import`, see "Import write: solid-model plan" below) and are locked, so
+  no re-run touches them; only the next import replaces them. New
   GUIDs are deterministic (`core::deterministic_guid` over the project GUID,
   `ProjectDB::project_guid()`). A file copy of a `.rux` is the **same**
   project: same project GUID, same row GUIDs.
@@ -115,6 +118,45 @@ frames) and each imported pose in `sensor_frames.initial_transform`. Gravity,
 prior, landmark and virtual links are ignored and counted in the import log.
 Links that are self-links, point to a node that was not imported, or carry an
 invalid (null/non-rigid) transform are skipped with a warning.
+
+### Panoramas: import, alignment and manual poses (rux import 360, rux align 360)
+
+360 panoramas live in `panoramic_images`: the equirect JPEG, its EXIF
+timestamp, the sensor frame it was matched to by timestamp (`node_id`, NULL
+when unmatched) and, optionally, its own pose (`pose`, row-major 4x4
+panorama-optical -> world, optical x right / y down / z forward as in
+`geometry/EquirectProjection.hpp`) with its provenance `pose_source`. Not a
+pipeline stage (no `stage_contract` row; the heading carries no stage name
+on purpose):
+
+| `pose_source` | Written by | Meaning |
+|---|---|---|
+| `timestamp` (or NULL, no `pose`) | `rux import 360` | shown levelled (yaw 0, horizon level) at the linked frame's centre |
+| `aligned` | `rux align 360` (`slam/PanoramaAlignment.hpp`) | content-aligned; `align_inliers` / `align_rms` set |
+| `manual` | `core::set_panorama_pose_manual` / `nudge_panorama_pose`, `io::register_panorama` (`rux set panoramas.<name>.pose`, `rux import 360 --pose`) | placed by hand; `align_inliers` / `align_rms` NULL |
+
+| | |
+|---|---|
+| Consumes | image files (import); `panoramic_images` + linked `sensor_frames` with depth and poses (align) |
+| Produces | `panoramic_images` rows (import); `pose` / `pose_source` / `align_*` (align) |
+| Checks   | import: equirect guard (JPEG width == 2 x height; `.insp` is stitched first) |
+
+Manual poses (reusex-3iy8.5) bypass alignment. A manual pose is validated
+(finite, bottom row `[0 0 0 1]`, proper rotation) before anything is written.
+A nudge sets any of world x / y / z and the yaw (heading of the optical
+forward axis about an up direction, world +z by default) and keeps the rest:
+a yaw nudge rotates about up through the centre, so pitch and roll are kept.
+A panorama with no pose of its own is nudged from the levelled placement it is
+drawn with: upright, yaw 0, at its linked frame's centre (never the phone
+camera's rotation), else at the origin. `io::register_panorama` stores a
+new image unlinked (no timestamp matching) with a manual pose, image and pose
+in one transaction of its own (it cannot run inside a caller's
+`ProjectDB::Transaction`). `rux align 360` never replaces a manual pose, not even with
+`--overwrite`; only `--force` does (`core::panorama_align_decision`). Content-
+alignment consumers that need a measured pose (`rux export colmap`, gsplat
+training views) keep using `aligned` panoramas only. No storey is stored per
+panorama: the storey is derived from the pose with `core::which_storey` (see
+`storeys`).
 
 ### `graph_init` (`rux graph init`)
 
@@ -301,6 +343,19 @@ warns, with the angle and shift, when a kept locked row's frame differs from
 that of the new row it stands for (same GUID, else nearest floor), and when
 its height range overlaps a new row's (measured in that row's frame). `rux get storeys` prints the table; `rux del storeys` removes it, and
 needs `--force` when any row is locked.
+
+Which storey a world point is on: `core::which_storey`
+(`core/storey_lookup.hpp`, reusex-3iy8.4). Each storey is the half-open band
+`[z_floor, z_ceiling)` of its own level frame (the point's level z is row 3 of
+`level_transform` applied to it), so shared and per-storey frames both work.
+A row with `z_ceiling <= z_floor` (ceiling unknown, e.g. an imported level
+with only an elevation) is open upward to the next storey's floor (unbounded
+only for the top storey); a row with a non-finite frame or heights is
+ignored. When several bands hold the point the
+storey whose floor is nearest below it wins. A point in no band (below the
+lowest floor, above the highest ceiling, inside a slab gap) has no storey,
+unless `clamp_to_nearest` is set: then the nearest band's storey, a tie going
+to the upper one. The same rule holds for `source = imported` rows.
 
 ### `classify` (`rux create classify`)
 
@@ -812,6 +867,196 @@ or `instances` keeps its original `stage`/`parameters` (e.g. reconstruct's
 its GUID (and its part's link) only when reconciliation matches it by overlap.
 The part never lands in a rejected (Afvist) type: the automatic type choice
 skips rejected types and creates a new one when only a rejected type matches.
+
+### Import write: solid-model plan (rux edit plan --import)
+
+<!-- No backticks in this heading: test_stage_contract parses backticked
+     `### ` headings as pipeline stages, and this is not one. -->
+
+Store an imported building model -- an authored reference plan, a Revit
+(via Speckle) or an IFC model -- in the solid-model tables
+(`io::store_solid_model()` over `ProjectDB::replace_imported_solid_model()`).
+Not a pipeline stage: no `Stage`, no `rux validate --stage` entry.
+
+| | |
+|---|---|
+| Consumes | a solid-model document (`docs/design/solid-model-json.md`), validated strictly; the elements are stamped `source = imported`, `locked = 1` (`io::mark_imported()`) |
+| Produces | `storeys`, `walls` + `wall_joins`, `openings`, `spaces` + `space_boundaries` rows, for each kind the document provides |
+| Checks   | every opening and space boundary names a wall the walls table holds after the import |
+
+For each kind the document provides (a non-empty array, or an empty one
+that is present), the project's earlier `imported` rows of that kind are
+deleted, locked ones included (joins and boundaries go with their walls and
+spaces), and the document's rows are written; kinds it leaves out are not
+touched. Detected and manual rows stay, with two exceptions, each logged at
+`warn` with the count:
+
+- an imported element whose GUID an **unlocked** detected / manual row holds
+  replaces that row. Storeys are keyed by `idx` (walls and spaces name their
+  storey by it), so an imported storey also replaces an unlocked storey of
+  the same `idx`: imported storey 0 becomes the project's storey 0, and the
+  detected walls of that idx are then read in its level frame;
+- an imported element whose GUID (a storey: GUID or `idx`) a **locked**
+  detected / manual row holds is not written: the locked row wins, as in
+  every stage.
+
+A taken-over wall's joins and a taken-over space's boundaries go with it
+(counted, `warn`). An imported storey matching one unlocked storey by GUID
+and another by `idx` takes over both; walls and spaces (any source) left on
+an `idx` the storeys table no longer holds are counted and warned about.
+An imported wall join must touch at least one wall of the same import (joins
+carry no source and go only with their walls, so that is what lets a
+re-import replace them); a join between two stored walls is refused.
+
+An element without a GUID gets `uuid5(project_guid, "imported/storeys/<idx>")`
+or `uuid5(project_guid, "imported/<kind>/<index in the document>")`, so
+importing the same document twice writes the same rows. The index is the
+element's position in the document, so reordering elements without a GUID
+changes theirs; give elements a GUID when their identity must survive edits. The whole import is
+one SAVEPOINT: a refused element leaves every table as it was. Plane classes
+and scene relations in a document are not stored (reported as not stored).
+`rux edit plan --export` reads the tables back (`io::load_solid_model()`);
+`JSON -> tables -> JSON` is lossless up to row order and the document's
+`name` / `description`, which have no table.
+
+### Import write: Revit model via Speckle (rux import speckle)
+
+<!-- No backticks in this heading: not a pipeline stage (see above). -->
+
+Fetch one version of a Speckle model published by the Revit connector
+(Speckle v3; `io::speckle::SpeckleReader`, GraphQL queries and HTTP GETs
+only -- nothing is written to the server), map it with
+`io::speckle::import_revit()` and store it with the solid-model import write
+above (`io::speckle::import_speckle_revit()`). One `pipeline_log` row,
+stage `import_speckle` (parameters: server, project, model, version, root
+object; never the token, which comes from `SPECKLE_TOKEN`).
+
+| | |
+|---|---|
+| Consumes | a Speckle server, project, model and version (default the latest) |
+| Produces | `storeys`, `walls`, `openings`, `spaces` rows (`source = imported`, locked, as above); meshes `imported/revit/<category slug>` (stage `import_speckle`) |
+| Checks   | the root carries `levelProxies` (a Revit model), else it throws and writes nothing |
+
+Mapping (`libs/reusex/include/io/speckle_revit.hpp`):
+
+- **Frame.** World is the frame the connector wrote the mesh vertices in,
+  in metres (any unit the root declares is converted): Revit's internal
+  origin, or the project base / survey point, depending on the connector's
+  reference-point setting -- so x / y depend on that setting. Nothing is
+  aligned to a scan. A model whose plan centre lies more than 10 km from the
+  origin is recentred by a whole-km x / y offset (`world_offset_m` in every
+  storey's metadata and every mesh's parameters; world = connector frame -
+  offset), so the float meshes keep mm precision (STANDARDS §4); a warn is
+  logged either way. Level elevations are relative to their
+  elevation base (often the survey point); the offset to internal z is
+  measured from the walls (bottom = base level + base offset; the mode over
+  all walls, logged with its vote count; `--elevation-offset` overrides
+  it). Only levels flagged as a building storey (`LEVEL_IS_BUILDING_STORY`)
+  become storeys; elements on a reference level go to the storey at or
+  below it, and that storey's metadata lists the reference level. All
+  storeys share one level frame, as detected storeys do: `level_transform`
+  translates the lowest storey's floor to z = 0, `z_floor` is each storey's
+  height above it and `z_ceiling` the next storey's (the top storey: +
+  `--storey-height`).
+- **Walls**: a Walls element whose footprint (convex hull, minimum-area
+  rectangle) is a straight rectangle becomes a wall: axis through the
+  rectangle's middle, thickness = the type's width (else measured),
+  `z_base` / `height` from its z range, `is_external` from Function =
+  Exterior. Walls thinner than `--min-wall-thickness` (finish layers) and
+  non-straight footprints are mesh-only, each counted at warn.
+- **Openings**: Doors / Windows hosted on an imported wall, by
+  `parentApplicationId`, else the element they are nested under, else
+  geometrically (centre within the wall's thickness + 0.3 m, overlapping
+  its run). Width and height come from the Revit rough opening (else the
+  nominal width / height), the width centred on the element's extent along
+  the host axis and the height from its sill height above its level; the
+  geometry (casings included) is the fallback. `metadata.extent_source`
+  says which. Unhosted ones are mesh-only, counted at warn.
+- **Spaces**: Rooms with a volume mesh; the polygon is the outline of its
+  bottom faces (holes kept; disjoint pieces and islands inside holes are
+  dropped, counted at warn), `z_floor` / `z_ceiling` from the mesh, area,
+  perimeter, volume, compactness, kind `room`. Unplaced rooms (no volume
+  mesh) are skipped, one warn listing their names.
+- **Meshes**: every element's geometry (instance proxies expanded) merged per
+  category, Rooms excepted, in the world frame, as `imported/revit/<category
+  slug>` (the importer in the name, so a Revit and an IFC import in one
+  project never write the same mesh); a re-import deletes earlier
+  `import_speckle` meshes this version no longer has, also ones of the
+  older unprefixed naming (`--no-meshes` writes
+  and deletes none). An element whose mesh has an invalid face list is
+  skipped, counted at warn.
+- **Identity**: GUIDs are `uuid5(project_guid,
+  "imported/revit/<kind>/<Revit applicationId>")`, so a re-import of the
+  same model keeps them; each record's `metadata` holds the Revit identity
+  (applicationId, elementId, category, family, type, level, IfcGUID, ...).
+
+### Import write: IFC model (rux import ifc)
+
+<!-- No backticks in this heading: not a pipeline stage (see above). -->
+
+Read an IFC file (IFC2X3 / IFC4 / IFC4X3, STEP) with the native C++ core of
+web-ifc, map it with `io::ifc::import_ifc()` and store it with the
+solid-model import write above (`io::ifc::import_ifc_file()`). One
+`pipeline_log` row, stage `import_ifc` (parameters: source, file name).
+web-ifc is an optional dependency: a build without it
+(`REUSEX_HAVE_WEB_IFC` off) refuses with a clear message. web-ifc's own log
+messages (it logs through spdlog's default logger) are shown as `[web-ifc]`
+at warn and above only, whatever `-v` says.
+
+| | |
+|---|---|
+| Consumes | an IFC file |
+| Produces | `storeys`, `walls`, `openings`, `spaces` rows (`source = imported`, locked, as above); meshes `imported/ifc/<IFC class slug>` (stage `import_ifc`) |
+| Checks   | the file is a complete STEP file (ISO-10303-21 header, ENDSEC / END-ISO-10303-21 at the end), web-ifc parses it without errors, and it has an IfcProject and at least one IfcBuildingStorey; else it throws, writes no record or mesh, and its `pipeline_log` row ends `failed` with the message |
+
+Mapping (`libs/reusex/include/io/ifc.hpp`; the geometric readings are the
+Revit import's, shared in `libs/reusex/src/io/bim_mapping.hpp`):
+
+- **Frame.** World is the file's world coordinate system (z up), in metres
+  (the project's length unit, `IfcSIUnit` or `IfcConversionBasedUnit`, is
+  read once and applied to geometry and attributes alike; web-ifc's Y-up
+  output is turned back). Nothing is aligned to a
+  scan. A model whose plan centre lies more than `--recenter-threshold`
+  (10 km) from the origin -- a georeferenced file -- is recentred by a
+  whole-km x / y offset, as the Revit import (`world_offset_m` in every
+  storey's metadata and every mesh's parameters; world = file - offset).
+  Storeys are the IfcBuildingStoreys, at the world z of their placement
+  (`Elevation` when there is none), sorted, in one shared level frame: the
+  lowest storey's floor at z = 0, `z_ceiling` the next storey's (the top
+  one: + `--storey-height`). Elements find their storey through
+  IfcRelContainedInSpatialStructure / IfcRelAggregates (walking up), else
+  by height (counted at warn).
+- **Walls**: IfcWall / IfcWallStandardCase / IfcWallElementedCase with a
+  straight footprint, as Revit walls: centreline of the footprint's
+  minimum-area rectangle, measured thickness, z range, `is_external` from
+  `Pset_WallCommon.IsExternal` (also through an
+  IfcPropertySetDefinitionSet). The IFC 'Axis' representation is not used:
+  it often runs along a layer edge (IfcMaterialLayerSetUsage offset), while
+  the solid-model axis is the centreline. Thin and non-straight walls, and
+  walls with no body left (e.g. fully voided), are mesh-only, counted at
+  warn.
+- **Openings**: IfcDoor / IfcWindow hosted through IfcRelFillsElement ->
+  IfcOpeningElement -> IfcRelVoidsElement -> an imported wall, else
+  geometrically (as Revit). Extent: the IfcOpeningElement they fill (the
+  hole), else `OverallWidth` / `OverallHeight`, else the geometry;
+  `metadata.extent_source` says which. Unhosted ones are mesh-only.
+- **Spaces**: IfcSpace; the polygon is the outline of its body's bottom
+  faces (as Revit rooms), else its 'FootPrint' curve with z from its 'Box'
+  (else its storey's floor to ceiling) -- common in ArchiCAD exports. Name =
+  `LongName`, else `Name`; kind `room`.
+- **Meshes**: every product's body (openings voided by web-ifc) merged per
+  IFC class. web-ifc meshes every representation of a product (curves and
+  bounding boxes aside); geometry that traces back only to a non-body
+  representation (anything but 'Body', 'Facetation', 'Body-FallBack' or an
+  unnamed one -- e.g. a 'Clearance' solid) is left out, anything else is
+  kept. Merged StandardCase / ElementedCase folded into the base class
+  (`imported/ifc/wall`, `imported/ifc/slab`, `imported/ifc/door`, ...); spatial
+  elements, opening elements, annotations and grids are left out. A
+  re-import deletes earlier `import_ifc` meshes the file no longer has;
+  `--no-meshes` writes and deletes none.
+- **Identity**: GUIDs are `uuid5(project_guid,
+  "imported/ifc/<kind>/<GlobalId>")`; each record's `metadata` holds the IFC
+  identity (GlobalId, class, Name, ObjectType, Tag, express id).
 
 ### `attributes` (`rux create attributes`)
 

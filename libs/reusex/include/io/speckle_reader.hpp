@@ -224,6 +224,12 @@ class SpeckleReader {
   query_versions(const std::string &project, const std::string &model,
                  int limit = 10) const;
 
+  /// One version of a model, by id (any age; a GraphQL query).
+  /// @throws std::runtime_error when the version is not in the model.
+  [[nodiscard]] VersionInfo query_version(const std::string &project,
+                                          const std::string &model,
+                                          const std::string &version) const;
+
   /// The newest version of a model.
   /// @throws std::runtime_error when the model has no versions.
   [[nodiscard]] VersionInfo latest_version(const std::string &project,

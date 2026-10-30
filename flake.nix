@@ -184,7 +184,7 @@
         # overlays/ccache.nix) get their compiler wrapped in ccache here.
         # Prebuilt (libtorch) and Rust (tokenizers-cpp) packages are excluded:
         # ccache does not help them.
-        ccachedPackageNames = ["gtsam" "trtsam3" "opennurbs"];
+        ccachedPackageNames = ["gtsam" "trtsam3" "opennurbs" "web-ifc"];
         ccachedPackages =
           nonBrokenPackages
           // lib.genAttrs

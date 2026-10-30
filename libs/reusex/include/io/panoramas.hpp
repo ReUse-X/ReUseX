@@ -4,6 +4,8 @@
 
 #pragma once
 
+#include <array>
+#include <cstdint>
 #include <filesystem>
 #include <string>
 #include <vector>
@@ -56,5 +58,42 @@ struct ImportPanoramasOptions {
 /// @returns    Number of panoramas newly imported (0 if none found).
 std::size_t import_panoramas(ProjectDB &db, const std::filesystem::path &dir,
                              const ImportPanoramasOptions &opts = {});
+
+/// Options of register_panorama() for a file.
+struct RegisterPanoramaOptions {
+  /// Stitch an Insta360 X4 .insp (the static calibration); false refuses one.
+  bool stitch_insp = true;
+  /// Name to store it under; empty = the file name (a .insp is stored as
+  /// `<stem>.jpg`, as `rux import 360` does).
+  std::string filename;
+};
+
+/// Register one new 360 panorama with a manual initial pose (reusex-3iy8.5):
+/// the decode/store path of `rux import 360` (equirect guard, .insp
+/// stitching, EXIF timestamp) without timestamp matching or content
+/// alignment. The row is stored unlinked (node_id NULL) with
+/// `pose_source = "manual"`, image and pose in one transaction, which this
+/// function opens itself (a `ProjectDB::Transaction`, BEGIN IMMEDIATE): do
+/// not call it inside a caller's transaction, which would make that BEGIN
+/// fail.
+///
+/// @param pose row-major 4x4 panorama-optical -> world (see
+///        core/panorama_pose.hpp; core::upright_panorama_pose() builds one
+///        from a position and a yaw).
+/// @return the new panorama's id.
+/// @throws std::invalid_argument for an invalid pose, a name already
+///         stored, or an image that is not an equirect (width == 2*height);
+///         std::runtime_error when the file cannot be read or stitched.
+///         Nothing is written on a throw.
+int register_panorama(ProjectDB &db, const std::filesystem::path &file,
+                      const std::array<double, 16> &pose,
+                      const RegisterPanoramaOptions &opts = {});
+
+/// The same for an equirect JPEG already in memory (an HTTP upload); it too
+/// opens its own transaction. @p timestamp epoch seconds, < 0 unknown.
+int register_panorama(ProjectDB &db, const std::string &filename,
+                      const std::vector<uint8_t> &jpeg,
+                      const std::array<double, 16> &pose,
+                      double timestamp = -1.0);
 
 } // namespace reusex::io

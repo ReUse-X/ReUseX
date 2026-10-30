@@ -713,7 +713,14 @@ tree — if a doc mentions `RTABMapDatabase`, that doc is stale.
   `core/space_polygon.hpp`; a boundary goes with its space but names its
   wall by GUID; a re-detected space keeps the GUID of the stored one whose
   centroid and area match, else uuid5 of storey + centroid at 5 cm,
-  `core/space_identity.hpp`). Schema v36 adds `survey_parts.dismissed`
+  `core/space_identity.hpp`). An imported model (`rux edit plan
+  --import`, `rux import speckle`, `rux import ifc`) goes into these four
+  tables through
+  `io::store_solid_model()` / `ProjectDB::replace_imported_solid_model()`:
+  one SAVEPOINT that replaces the project's `source = imported` rows of each
+  kind the model provides and keeps detected / manual rows (an unlocked one
+  with the same guid, or storey idx, is taken over; a locked one wins).
+  Schema v36 adds `survey_parts.dismissed`
   (`SurveyPartRecord::dismissed` / `SurveyPartPatch::dismissed`): a part
   marked as an error stays listed but `core/survey_service` leaves it out
   of its type's quantity (`type_quantity`, `set_type_quantity`) and of
@@ -774,7 +781,13 @@ tree — if a doc mentions `RTABMapDatabase`, that doc is stale.
 Other core pieces: `logging.hpp`, `stages.hpp` (`Stage` enum),
 `validate.hpp` (`check_stage_inputs`, backing `rux validate --stage`),
 `MaterialPassport.hpp` + `materialepas_*`, `guid.hpp`, `SensorIntrinsics.hpp`,
-`processing_observer.hpp` / `visual_observer.hpp`, `filter_expression.hpp`.
+`processing_observer.hpp` / `visual_observer.hpp`, `filter_expression.hpp`,
+`storey_lookup.hpp` (`which_storey()`: world point -> storey idx through each
+row's level frame, half-open `[z_floor, z_ceiling)`, optional clamp to the
+nearest band; reusex-3iy8.4), `panorama_pose.hpp` (manual 360 poses:
+`set_panorama_pose_manual()`, `nudge_panorama_pose()` for x/y/z/yaw keeping
+pitch and roll, `panorama_align_decision()` — `rux align 360` keeps a
+`pose_source = "manual"` pose unless `--force`; reusex-3iy8.5).
 
 ### I/O Module
 
@@ -790,7 +803,26 @@ External-format adapters only — project state itself lives in `core/ProjectDB`
   (`SpeckleReader`: GraphQL queries + HTTP GETs only). Project / model /
   version lookup, the whole object tree in one GET (`ObjectTree`), and
   `ObjectTree::resolve` (references, `@`-detached keys, DataChunk joins)
+- `speckle_revit.hpp`: Revit model (Speckle v3 Revit connector) -> solid
+  model + per-category meshes (`import_revit`, pure), and `rux import
+  speckle`'s entry point `import_speckle_revit` (fetch, map, store as
+  imported). Revit internal frame in metres, one shared level frame;
+  mapping rules in `docs/CONTRACTS.md` ("Import write: Revit model via
+  Speckle")
+- `ifc.hpp`: IFC file -> solid model + per-class meshes through web-ifc
+  (`import_ifc`, pure apart from reading the file) and `rux import ifc`'s
+  entry point `import_ifc_file`. Same rules as the Revit import; the
+  geometric readings both share (wall axis from the footprint rectangle,
+  room outline from bottom faces, opening hosting, GUID scheme, recentring,
+  mesh merge / write) live in the private `src/io/bim_mapping.{hpp,cpp}`.
+  Mapping rules in `docs/CONTRACTS.md` ("Import write: IFC model")
+- `imported_mesh.hpp`: `ImportedMesh`, the per-category display mesh both
+  BIM imports return (`speckle::RevitMesh` is an alias), named by importer:
+  `imported/revit/<category>`, `imported/ifc/<class>`
 - `exif.hpp`: photo metadata (exiv2)
+- `panoramas.hpp`: companion 360 discovery (`import_panoramas`) and
+  `register_panorama()` — one new panorama with a manual pose, unlinked, no
+  timestamp matching or alignment (`rux import 360 --pose`)
 - `export_scene.hpp`: serializes a reconstructed scene
 - `solid_model_json.hpp`: the solid-model JSON document (reference plans and
   detected models, `core/solid_model.hpp` records)
@@ -804,17 +836,17 @@ Top-level commands, as registered in `apps/rux/src/rux.cpp`:
 
 | Command | Sub-commands | Source |
 |---|---|---|
-| `import` | `rtabmap`, `mushroom`, `arkitscenes`, `e57`, `ply`, `gsplat`, `materialepas`, `csv`, `360`, `photos` | `src/import/` |
+| `import` | `rtabmap`, `mushroom`, `arkitscenes`, `e57`, `ply`, `gsplat`, `materialepas`, `csv`, `360`, `photos`, `speckle` (Revit model via Speckle, read-only: storeys / walls / openings / spaces as imported rows + `imported/revit/<category>` meshes), `ifc` (IFC file via web-ifc: the same tables + `imported/ifc/<IFC class>` meshes; needs `REUSEX_HAVE_WEB_IFC`) | `src/import/` |
 | `create` | `clouds`, `dense`, `annotate`, `annotate-360`, `material`, `project`, `planes`, `rooms`, `instances`, `storeys`, `classify`, `walls`, `openings`, `spaces`, `solids`, `materials`, `survey`, `mesh`, `texture`, `windows` (deprecated) | `src/create/` |
 | `export` | `ply`, `e57`, `materialepas`, `csv`, `rhino`, `semantic-images`, `speckle`, `colmap`, `pdf` | `src/export/` |
-| `align` | `360` (content-based panorama pose refinement) | `src/align/` |
+| `align` | `360` (content-based panorama pose refinement; skips manually placed panoramas unless `--force`) | `src/align/` |
 | `edit` | `downsample`, `perturb-poses` (drift synthesis, #338) | `src/edit/` |
 | `analyze` | `quality`, `accuracy`, `solid` (typed model vs a reference plan), `drift` (where the stored poses disagree: pass-to-pass residual vs noise floor, segment pairs + ICP suggestions, through-wall crossings) | `src/analyze/` |
 | `optimize` | — (solves the stored pose graph; `--edits e.yaml` steers it with pose edits, `--edits e.yaml --watch` is the hot-reload pose loop: in-memory re-solve on every save, preview cloud, drift renders, metrics block with a shear indicator and paste-ready YAML suggestions, `optimize_watch.hpp`, [`docs/guides/pose-reference-authoring.md`](docs/guides/pose-reference-authoring.md)) | `src/optimize.cpp` |
 | `graph` | `init`, `discover`, `prune` (stored pose graph) | `src/graph/` |
 | `register` | — (joint pairwise registration) | `src/register.cpp` |
 | `validate` | — (`--stage`, `--json`) | `src/validate.cpp` |
-| `get` / `set` / `del` | path-based DB access (`src/database/*_router.cpp`) | `src/get.cpp`, `src/set.cpp`, `src/del.cpp` |
+| `get` / `set` / `del` | path-based DB access (`src/database/*_router.cpp`; `rux set panoramas.<name>.pose` takes a 4x4, `[x,y,z,yaw]` or a `{x,y,z,yaw_deg}` nudge) | `src/get.cpp`, `src/set.cpp`, `src/del.cpp` |
 | `info` | — (project summary) | `src/info.cpp` |
 | `log` | — (pipeline execution history) | `src/log.cpp` |
 | `view` | — (interactive viewer, needs a display; `--plan gt.yaml --watch` = hot-reloading ground-truth workbench over `populate_scene`, `view/plan_workbench.hpp`) | `src/view/` |
@@ -998,6 +1030,14 @@ Anything not found there is not a dependency.
 - RTABMap - SLAM database import
 - E57Format - point cloud exchange format
 - OpenNURBS - Rhino 3D (.3dm) files
+- web-ifc - IFC (STEP) parsing + geometry, the native C++ core of That Open's
+  web-ifc (MPL-2.0, `pkgs/web-ifc`). **Optional**: found ->
+  `REUSEX_HAVE_WEB_IFC` (a capability flag: `reusex_io` has IFC support), linked
+  PRIVATE into `reusex_io`. Keep its includes inside `src/io/ifc*.cpp`: it
+  ships its own pinned glm and generic top-level `geometry/`, `schema/`,
+  `cache/` include dirs. It logs through spdlog's *default* logger (rux's), so
+  `src/io/ifc.cpp` wraps every web-ifc call in a `WebIfcLog::Scope` that
+  swaps in a `[web-ifc]` logger at >= warn and counts its errors
 - OpenCV (`core`, `imgproc`, `highgui`) - image processing
 - VTK (`CommonCore`, `CommonDataModel`, `CommonExecutionModel`, `RenderingCore`,
   `RenderingOpenGL2`, `RenderingFreeType` for the plan overlay's labels) - the rendering backend behind `reusex_visualize`'s
