@@ -14,11 +14,15 @@
 #include <catch2/catch_test_macros.hpp>
 #include <catch2/matchers/catch_matchers_string.hpp>
 
+#include <fmt/format.h>
 #include <nlohmann/json.hpp>
 
 #include <algorithm>
 #include <filesystem>
 #include <fstream>
+#include <iterator>
+#include <map>
+#include <set>
 #include <sstream>
 #include <stdexcept>
 #include <string>
@@ -857,4 +861,277 @@ TEST_CASE("SolidModelFixture_NewOffice_FollowsTheMaintainersRoomLayout",
                      "WC 2", "WC 3"});
   CHECK_THAT(m.description, ContainsSubstring("maintainer's description"));
   CHECK_THAT(m.storeys[0].metadata, ContainsSubstring("room_layout"));
+}
+
+// ── store_solid_model: natural-key guids, import_plan's log row
+//    (reusex-3iy8.12) ──────────────────────────────────────────────────────
+
+namespace {
+
+reusex::core::WallRecord guidless_wall(double x0, double y0, double x1,
+                                       double y1, double thickness = 0.2) {
+  reusex::core::WallRecord w;
+  w.storey = 0;
+  w.x0 = x0;
+  w.y0 = y0;
+  w.x1 = x1;
+  w.y1 = y1;
+  w.height = 2.5;
+  w.thickness = thickness;
+  return w;
+}
+
+reusex::core::SpaceRecord guidless_space(double x, double y, double size) {
+  reusex::core::SpaceRecord s;
+  s.storey = 0;
+  s.kind = "room";
+  s.polygon.outer = {
+      {x, y}, {x + size, y}, {x + size, y + size}, {x, y + size}};
+  s.z_ceiling = 2.5;
+  return s;
+}
+
+reusex::core::OpeningRecord guidless_opening(double s0, double s1,
+                                             const std::string &kind) {
+  reusex::core::OpeningRecord o;
+  o.wall = "host";
+  o.kind = kind;
+  o.s_start = s0;
+  o.s_end = s1;
+  o.z_head = 2.0;
+  return o;
+}
+
+/// A storey, a host wall with a guid, three guid-less walls, two guid-less
+/// spaces and two guid-less openings on the host.
+SolidModel natural_key_model() {
+  SolidModel m;
+  m.storeys = {detected_storey("s0", 0)};
+  auto host = guidless_wall(0, -1, 10, -1);
+  host.guid = "host";
+  m.walls = {host, guidless_wall(0, 0, 5, 0), guidless_wall(5, 0, 5, 4),
+             guidless_wall(5, 4, 0, 4)};
+  m.spaces = {guidless_space(0, 0, 4), guidless_space(6, 0, 3)};
+  m.openings = {guidless_opening(1.0, 1.9, "door"),
+                guidless_opening(4.0, 5.2, "window")};
+  reusex::io::mark_imported(m);
+  return m;
+}
+
+/// The stored guid of each record, keyed by something the test controls
+/// (wall: x0,y0 of either end sorted; space: its first x; opening: kind).
+std::map<std::string, std::string> stored_guids(const reusex::ProjectDB &db) {
+  std::map<std::string, std::string> out;
+  for (const auto &w : db.walls()) {
+    auto a = std::make_pair(w.x0, w.y0), b = std::make_pair(w.x1, w.y1);
+    if (b < a)
+      std::swap(a, b);
+    out[fmt::format("wall {},{} {},{} h{}", a.first, a.second, b.first,
+                    b.second, w.height)] = w.guid;
+  }
+  for (const auto &s : db.spaces())
+    out[fmt::format("space {}", s.polygon.outer.at(0)[0])] = s.guid;
+  for (const auto &o : db.openings())
+    out["opening " + o.kind] = o.guid;
+  return out;
+}
+
+std::set<std::string> guid_values(const std::map<std::string, std::string> &m) {
+  std::set<std::string> out;
+  for (const auto &[k, v] : m)
+    out.insert(v);
+  return out;
+}
+
+} // namespace
+
+TEST_CASE("StoreSolidModel_MintedGuids_DoNotDependOnDocumentOrder",
+          "[io][solid_model]") {
+  reusex::test_support::TempPath tmp("test_store_solid_natural_order");
+  reusex::ProjectDB db(tmp.path);
+  SolidModel m = natural_key_model();
+  reusex::io::store_solid_model(db, m);
+  const auto first = stored_guids(db);
+  REQUIRE(first.size() == 4 + 2 + 2);
+  CHECK(guid_values(first).size() == first.size()); // all distinct
+
+  SECTION("every element kind reversed") {
+    std::reverse(m.walls.begin(), m.walls.end());
+    std::reverse(m.spaces.begin(), m.spaces.end());
+    std::reverse(m.openings.begin(), m.openings.end());
+  }
+  SECTION("an element inserted in front of the others") {
+    m.walls.insert(m.walls.begin(), guidless_wall(20, 20, 25, 20));
+    m.spaces.insert(m.spaces.begin(), guidless_space(20, 20, 2));
+  }
+  SECTION("a wall axis drawn the other way round") {
+    std::swap(m.walls[1].x0, m.walls[1].x1);
+    std::swap(m.walls[1].y0, m.walls[1].y1);
+    // A space ring started at another vertex, wound the other way.
+    std::reverse(m.spaces[0].polygon.outer.begin(),
+                 m.spaces[0].polygon.outer.end());
+  }
+  SECTION("coordinates jittered well inside the 1 cm grid") {
+    for (auto &w : m.walls)
+      w.x0 += 0.0004;
+    for (auto &s : m.spaces)
+      for (auto &p : s.polygon.outer)
+        p[1] += 0.0004;
+  }
+  reusex::io::store_solid_model(db, m);
+  const auto second = stored_guids(db);
+  for (const auto &[key, guid] : first) {
+    INFO(key);
+    // Every element of the first import is found again under its old guid
+    // (jittered coordinates change the lookup key, not the guid).
+    CHECK(guid_values(second).count(guid) == 1);
+  }
+}
+
+TEST_CASE("StoreSolidModel_MovingOneElement_ChangesOnlyItsGuid",
+          "[io][solid_model]") {
+  reusex::test_support::TempPath tmp("test_store_solid_natural_move");
+  reusex::ProjectDB db(tmp.path);
+  SolidModel m = natural_key_model();
+  reusex::io::store_solid_model(db, m);
+  const auto before = guid_values(stored_guids(db));
+
+  SECTION("a wall moved by 5 cm") { m.walls[2].x0 += 0.05; }
+  SECTION("a wall made thicker") { m.walls[2].thickness = 0.3; }
+  SECTION("a space grown") { m.spaces[1].polygon.outer[1][0] += 0.5; }
+  SECTION("an opening slid along its host") {
+    m.openings[0].s_start += 0.2;
+    m.openings[0].s_end += 0.2;
+  }
+  SECTION("an opening retyped") { m.openings[1].kind = "opening"; }
+  reusex::io::store_solid_model(db, m);
+  const auto after = guid_values(stored_guids(db));
+  REQUIRE(after.size() == before.size());
+  std::vector<std::string> gone;
+  std::set_difference(before.begin(), before.end(), after.begin(), after.end(),
+                      std::back_inserter(gone));
+  CHECK(gone.size() == 1);
+}
+
+TEST_CASE("StoreSolidModel_DuplicateNaturalKeys_AreToldApartByContent",
+          "[io][solid_model]") {
+  reusex::test_support::TempPath tmp("test_store_solid_natural_dup");
+  reusex::ProjectDB db(tmp.path);
+  SolidModel m;
+  m.storeys = {detected_storey("s0", 0)};
+  // Same axis (one drawn reversed, one 2 mm off) and thickness: one natural
+  // key. Only their height tells them apart.
+  auto low = guidless_wall(0, 0, 5, 0);
+  low.height = 1.0;
+  auto mid = guidless_wall(5, 0, 0, 0);
+  mid.height = 2.0;
+  auto high = guidless_wall(0.002, 0, 5, 0);
+  high.height = 3.0;
+  m.walls = {low, mid, high};
+  reusex::io::mark_imported(m);
+
+  reusex::io::store_solid_model(db, m);
+  std::map<double, std::string> by_height;
+  for (const auto &w : db.walls())
+    by_height[w.height] = w.guid;
+  REQUIRE(by_height.size() == 3);
+  CHECK(
+      guid_values(
+          {{"a", by_height[1.0]}, {"b", by_height[2.0]}, {"c", by_height[3.0]}})
+          .size() == 3);
+
+  // Any document order gives each wall the same guid.
+  std::vector<std::size_t> order{0, 1, 2};
+  do {
+    SolidModel shuffled = m;
+    for (std::size_t i = 0; i < 3; ++i)
+      shuffled.walls[i] = m.walls[order[i]];
+    reusex::io::store_solid_model(db, shuffled);
+    for (const auto &w : db.walls()) {
+      INFO("height " << w.height);
+      CHECK(by_height.at(w.height) == w.guid);
+    }
+  } while (std::next_permutation(order.begin(), order.end()));
+
+  SECTION("identical walls still get distinct guids") {
+    SolidModel twins;
+    twins.walls = {low, low};
+    reusex::io::mark_imported(twins);
+    const auto r = reusex::io::store_solid_model(db, twins);
+    CHECK(r.walls == 2);
+    REQUIRE(db.walls().size() == 2);
+    CHECK(db.walls()[0].guid != db.walls()[1].guid);
+  }
+}
+
+namespace {
+
+/// The run_id column of every row of @p table.
+std::vector<std::int64_t> run_ids(const reusex::ProjectDB &db,
+                                  std::string_view table) {
+  const auto cols = db.table_columns(table);
+  const auto it = std::find_if(cols.begin(), cols.end(), [](const auto &c) {
+    return c.name == "run_id";
+  });
+  REQUIRE(it != cols.end());
+  const auto col = static_cast<std::size_t>(it - cols.begin());
+  std::vector<std::int64_t> out;
+  for (const auto &row : db.table_rows(table, 0, 1000))
+    out.push_back(row.at(col).kind ==
+                          reusex::ProjectDB::TableCell::Kind::integer
+                      ? row.at(col).integer
+                      : -1);
+  return out;
+}
+
+} // namespace
+
+TEST_CASE("ImportPlan_LogsOneRowWithTheCounts", "[io][solid_model]") {
+  reusex::test_support::TempPath tmp("test_import_plan_log");
+  reusex::ProjectDB db(tmp.path);
+  SolidModel m =
+      reusex::io::solid_model_from_file(fixture("two_rooms.plan.json"));
+  reusex::io::mark_imported(m);
+
+  const auto r = reusex::io::import_plan(db, m, fixture("two_rooms.plan.json"));
+  const auto log = db.pipeline_log();
+  REQUIRE(log.size() == 1);
+  CHECK(log[0].stage == "import_plan");
+  CHECK(log[0].status == "success");
+  CHECK_THAT(log[0].parameters, ContainsSubstring("two_rooms.plan.json"));
+  CHECK_THAT(log[0].parameters, ContainsSubstring("\"source\":\"plan\""));
+  CHECK(log[0].error_msg == reusex::io::store_summary(r));
+  CHECK_THAT(log[0].error_msg,
+             ContainsSubstring(fmt::format("{} walls", m.walls.size())));
+  // Every stored row names the run that wrote it.
+  for (const char *table : {"storeys", "walls", "spaces", "openings"})
+    for (const auto id : run_ids(db, table)) {
+      INFO(table);
+      CHECK(id == log[0].id);
+    }
+
+  SECTION("a refused plan closes its row failed, with the reason") {
+    CHECK_THROWS_AS(
+        reusex::io::import_plan(db, refused_model(), "refused.plan.json"),
+        std::invalid_argument);
+    const auto after = db.pipeline_log();
+    REQUIRE(after.size() == 2);
+    CHECK(after[0].stage == "import_plan");
+    CHECK(after[0].status == "failed");
+    CHECK_THAT(after[0].error_msg, ContainsSubstring("no-such-wall"));
+    // Nothing of it was stored: the walls still carry the first run.
+    for (const auto id : run_ids(db, "walls"))
+      CHECK(id == log[0].id);
+  }
+
+  SECTION("a caller-owned row is neither opened nor closed") {
+    const int caller = db.log_pipeline_start("some_stage", "{}");
+    reusex::io::import_plan(db, m, "x.plan.json", caller);
+    const auto after = db.pipeline_log();
+    REQUIRE(after.size() == 2);
+    CHECK(after[0].id == caller);
+    CHECK(after[0].status == "running");
+    for (const auto id : run_ids(db, "walls"))
+      CHECK(id == caller);
+  }
 }

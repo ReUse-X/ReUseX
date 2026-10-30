@@ -116,11 +116,16 @@ void format_terminal_output(
                                    fmt::fg(fmt::terminal_color::bright_black)));
     }
 
-    // Error message on third line (indented, red text)
+    // Message on third line (indented): the reason of a failed run in red,
+    // otherwise what the run reports (e.g. import_plan's counts, a
+    // cancelled gsplat run) -- not an error.
     if (!entry.error_msg.empty()) {
-      fmt::print("{}",
-                 fmt::styled(fmt::format("     Error: {}\n", entry.error_msg),
-                             fmt::fg(fmt::terminal_color::red)));
+      if (entry.status == "failed")
+        fmt::print("{}",
+                   fmt::styled(fmt::format("     Error: {}\n", entry.error_msg),
+                               fmt::fg(fmt::terminal_color::red)));
+      else
+        fmt::print("     Message: {}\n", entry.error_msg);
     }
   }
 }

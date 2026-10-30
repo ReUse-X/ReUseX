@@ -144,6 +144,37 @@ TEST_CASE("EditPlan_ImportThenExport_GivesThePlanBack",
     CHECK((w.source == "imported" && w.locked));
 }
 
+TEST_CASE("EditPlan_Import_LogsAnImportPlanRow", "[rux_app][edit_plan]") {
+  // reusex-3iy8.12: every --import leaves one pipeline_log row with what it
+  // wrote; a plan that does not parse never reaches the project.
+  TempPath project("test_edit_plan_log");
+  {
+    reusex::ProjectDB db(project.path);
+  }
+  const auto plan = fixture("two_rooms.plan.json");
+  REQUIRE(rux_exit(project.path, {"--import", plan.string()}) == 0);
+  {
+    const reusex::ProjectDB db(project.path, /*readOnly*/ true);
+    const auto log = db.pipeline_log();
+    REQUIRE(log.size() == 1);
+    CHECK(log[0].stage == "import_plan");
+    CHECK(log[0].status == "success");
+    CHECK(log[0].parameters.find("two_rooms.plan.json") != std::string::npos);
+    const auto model = reusex::io::solid_model_from_file(plan);
+    CHECK(log[0].error_msg.find(std::to_string(model.walls.size()) +
+                                " walls") != std::string::npos);
+  }
+
+  TempPath bad("test_edit_plan_log_bad", ".json");
+  {
+    std::ofstream o(bad.path);
+    o << R"({"model_version": 1, "walls": [{"guid": "w1", "axs": []}]})";
+  }
+  CHECK(rux_exit(project.path, {"--import", bad.path.string()}) == 3);
+  const reusex::ProjectDB db(project.path, /*readOnly*/ true);
+  CHECK(db.pipeline_log().size() == 1);
+}
+
 TEST_CASE("EditPlan_Export_WritesTheProjectModel", "[rux_app][edit_plan]") {
   TempPath project("test_edit_plan_export");
   TempPath out("test_edit_plan_export_out", ".json");
