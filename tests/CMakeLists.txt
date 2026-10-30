@@ -159,6 +159,15 @@ target_link_libraries(reusex_unit_tests
 # this binary no Qt start-up.
 target_link_libraries(reusex_unit_tests PRIVATE rux_qt_core)
 
+# tests/unit/io/test_web_ifc_smoke.cpp drives web-ifc's API directly (the
+# importer proper is a separate task), so it needs the headers. reusex_io links
+# web-ifc PRIVATE and the imported target only exists in the libs/reusex
+# directory scope, hence the repeated find_package (same as Torch below).
+if(REUSEX_HAVE_WEB_IFC)
+    find_package(web-ifc CONFIG REQUIRED)
+    target_link_libraries(reusex_unit_tests PRIVATE web-ifc::web-ifc)
+endif()
+
 target_include_directories(reusex_unit_tests PRIVATE
     ${CMAKE_SOURCE_DIR}/libs/reusex/include
     ${CMAKE_BINARY_DIR}/generated

@@ -414,6 +414,13 @@ target_link_libraries(reusex_io PRIVATE opencv_imgcodecs opencv_stitching)
 # yaml-cpp: the solid-model YAML front-end (solid_model_json.cpp). PRIVATE:
 # not part of any public header (reusex-yf4.1).
 target_link_libraries(reusex_io PRIVATE yaml-cpp::yaml-cpp)
+# web-ifc: IFC STEP parsing + geometry (Dependencies.cmake, optional).
+# PRIVATE: no public header exposes a web-ifc type. The define is PUBLIC so
+# consumers (rux, tests) can tell whether IFC import is compiled in.
+if(REUSEX_HAVE_WEB_IFC)
+    target_link_libraries(reusex_io PRIVATE web-ifc::web-ifc)
+    target_compile_definitions(reusex_io PUBLIC REUSEX_HAVE_WEB_IFC)
+endif()
 
 reusex_add_module(reusex_vision ${REUSEX_VISION_SOURCES})
 target_link_libraries(reusex_vision PUBLIC reusex_core)
@@ -615,5 +622,6 @@ if(NOT CMAKE_CURRENT_SOURCE_DIR STREQUAL CMAKE_SOURCE_DIR)
     set(USE_MIP_SOLVER ${USE_MIP_SOLVER} PARENT_SCOPE)
     set(ENABLED_ML_BACKENDS ${ENABLED_ML_BACKENDS} PARENT_SCOPE)
     set(REUSEX_HAVE_GSPLAT ${REUSEX_HAVE_GSPLAT} PARENT_SCOPE)
+    set(REUSEX_HAVE_WEB_IFC ${REUSEX_HAVE_WEB_IFC} PARENT_SCOPE)
     set(REUSEX_PACKAGE_TARGETS ${REUSEX_PACKAGE_TARGETS} PARENT_SCOPE)
 endif()
