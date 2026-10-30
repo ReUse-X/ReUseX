@@ -264,6 +264,21 @@ find_package(igraph REQUIRED)
 find_package(E57Format REQUIRED)
 find_package(opennurbs REQUIRED)
 
+# IFC (STEP) parsing + geometry: the native C++ core of web-ifc (That Open,
+# MPL-2.0; pkgs/web-ifc), for `rux import ifc` (reusex-3iy8). OPTIONAL: a
+# build without it configures and links, and REUSEX_HAVE_WEB_IFC stays OFF
+# (reusexLibrary.cmake links it PRIVATE into reusex_io when found). The
+# define is a capability flag ("reusex_io has IFC support"), not a promise
+# that web-ifc headers are includable; see reusexLibrary.cmake.
+find_package(web-ifc CONFIG QUIET)
+if(web-ifc_FOUND)
+    set(REUSEX_HAVE_WEB_IFC ON)
+    message(STATUS "web-ifc found: IFC import support enabled")
+else()
+    set(REUSEX_HAVE_WEB_IFC OFF)
+    message(STATUS "web-ifc not found: IFC import support disabled")
+endif()
+
 # EXIF metadata reading (for 360 panoramic image import)
 find_package(exiv2 REQUIRED CONFIG)
 

@@ -1010,6 +1010,12 @@ Anything not found there is not a dependency.
 - RTABMap - SLAM database import
 - E57Format - point cloud exchange format
 - OpenNURBS - Rhino 3D (.3dm) files
+- web-ifc - IFC (STEP) parsing + geometry, the native C++ core of That Open's
+  web-ifc (MPL-2.0, `pkgs/web-ifc`). **Optional**: found ->
+  `REUSEX_HAVE_WEB_IFC` (a capability flag: `reusex_io` has IFC support), linked
+  PRIVATE into `reusex_io`. Keep its includes inside `src/io/ifc*.cpp`: it
+  ships its own pinned glm and generic top-level `geometry/`, `schema/`,
+  `cache/` include dirs
 - OpenCV (`core`, `imgproc`, `highgui`) - image processing
 - VTK (`CommonCore`, `CommonDataModel`, `CommonExecutionModel`, `RenderingCore`,
   `RenderingOpenGL2`, `RenderingFreeType` for the plan overlay's labels) - the rendering backend behind `reusex_visualize`'s
