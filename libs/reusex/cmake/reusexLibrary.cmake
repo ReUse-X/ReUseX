@@ -415,8 +415,15 @@ target_link_libraries(reusex_io PRIVATE opencv_imgcodecs opencv_stitching)
 # not part of any public header (reusex-yf4.1).
 target_link_libraries(reusex_io PRIVATE yaml-cpp::yaml-cpp)
 # web-ifc: IFC STEP parsing + geometry (Dependencies.cmake, optional).
-# PRIVATE: no public header exposes a web-ifc type. The define is PUBLIC so
-# consumers (rux, tests) can tell whether IFC import is compiled in.
+# PRIVATE: no public header exposes a web-ifc type, and web-ifc includes must
+# stay confined to the src/io/ifc*.cpp TUs. Its include dirs are generic and
+# would shadow or collide elsewhere: it installs its own pinned glm and
+# top-level directories named geometry/, schema/, cache/, parsing/.
+#
+# REUSEX_HAVE_WEB_IFC (PUBLIC) is a capability flag only: "reusex_io was built
+# with IFC support". It does NOT mean web-ifc headers are includable by a
+# consumer -- the static library's PRIVATE dep travels as
+# $<LINK_ONLY:web-ifc::web-ifc>, which carries no include directories.
 if(REUSEX_HAVE_WEB_IFC)
     target_link_libraries(reusex_io PRIVATE web-ifc::web-ifc)
     target_compile_definitions(reusex_io PUBLIC REUSEX_HAVE_WEB_IFC)
